@@ -427,7 +427,6 @@ tagged_value! {
 	InterpolationDistribution(vector::misc::InterpolationDistribution),
 	#[serde(alias = "LineCap")]
 	StrokeCap(vector::style::StrokeCap),
-	#[serde(alias = "LineJoin")]
 	StrokeJoin(vector::style::StrokeJoin),
 	StrokeAlign(vector::style::StrokeAlign),
 	PaintOrder(vector::style::PaintOrder),
