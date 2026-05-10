@@ -1,10 +1,12 @@
+pub mod resource;
+
+pub use resource::{Resource, ResourceHash, ResourceStorage};
+
 use core_types::transform::Footprint;
 use dyn_any::{DynAny, StaticType, StaticTypeSized};
 use glam::DVec2;
 use std::fmt::Debug;
-use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::pin::Pin;
 use std::ptr::addr_of;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,8 +43,6 @@ impl From<ImageTexture> for Arc<wgpu::Texture> {
 #[cfg(not(feature = "wgpu"))]
 #[derive(Debug, Clone, Hash, PartialEq, Eq, DynAny)]
 pub struct ImageTexture;
-
-pub type ResourceHash = [u8; 32];
 
 pub trait ApplicationIo {
 	type Executor;

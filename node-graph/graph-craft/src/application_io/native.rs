@@ -1,5 +1,5 @@
 use dyn_any::StaticType;
-use graphene_application_io::{ApplicationError, ApplicationIo, ResourceHash};
+use graphene_application_io::{ApplicationIo, ResourceHash};
 use std::collections::HashMap;
 use std::sync::Arc;
 #[cfg(feature = "tokio")]

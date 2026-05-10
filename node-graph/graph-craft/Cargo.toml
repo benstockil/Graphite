@@ -34,6 +34,7 @@ graphic-types = { workspace = true, features = ["serde"] }
 text-nodes = { workspace = true, features = ["serde"] }
 
 # Workspace dependencies
+blake3 = { workspace = true }
 log = { workspace = true }
 glam = { workspace = true }
 rustc-hash = { workspace = true }

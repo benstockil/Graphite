@@ -171,6 +171,7 @@ glam = { version = "0.32.1", default-features = false, features = [
 	"bytemuck",
 ] }
 base64 = "0.22"
+blake3 = "1.5"
 image = { version = "0.25", default-features = false, features = [
 	"png",
 	"jpeg",

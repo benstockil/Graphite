@@ -5,6 +5,8 @@ mod native;
 #[cfg(target_family = "wasm")]
 mod wasm;
 
+pub mod resource;
+
 #[cfg(not(target_family = "wasm"))]
 pub type PlatformApplicationIo = native::NativeApplicationIo;
 #[cfg(target_family = "wasm")]
