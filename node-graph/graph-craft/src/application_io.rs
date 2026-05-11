@@ -15,11 +15,11 @@ pub use resource::mmap::MmapResourceStorage;
 pub struct PlatformApplicationIo {
 	#[cfg(feature = "wgpu")]
 	pub(crate) gpu_executor: Option<WgpuExecutor>,
-	resources: Mutex<Box<dyn ResourceStorage + Send>>,
+	resources: Mutex<Box<dyn ResourceStorage>>,
 }
 
 impl PlatformApplicationIo {
-	pub async fn new(resources: Box<dyn ResourceStorage + Send>) -> Self {
+	pub async fn new(resources: Box<dyn ResourceStorage>) -> Self {
 		#[cfg(feature = "wgpu")]
 		let executor = WgpuExecutor::new().await;
 
@@ -37,7 +37,7 @@ impl PlatformApplicationIo {
 	}
 
 	#[cfg(feature = "wgpu")]
-	pub fn new_with_context(context: wgpu_executor::WgpuContext, resources: Box<dyn ResourceStorage + Send>) -> Self {
+	pub fn new_with_context(context: wgpu_executor::WgpuContext, resources: Box<dyn ResourceStorage>) -> Self {
 		let executor = WgpuExecutor::with_context(context);
 
 		let wgpu_available = executor.is_some();

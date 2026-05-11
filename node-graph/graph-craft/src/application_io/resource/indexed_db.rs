@@ -162,6 +162,7 @@ fn indexed_db_factory() -> Result<IdbFactory, JsValue> {
 
 async fn await_request(request: &IdbRequest) -> Result<JsValue, JsValue> {
 	let promise = js_sys::Promise::new(&mut |resolve, reject| {
+		let reject_for_error = reject.clone();
 		let request_for_success = request.clone();
 		let on_success = Closure::once_into_js(move |_event: web_sys::Event| match request_for_success.result() {
 			Ok(value) => {
@@ -181,10 +182,13 @@ async fn await_request(request: &IdbRequest) -> Result<JsValue, JsValue> {
 				.flatten()
 				.map(JsValue::from)
 				.unwrap_or_else(|| JsValue::from_str("IndexedDB request error"));
-			let _ = reject.call1(&JsValue::NULL, &error);
+			let _ = reject_for_error.call1(&JsValue::NULL, &error);
 		});
 		request.set_onerror(Some(on_error.unchecked_ref()));
 	});
 
 	JsFuture::from(promise).await
 }
+
+// SAFETY: wasm is single-threaded, so the non-`Send` JS handles inside the IndexedDB-backed `ResourceStorage` are never observed across threads.
+unsafe impl Send for IndexedDbResourceStorage {}

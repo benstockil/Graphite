@@ -1,7 +1,7 @@
 use super::*;
 use crate::messages::frontend::utility_types::{ExportBounds, FileType};
 use glam::{DAffine2, DVec2, UVec2};
-use graph_craft::application_io::{HashMapResourceStorage, PlatformApplicationIo, PlatformEditorApi};
+use graph_craft::application_io::{PlatformApplicationIo, PlatformEditorApi};
 use graph_craft::document::value::{RenderOutput, RenderOutputType, TaggedValue};
 use graph_craft::document::{NodeId, NodeNetwork};
 use graph_craft::graphene_compiler::Compiler;
@@ -154,17 +154,6 @@ impl NodeRuntime {
 	}
 
 	pub async fn run(&mut self) -> Option<ImageTexture> {
-		if self.editor_api.application_io.is_none() {
-			let resources = Box::new(HashMapResourceStorage::new());
-			self.editor_api = PlatformEditorApi {
-				application_io: Some(PlatformApplicationIo::new(resources).await.into()),
-				font_cache: self.editor_api.font_cache.clone(),
-				node_graph_message_sender: Box::new(self.sender.clone()),
-				editor_preferences: Box::new(self.editor_preferences.clone()),
-			}
-			.into();
-		}
-
 		let mut font = None;
 		let mut preferences = None;
 		let mut graph = None;

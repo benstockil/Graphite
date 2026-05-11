@@ -4,7 +4,7 @@ use graphite_editor::messages::prelude::{FrontendMessage, Message};
 use message_dispatcher::DesktopWrapperMessageDispatcher;
 use messages::{DesktopFrontendMessage, DesktopWrapperMessage};
 
-pub use graph_craft::application_io::HashMapResourceStorage;
+pub use graph_craft::application_io::{HashMapResourceStorage, MmapResourceStorage};
 pub use graphite_editor::consts::{DOUBLE_CLICK_MILLISECONDS, FILE_EXTENSION};
 pub use wgpu_executor::WgpuContext;
 pub use wgpu_executor::WgpuContextBuilder;
@@ -37,7 +37,7 @@ impl DesktopWrapper {
 		}
 	}
 
-	pub fn init(&self, wgpu_context: WgpuContext, resources: Box<dyn ResourceStorage + Send>) {
+	pub fn init(&self, wgpu_context: WgpuContext, resources: Box<dyn ResourceStorage>) {
 		let application_io = PlatformApplicationIo::new_with_context(wgpu_context, resources);
 		futures::executor::block_on(graphite_editor::node_graph_executor::replace_application_io(application_io));
 	}

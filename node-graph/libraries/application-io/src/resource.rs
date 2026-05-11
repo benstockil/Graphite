@@ -138,7 +138,7 @@ impl fmt::Debug for Resource {
 	}
 }
 
-pub trait ResourceStorage {
+pub trait ResourceStorage: Send {
 	fn read(&mut self, hash: &ResourceHash) -> Option<Resource>;
 	fn write(&mut self, data: &[u8]) -> ResourceHash;
 	fn contains(&mut self, hash: &ResourceHash) -> bool;
