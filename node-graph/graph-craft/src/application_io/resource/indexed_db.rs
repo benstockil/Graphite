@@ -8,7 +8,10 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbRequest, IdbTransactionMode};
 
 const STORE_NAME: &str = "resources";
-const DATABASE_VERSION: u32 = 1;
+// v2 switched from `Uint8Array` keys to hex string keys (IndexedDB normalizes binary keys to `ArrayBuffer` on read,
+// which made `Uint8Array::dyn_into` fail and entries get silently skipped on hydrate). The upgrade handler wipes
+// the v1 store so any binary-keyed entries from earlier WIP builds are dropped cleanly.
+const DATABASE_VERSION: u32 = 2;
 
 pub struct IndexedDbResourceStorage {
 	cache: HashMap<ResourceHash, Resource>,
@@ -28,6 +31,12 @@ impl IndexedDbResourceStorage {
 			let Ok(request) = target.dyn_into::<IdbOpenDbRequest>() else { return };
 			let Ok(db_value) = request.result() else { return };
 			let Ok(db) = db_value.dyn_into::<IdbDatabase>() else { return };
+			// Drop any pre-existing object store so an upgrade from an older format (binary keys) starts clean.
+			if db.object_store_names().contains(&store_name_for_upgrade) {
+				if let Err(error) = db.delete_object_store(&store_name_for_upgrade) {
+					log::error!("Failed to delete stale IndexedDB object store {store_name_for_upgrade:?}: {error:?}");
+				}
+			}
 			if let Err(error) = db.create_object_store(&store_name_for_upgrade) {
 				log::error!("Failed to create IndexedDB object store {store_name_for_upgrade:?}: {error:?}");
 			}
@@ -69,25 +78,24 @@ impl IndexedDbResourceStorage {
 		let values_array = values.dyn_into::<js_sys::Array>()?;
 
 		for (key, value) in keys_array.iter().zip(values_array.iter()) {
-			let Ok(key_bytes) = key.dyn_into::<js_sys::Uint8Array>() else {
-				log::warn!("Skipping IndexedDB entry whose key is not a Uint8Array");
+			let Some(key_string) = key.as_string() else {
+				log::warn!("Skipping IndexedDB entry whose key is not a string");
 				continue;
+			};
+			let stored = match ResourceHash::try_from(key_string.as_str()) {
+				Ok(hash) => hash,
+				Err(error) => {
+					log::warn!("Skipping IndexedDB entry whose key {key_string:?} is not a valid resource hash: {error}");
+					continue;
+				}
 			};
 			let Ok(value_bytes) = value.dyn_into::<js_sys::Uint8Array>() else {
 				log::warn!("Skipping IndexedDB entry whose value is not a Uint8Array");
 				continue;
 			};
 
-			if key_bytes.length() != 32 {
-				log::warn!("Skipping IndexedDB entry whose key is {} bytes (expected 32)", key_bytes.length());
-				continue;
-			}
-			let mut hash_buf = [0u8; 32];
-			key_bytes.copy_to(&mut hash_buf);
-
 			let payload = value_bytes.to_vec();
 			let recomputed = ResourceHash::from(payload.as_slice());
-			let stored = ResourceHash::from(hash_buf);
 			if recomputed != stored {
 				log::warn!("Skipping IndexedDB entry whose hash does not match its payload: {stored} vs {recomputed}");
 				continue;
@@ -120,7 +128,7 @@ impl IndexedDbResourceStorage {
 				}
 			};
 
-			let key = js_sys::Uint8Array::from(hash.as_bytes().as_slice());
+			let key = JsValue::from_str(&hash.to_hex());
 			let value = js_sys::Uint8Array::from(data.as_slice());
 
 			let request = match store.put_with_key(&value, &key) {
