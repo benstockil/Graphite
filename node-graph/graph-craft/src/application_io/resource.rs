@@ -1,3 +1,6 @@
+#[cfg(not(target_family = "wasm"))]
+pub mod mmap;
+
 use graphene_application_io::{Resource, ResourceHash, ResourceStorage};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,17 +18,17 @@ impl HashMapResourceStorage {
 }
 
 impl ResourceStorage for HashMapResourceStorage {
-	fn read(&self, hash: &ResourceHash) -> Option<Resource> {
+	fn read(&mut self, hash: &ResourceHash) -> Option<Resource> {
 		self.resources.get(hash).cloned()
 	}
 
 	fn write(&mut self, data: &[u8]) -> ResourceHash {
-		let hash = blake3::hash(data).into();
+		let hash = ResourceHash::from(blake3::hash(data));
 		self.resources.insert(hash, Resource::new(Arc::<[u8]>::from(data)));
 		hash
 	}
 
-	fn contains(&self, hash: &ResourceHash) -> bool {
+	fn contains(&mut self, hash: &ResourceHash) -> bool {
 		self.resources.contains_key(hash)
 	}
 }

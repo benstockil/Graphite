@@ -57,6 +57,7 @@ wasm-bindgen = { workspace = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 winit = { workspace = true }
+mmap-io = { workspace = true }
 
 [dev-dependencies]
 # Workspace dependencies

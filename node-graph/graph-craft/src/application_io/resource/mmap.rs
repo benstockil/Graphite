@@ -1,0 +1,121 @@
+use graphene_application_io::{Resource, ResourceHash, ResourceStorage};
+use mmap_io::mmap::{MemoryMappedFile, MmapMode};
+use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+/// `ResourceStorage` backed by a directory of files laid out as `root/xx/<remaining hex>`,
+/// where the full hex is the resource's blake3 content hash. Files are mmap'd on read
+/// (with huge pages requested, falling back to a regular mapping if unavailable) and
+/// the live `MemoryMappedFile`s are cached so repeat reads avoid the syscall.
+pub struct MmapResourceStorage {
+	root: PathBuf,
+	cache: HashMap<ResourceHash, Resource>,
+}
+
+impl MmapResourceStorage {
+	pub fn new(root: impl Into<PathBuf>) -> std::io::Result<Self> {
+		let root = root.into();
+		fs::create_dir_all(&root)?;
+		Ok(Self { root, cache: HashMap::new() })
+	}
+
+	fn path_for(&self, hash: &ResourceHash) -> PathBuf {
+		let hex = hash.to_hex();
+		let mut path = self.root.clone();
+		path.push(&hex[..2]);
+		path.push(&hex[2..]);
+		path
+	}
+
+	fn open_mmap(path: &Path) -> Option<MemoryMappedFile> {
+		match MemoryMappedFile::builder(path).mode(MmapMode::ReadOnly).huge_pages(true).open() {
+			Ok(file) => Some(file),
+			Err(error) => {
+				log::warn!("Failed to mmap {path:?} retrying without huge pages: {error}");
+
+				match MemoryMappedFile::open_ro(path) {
+					Ok(file) => Some(file),
+					Err(error) => {
+						log::error!("Failed to mmap {path:?}: {error}");
+						None
+					}
+				}
+			}
+		}
+	}
+}
+
+impl ResourceStorage for MmapResourceStorage {
+	fn read(&mut self, hash: &ResourceHash) -> Option<Resource> {
+		if let Some(resource) = self.cache.get(hash) {
+			return Some(resource.clone());
+		}
+
+		let path = self.path_for(hash);
+		let mmap = Self::open_mmap(&path)?;
+		let resource = Resource::new(MmappedBytes(mmap));
+
+		self.cache.insert(*hash, resource.clone());
+		Some(resource)
+	}
+
+	fn write(&mut self, data: &[u8]) -> ResourceHash {
+		let hash = ResourceHash::from(blake3::hash(data));
+		let path = self.path_for(&hash);
+
+		if path.exists() {
+			return hash;
+		}
+
+		let Some(parent) = path.parent() else {
+			log::error!("Resource path {path:?} has no parent directory");
+			return hash;
+		};
+		if let Err(error) = fs::create_dir_all(parent) {
+			log::error!("Failed to create resource subdirectory {parent:?}: {error}");
+			return hash;
+		}
+
+		let tmp = parent.join(format!(
+			"tmp.{}.{}.{}",
+			path.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+			std::process::id(),
+			std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0),
+		));
+
+		let write_result = (|| -> std::io::Result<()> {
+			let mut file = fs::File::create(&tmp)?;
+			file.write_all(data)?;
+			file.sync_all()?;
+			fs::rename(&tmp, &path)
+		})();
+
+		if let Err(error) = write_result {
+			log::error!("Failed to write resource to {path:?}: {error}");
+			let _ = fs::remove_file(&tmp);
+		}
+
+		hash
+	}
+
+	fn contains(&mut self, hash: &ResourceHash) -> bool {
+		self.cache.contains_key(hash) || self.path_for(hash).exists()
+	}
+}
+
+struct MmappedBytes(MemoryMappedFile);
+
+impl AsRef<[u8]> for MmappedBytes {
+	fn as_ref(&self) -> &[u8] {
+		let len = self.0.len();
+		match self.0.as_slice(0, len) {
+			Ok(slice) => slice,
+			Err(error) => {
+				log::error!("Failed to obtain mmap slice: {error}");
+				&[]
+			}
+		}
+	}
+}
