@@ -104,6 +104,10 @@ impl NodeGraphExecutor {
 			.expect("Failed to send editor preferences");
 	}
 
+	pub fn store_resource(&self, data: std::sync::Arc<[u8]>) {
+		self.runtime_io.send(GraphRuntimeRequest::StoreResource(data)).expect("Failed to send store resource request");
+	}
+
 	/// Updates the network to monitor all inputs. Useful for the testing.
 	#[cfg(test)]
 	pub(crate) fn update_node_graph_instrumented(&mut self, document: &mut DocumentMessageHandler) -> Result<Instrumented, String> {

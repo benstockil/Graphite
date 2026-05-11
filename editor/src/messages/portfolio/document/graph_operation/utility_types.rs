@@ -5,7 +5,7 @@ use crate::messages::portfolio::document::utility_types::network_interface::{sel
 use crate::messages::prelude::*;
 use glam::{DAffine2, DVec2};
 use graph_craft::document::value::TaggedValue;
-use graph_craft::document::{NodeId, NodeInput};
+use graph_craft::document::{DocumentNodeImplementation, NodeId, NodeInput};
 use graph_craft::{ProtoNodeIdentifier, concrete, descriptor};
 use graphene_std::brush::brush_stroke::BrushStroke;
 use graphene_std::list::List;
@@ -298,9 +298,20 @@ impl<'a> ModifyInputsContext<'a> {
 		let transform = resolve_proto_node_type(graphene_std::transform_nodes::transform::IDENTIFIER)
 			.expect("Transform node does not exist")
 			.default_node_template();
-		let image_node = resolve_proto_node_type(graphene_std::raster_nodes::std_nodes::image::IDENTIFIER)
-			.expect("Image node does not exist")
-			.node_template_input_override([Some(NodeInput::value(TaggedValue::None, false)), Some(NodeInput::value(TaggedValue::ImageData(image), false))]);
+
+		let png_bytes: std::sync::Arc<[u8]> = image.to_png().into();
+		let hash = graphene_std::application_io::ResourceHash::from(png_bytes.as_ref());
+		self.responses.add(PortfolioMessage::StoreResource { data: png_bytes });
+
+		let mut image_node = resolve_network_node_type("Image").expect("Image node does not exist").default_node_template();
+		if let DocumentNodeImplementation::Network(inner) = &mut image_node.document_node.implementation
+			&& let Some(load_resource) = inner.nodes.get_mut(&NodeId(0))
+			&& let Some(hash_input) = load_resource.inputs.get_mut(2)
+		{
+			*hash_input = NodeInput::value(TaggedValue::Resource(hash), false);
+		} else {
+			log::error!("Image node template did not have the expected internal load_resource node");
+		}
 
 		let image_id = NodeId::new();
 		self.network_interface.insert_node(image_id, image_node, &[]);

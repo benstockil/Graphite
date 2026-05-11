@@ -549,12 +549,14 @@ const NODE_REPLACEMENTS: &[NodeReplacement<'static>] = &[
 		],
 	},
 	NodeReplacement {
-		node: graphene_std::raster_nodes::std_nodes::image::IDENTIFIER,
+		node: graphene_std::raster_nodes::std_nodes::decode_image::IDENTIFIER,
 		aliases: &[
 			"raster_nodes::std_nodes::ImageValueNode",
 			"graphene_raster_nodes::std_nodes::ImageValueNode",
 			"graphene_std::raster::ImageValueNode",
 			"graphene_std::raster::ImageNode",
+			"raster_nodes::std_nodes::ImageNode",
+			"graphene_raster_nodes::std_nodes::ImageNode",
 		],
 	},
 	NodeReplacement {
@@ -1588,7 +1590,7 @@ fn migrate_node(node_id: &NodeId, node: &DocumentNode, network_path: &[NodeId], 
 		document.network_interface.set_input(&InputConnector::node(*node_id, 4), old_inputs[3].clone(), network_path);
 	}
 
-	if reference == DefinitionIdentifier::ProtoNode(graphene_std::raster_nodes::std_nodes::image::IDENTIFIER) && inputs_count == 1 {
+	if reference == DefinitionIdentifier::ProtoNode(graphene_std::raster_nodes::std_nodes::decode_image::IDENTIFIER) && inputs_count == 1 {
 		let mut node_template = resolve_document_node_type(&reference)?.default_node_template();
 		document.network_interface.replace_implementation(node_id, network_path, &mut node_template);
 

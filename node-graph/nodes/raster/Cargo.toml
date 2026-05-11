@@ -18,6 +18,7 @@ std = [
 	"dep:core-types",
 	"dep:dyn-any",
 	"dep:graphene-hash",
+	"dep:graphene-application-io",
 	"dep:raster-types",
 	"dep:vector-types",
 	"dep:image",
@@ -26,6 +27,7 @@ std = [
 	"dep:rand_chacha",
 	"dep:fastnoise-lite",
 	"dep:kurbo",
+	"dep:log",
 ]
 wasm = [
 	"core-types/wasm",
@@ -44,6 +46,7 @@ node-macro = { workspace = true }
 dyn-any = { workspace = true, optional = true }
 core-types = { workspace = true, optional = true }
 graphene-hash = { workspace = true, optional = true }
+graphene-application-io = { workspace = true, optional = true }
 raster-types = { workspace = true, optional = true }
 vector-types = { workspace = true, optional = true }
 wgpu-executor = { workspace = true, optional = true }
@@ -64,6 +67,7 @@ rand_chacha = { workspace = true, optional = true }
 fastnoise-lite = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 kurbo = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
 
 # Workspace Wasm dependencies
 tsify = { workspace = true, optional = true }

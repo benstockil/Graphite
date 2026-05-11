@@ -9,6 +9,7 @@ use core_types::transform::Transform;
 use dyn_any::DynAny;
 use fastnoise_lite;
 use glam::{DAffine2, DVec2, Vec2};
+use graphene_application_io::Resource;
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use raster_types::Image;
@@ -289,7 +290,22 @@ pub fn empty_image(_: impl Ctx, transform: DAffine2, color: List<Color>) -> List
 }
 
 #[node_macro::node(category(""))]
-pub fn image(_: impl Ctx, _primary: (), image: Image<Color>) -> List<Raster<CPU>> {
+pub fn decode_image(_: impl Ctx, _primary: (), resource: Resource) -> List<Raster<CPU>> {
+	let Ok(decoded) = ::image::load_from_memory(resource.as_ref()) else {
+		log::error!("Failed to decode image resource");
+		return List::new();
+	};
+	let rgba = decoded.to_rgba32f();
+	let image = Image {
+		data: rgba
+			.chunks(4)
+			.map(|pixel| Color::from_unassociated_alpha(pixel[0], pixel[1], pixel[2], pixel[3]).to_linear_srgb())
+			.collect(),
+		width: rgba.width(),
+		height: rgba.height(),
+		..Default::default()
+	};
+
 	List::new_from_element(Raster::new_cpu(image))
 }
 

@@ -437,6 +437,7 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 				}
 			}
 			PortfolioMessage::EditorPreferences => self.executor.update_editor_preferences(preferences.editor_preferences()),
+			PortfolioMessage::StoreResource { data } => self.executor.store_resource(data),
 			PortfolioMessage::LoadDocumentResources { document_id } => {
 				let catalog = &self.cached_data.font_catalog;
 

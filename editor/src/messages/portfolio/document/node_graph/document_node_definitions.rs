@@ -914,7 +914,7 @@ fn document_node_definitions() -> HashMap<DefinitionIdentifier, DocumentNodeDefi
 			properties: None,
 		},
 		DocumentNodeDefinition {
-			identifier: "Load Image",
+			identifier: "Image",
 			category: "Web Request",
 			node_template: NodeTemplate {
 				document_node: DocumentNode {
@@ -922,13 +922,17 @@ fn document_node_definitions() -> HashMap<DefinitionIdentifier, DocumentNodeDefi
 						exports: vec![NodeInput::node(NodeId(1), 0)],
 						nodes: [
 							DocumentNode {
-								inputs: vec![NodeInput::value(TaggedValue::None, false), NodeInput::scope("editor-api"), NodeInput::import(concrete!(String), 1)],
+								inputs: vec![
+									NodeInput::value(TaggedValue::None, false),
+									NodeInput::scope("editor-api"),
+									NodeInput::value(TaggedValue::Resource(application_io::ResourceHash::default()), false),
+								],
 								implementation: DocumentNodeImplementation::ProtoNode(platform_application_io::load_resource::IDENTIFIER),
 								..Default::default()
 							},
 							DocumentNode {
-								inputs: vec![NodeInput::node(NodeId(0), 0)],
-								implementation: DocumentNodeImplementation::ProtoNode(platform_application_io::decode_image::IDENTIFIER),
+								inputs: vec![NodeInput::value(TaggedValue::None, false), NodeInput::node(NodeId(0), 0)],
+								implementation: DocumentNodeImplementation::ProtoNode(raster_nodes::std_nodes::decode_image::IDENTIFIER),
 								..Default::default()
 							},
 						]
@@ -938,11 +942,11 @@ fn document_node_definitions() -> HashMap<DefinitionIdentifier, DocumentNodeDefi
 						.collect(),
 						..Default::default()
 					}),
-					inputs: vec![NodeInput::value(TaggedValue::None, false), NodeInput::value(TaggedValue::String("graphite:null".to_string()), false)],
+					inputs: vec![NodeInput::value(TaggedValue::None, false)],
 					..Default::default()
 				},
 				persistent_node_metadata: DocumentNodePersistentMetadata {
-					input_metadata: vec![("Empty", "TODO").into(), ("URL", "TODO").into()],
+					input_metadata: vec![("Empty", "TODO").into()],
 					output_names: vec!["Image".to_string()],
 					network_metadata: Some(NodeNetworkMetadata {
 						persistent_metadata: NodeNetworkPersistentMetadata {
@@ -973,7 +977,7 @@ fn document_node_definitions() -> HashMap<DefinitionIdentifier, DocumentNodeDefi
 					..Default::default()
 				},
 			},
-			description: Cow::Borrowed("Loads an image from a given URL."),
+			description: Cow::Borrowed("An image stored as a content-addressed resource in the platform resource store."),
 			properties: None,
 		},
 		#[cfg(all(feature = "gpu", target_family = "wasm"))]

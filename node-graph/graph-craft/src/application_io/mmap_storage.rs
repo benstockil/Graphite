@@ -101,6 +101,8 @@ impl ResourceStorage for MmapResourceStorage {
 	}
 }
 
+/// Wraps a `MemoryMappedFile` so it can flow through the type-erased `Resource` handle.
+/// The mapping stays alive for as long as any `Resource` clone holding this wrapper exists.
 struct MmappedBytes(MemoryMappedFile);
 
 impl AsRef<[u8]> for MmappedBytes {

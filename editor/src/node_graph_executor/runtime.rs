@@ -71,6 +71,7 @@ pub enum GraphRuntimeRequest {
 	ExecutionRequest(ExecutionRequest),
 	FontCacheUpdate(FontCache),
 	EditorPreferencesUpdate(EditorPreferences),
+	StoreResource(Arc<[u8]>),
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -154,6 +155,17 @@ impl NodeRuntime {
 	}
 
 	pub async fn run(&mut self) -> Option<ImageTexture> {
+		if self.editor_api.application_io.is_none() {
+			let resources = Box::new(graphene_std::render_node::HashMapResourceStorage::new());
+			self.editor_api = PlatformEditorApi {
+				application_io: Some(PlatformApplicationIo::new(resources).await.into()),
+				font_cache: self.editor_api.font_cache.clone(),
+				node_graph_message_sender: Box::new(self.sender.clone()),
+				editor_preferences: Box::new(self.editor_preferences.clone()),
+			}
+			.into();
+		}
+
 		let mut font = None;
 		let mut preferences = None;
 		let mut graph = None;
@@ -180,6 +192,13 @@ impl NodeRuntime {
 				}
 				GraphRuntimeRequest::FontCacheUpdate(_) => font = Some(request),
 				GraphRuntimeRequest::EditorPreferencesUpdate(_) => preferences = Some(request),
+				GraphRuntimeRequest::StoreResource(data) => {
+					if let Some(api) = self.editor_api.application_io.as_ref() {
+						api.store_resource(&data);
+					} else {
+						log::error!("StoreResource received before ApplicationIo was initialized");
+					}
+				}
 			}
 		}
 
@@ -347,6 +366,7 @@ impl NodeRuntime {
 					});
 					return texture;
 				}
+				GraphRuntimeRequest::StoreResource(_) => unreachable!(),
 			}
 		}
 		None

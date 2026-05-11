@@ -2,6 +2,9 @@
 use base64::Engine;
 #[cfg(target_family = "wasm")]
 use canvas_utils::{Canvas, CanvasHandle};
+use core_types::Ctx;
+#[cfg(target_family = "wasm")]
+use core_types::Color;
 use core_types::list::{Item, List};
 #[cfg(target_family = "wasm")]
 use core_types::math::bbox::Bbox;
@@ -9,10 +12,8 @@ use core_types::math::bbox::Bbox;
 use core_types::transform::Footprint;
 #[cfg(target_family = "wasm")]
 use core_types::{ATTR_EDITOR_MERGED_LAYERS, ATTR_TRANSFORM, WasmNotSend};
-use core_types::{Color, Ctx};
 pub use graph_craft::application_io::*;
 pub use graph_craft::document::value::RenderOutputType;
-use graphene_application_io::ApplicationIo;
 #[cfg(target_family = "wasm")]
 pub use graphene_canvas_utils as canvas_utils;
 #[cfg(target_family = "wasm")]
@@ -21,13 +22,13 @@ use graphic_types::Graphic;
 use graphic_types::IntoGraphicList;
 #[cfg(target_family = "wasm")]
 use graphic_types::Vector;
+#[cfg(target_family = "wasm")]
 use graphic_types::raster_types::Image;
 use graphic_types::raster_types::{CPU, Raster};
 #[cfg(target_family = "wasm")]
 use graphic_types::vector_types::gradient::GradientStops;
 #[cfg(target_family = "wasm")]
 use rendering::{Render, RenderParams, RenderSvgSegmentList, SvgRender};
-use std::sync::Arc;
 
 fn parse_headers(headers: &str) -> reqwest::header::HeaderMap {
 	use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -126,36 +127,17 @@ fn image_to_bytes(_: impl Ctx, image: List<Raster<CPU>>) -> List<u8> {
 	image.data.iter().flat_map(|color| color.to_rgba8_srgb()).map(Item::new_from_element).collect()
 }
 
-/// Loads binary data from the resource store by its content hash. Panics if the resource is not found.
+/// Loads a binary blob from the platform resource storage by its content hash. Returns an empty `Resource` if the hash is not present in storage.
 #[node_macro::node(category("Web Request"))]
-async fn load_resource<'a: 'n>(_: impl Ctx, _primary: (), #[scope("editor-api")] editor_resources: &'a PlatformEditorApi, #[name("Hash")] hash: String) -> Arc<[u8] > {
-	let api = editor_resources.application_io.as_ref().expect("ApplicationIo not available");
-	let hash = ResourceHash::try_from(hash.as_str()).expect("Invalid resource hash");
-	let resource = api.load_resource(&hash).expect("Resource not found");
-
-	Arc::from(resource.as_ref().to_vec())
-}
-
-/// Converts raw binary data to a raster image.
-///
-/// Works with standard image format (PNG, JPEG, WebP, etc.). Automatically converts the color space to linear sRGB for accurate compositing.
-#[node_macro::node(category("Web Request"))]
-fn decode_image(_: impl Ctx, data: Arc<[u8]>) -> List<Raster<CPU>> {
-	let Some(image) = image::load_from_memory(data.as_ref()).ok() else {
-		return List::new();
+async fn load_resource<'a: 'n>(_: impl Ctx, _primary: (), #[scope("editor-api")] editor_api: &'a PlatformEditorApi, hash: ResourceHash) -> Resource {
+	let Some(api) = editor_api.application_io.as_ref() else {
+		log::error!("ApplicationIo not available");
+		return Resource::new(Vec::<u8>::new());
 	};
-	let image = image.to_rgba32f();
-	let image = Image {
-		data: image
-			.chunks(4)
-			.map(|pixel| Color::from_unassociated_alpha(pixel[0], pixel[1], pixel[2], pixel[3]).to_linear_srgb())
-			.collect(),
-		width: image.width(),
-		height: image.height(),
-		..Default::default()
-	};
-
-	List::new_from_element(Raster::new_cpu(image))
+	api.load_resource(&hash).unwrap_or_else(|| {
+		log::error!("Resource {hash} not found");
+		Resource::new(Vec::<u8>::new())
+	})
 }
 
 #[cfg(target_family = "wasm")]

@@ -1,9 +1,12 @@
+use core_types::CacheHash;
+use dyn_any::{DynAny, StaticType};
 use std::fmt;
+use std::hash::Hash;
 use std::ops::Deref;
 use std::sync::Arc;
 
 /// Blake3 content hash of a resource
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord, DynAny)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ResourceHash([u8; 32]);
 
@@ -27,15 +30,15 @@ impl ResourceHash {
 	}
 }
 
-impl From<[u8; 32]> for ResourceHash {
-	fn from(bytes: [u8; 32]) -> Self {
-		Self(bytes)
+impl From<&[u8]> for ResourceHash {
+	fn from(data: &[u8]) -> Self {
+		Self(blake3::hash(data).into())
 	}
 }
 
-impl From<blake3::Hash> for ResourceHash {
-	fn from(hash: blake3::Hash) -> Self {
-		Self(hash.into())
+impl From<[u8; 32]> for ResourceHash {
+	fn from(bytes: [u8; 32]) -> Self {
+		Self(bytes)
 	}
 }
 
@@ -94,6 +97,12 @@ impl TryFrom<&str> for ResourceHash {
 	}
 }
 
+impl CacheHash for ResourceHash {
+	fn cache_hash<H: core::hash::Hasher>(&self, state: &mut H) {
+		core::hash::Hash::hash(self, state);
+	}
+}
+
 fn decode_hex_nibble(byte: u8, position: usize) -> Result<u8, ResourceHashParseError> {
 	match byte {
 		b'0'..=b'9' => Ok(byte - b'0'),
@@ -136,6 +145,24 @@ impl fmt::Debug for Resource {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("Resource").field("len", &self.len()).finish()
 	}
+}
+
+impl PartialEq for Resource {
+	fn eq(&self, other: &Self) -> bool {
+		self.as_ref() == other.as_ref()
+	}
+}
+
+impl CacheHash for Resource {
+	fn cache_hash<H: core::hash::Hasher>(&self, state: &mut H) {
+		self.as_ref().hash(state);
+	}
+}
+
+// SAFETY: `Resource` does not borrow any non-'static data — its only field is `Arc<dyn AsRef<[u8]> + Send + Sync>`,
+// which owns its bytes. The trait object has no lifetime parameter.
+unsafe impl StaticType for Resource {
+	type Static = Resource;
 }
 
 pub trait ResourceStorage: Send {

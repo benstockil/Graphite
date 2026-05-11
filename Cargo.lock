@@ -1908,7 +1908,6 @@ dependencies = [
 name = "graph-craft"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "brush-nodes",
  "core-types",
  "criterion",
@@ -4333,9 +4332,11 @@ dependencies = [
  "fastnoise-lite",
  "futures",
  "glam",
+ "graphene-application-io",
  "graphene-hash",
  "image",
  "kurbo",
+ "log",
  "ndarray",
  "no-std-types",
  "node-macro",

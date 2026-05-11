@@ -86,7 +86,7 @@ impl IndexedDbResourceStorage {
 			key_bytes.copy_to(&mut hash_buf);
 
 			let payload = value_bytes.to_vec();
-			let recomputed = ResourceHash::from(blake3::hash(&payload));
+			let recomputed = ResourceHash::from(payload.as_slice());
 			let stored = ResourceHash::from(hash_buf);
 			if recomputed != stored {
 				log::warn!("Skipping IndexedDB entry whose hash does not match its payload: {stored} vs {recomputed}");
@@ -144,7 +144,7 @@ impl ResourceStorage for IndexedDbResourceStorage {
 	}
 
 	fn write(&mut self, data: &[u8]) -> ResourceHash {
-		let hash = ResourceHash::from(blake3::hash(data));
+		let hash = ResourceHash::from(data);
 		self.cache.insert(hash, Resource::new(Arc::<[u8]>::from(data)));
 		self.enqueue_put(hash, data.to_vec());
 		hash
