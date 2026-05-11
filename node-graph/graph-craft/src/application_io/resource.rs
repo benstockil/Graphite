@@ -1,3 +1,5 @@
+#[cfg(target_family = "wasm")]
+pub mod indexed_db;
 #[cfg(not(target_family = "wasm"))]
 pub mod mmap;
 

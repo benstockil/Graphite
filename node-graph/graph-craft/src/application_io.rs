@@ -7,6 +7,8 @@ pub mod resource;
 
 pub use graphene_application_io::{ApplicationIo, Resource, ResourceHash, ResourceStorage};
 pub use resource::HashMapResourceStorage;
+#[cfg(target_family = "wasm")]
+pub use resource::indexed_db::IndexedDbResourceStorage;
 #[cfg(not(target_family = "wasm"))]
 pub use resource::mmap::MmapResourceStorage;
 

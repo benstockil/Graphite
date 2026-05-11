@@ -1936,6 +1936,7 @@ dependencies = [
  "url",
  "vector-nodes",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
  "wgpu-executor",
  "winit",
