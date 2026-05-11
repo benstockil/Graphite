@@ -22,7 +22,7 @@ use crate::preferences;
 use crate::render::{RenderError, RenderState};
 use crate::window::Window;
 use crate::wrapper::messages::{DesktopFrontendMessage, DesktopWrapperMessage, InputMessage, MouseKeys, MouseState, Preferences};
-use crate::wrapper::{DesktopWrapper, NodeGraphExecutionResult, WgpuContext, serialize_frontend_messages};
+use crate::wrapper::{DesktopWrapper, HashMapResourceStorage, NodeGraphExecutionResult, WgpuContext, serialize_frontend_messages};
 
 pub(crate) struct App {
 	render_state: Option<RenderState>,
@@ -526,7 +526,7 @@ impl ApplicationHandler for App {
 
 		self.resize();
 
-		self.desktop_wrapper.init(self.wgpu_context.clone());
+		self.desktop_wrapper.init(self.wgpu_context.clone(), Box::new(HashMapResourceStorage::new()));
 
 		self.startup_time = Some(Instant::now());
 	}

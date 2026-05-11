@@ -49,7 +49,9 @@ pub trait ApplicationIo {
 	fn gpu_executor(&self) -> Option<&Self::Executor> {
 		None
 	}
-	fn load_resource(&self, hash: &ResourceHash) -> Option<&[u8]>;
+	fn load_resource(&self, hash: &ResourceHash) -> Option<Resource>;
+	fn store_resource(&self, data: &[u8]) -> ResourceHash;
+	fn contains_resource(&self, hash: &ResourceHash) -> bool;
 }
 
 impl<T: ApplicationIo> ApplicationIo for &T {
@@ -59,8 +61,16 @@ impl<T: ApplicationIo> ApplicationIo for &T {
 		(**self).gpu_executor()
 	}
 
-	fn load_resource<'a>(&self, hash: &ResourceHash) -> Option<&[u8]> {
+	fn load_resource(&self, hash: &ResourceHash) -> Option<Resource> {
 		(**self).load_resource(hash)
+	}
+
+	fn store_resource(&self, data: &[u8]) -> ResourceHash {
+		(**self).store_resource(data)
+	}
+
+	fn contains_resource(&self, hash: &ResourceHash) -> bool {
+		(**self).contains_resource(hash)
 	}
 }
 

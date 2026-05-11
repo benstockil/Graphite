@@ -126,20 +126,14 @@ fn image_to_bytes(_: impl Ctx, image: List<Raster<CPU>>) -> List<u8> {
 	image.data.iter().flat_map(|color| color.to_rgba8_srgb()).map(Item::new_from_element).collect()
 }
 
-/// Loads binary from URLs and local asset paths. Returns a transparent placeholder if the resource fails to load, allowing rendering to continue.
+/// Loads binary data from the resource store by its content hash. Panics if the resource is not found.
 #[node_macro::node(category("Web Request"))]
-async fn load_resource<'a: 'n>(_: impl Ctx, _primary: (), #[scope("editor-api")] editor_resources: &'a PlatformEditorApi, #[name("URL")] url: String) -> Arc<[u8]> {
-	let Some(api) = editor_resources.application_io.as_ref() else {
-		return Arc::from(include_bytes!("../../../graph-craft/src/null.png").to_vec());
-	};
-	let Ok(data) = api.load_resource(url) else {
-		return Arc::from(include_bytes!("../../../graph-craft/src/null.png").to_vec());
-	};
-	let Ok(data) = data.await else {
-		return Arc::from(include_bytes!("../../../graph-craft/src/null.png").to_vec());
-	};
+async fn load_resource<'a: 'n>(_: impl Ctx, _primary: (), #[scope("editor-api")] editor_resources: &'a PlatformEditorApi, #[name("Hash")] hash: String) -> Arc<[u8] > {
+	let api = editor_resources.application_io.as_ref().expect("ApplicationIo not available");
+	let hash = ResourceHash::try_from(hash.as_str()).expect("Invalid resource hash");
+	let resource = api.load_resource(&hash).expect("Resource not found");
 
-	data
+	Arc::from(resource.as_ref().to_vec())
 }
 
 /// Converts raw binary data to a raster image.
