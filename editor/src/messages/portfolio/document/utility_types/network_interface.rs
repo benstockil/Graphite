@@ -511,10 +511,8 @@ impl NodeNetworkInterface {
 		})
 	}
 
-	pub fn used_resources(&self) -> HashSet<ResourceHash> {
-		let mut used_resources = HashSet::new();
-		collect_network_resources(self.document_network(), &mut used_resources);
-		used_resources
+	pub fn collect_used_resources(&self, target: &mut HashSet<ResourceHash>) {
+		collect_network_resources(self.document_network(), target);
 	}
 
 	pub fn frontend_imports(&mut self, network_path: &[NodeId]) -> Vec<Option<FrontendGraphOutput>> {

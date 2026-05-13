@@ -441,7 +441,7 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 			PortfolioMessage::EditorPreferences => self.executor.update_editor_preferences(preferences.editor_preferences()),
 			PortfolioMessage::StoreResource { data } => self.executor.queue_resource_request(ResourceRequest::Write(data)),
 			PortfolioMessage::GarbageCollectResources => {
-				let used_resources = self.documents.values().flat_map(|document| document.network_interface.used_resources()).collect::<Vec<_>>();
+				let used_resources = self.documents.values().flat_map(|document| document.used_resources()).collect::<Vec<_>>();
 				self.executor.queue_resource_request(ResourceRequest::GarbageCollect {
 					used: used_resources.into_boxed_slice(),
 				});

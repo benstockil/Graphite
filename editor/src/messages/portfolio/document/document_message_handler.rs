@@ -29,7 +29,7 @@ use crate::messages::tool::tool_messages::tool_prelude::Key;
 use crate::messages::tool::utility_types::ToolType;
 use crate::node_graph_executor::NodeGraphExecutor;
 use glam::{DAffine2, DVec2};
-use graph_craft::application_io::wgpu_available;
+use graph_craft::application_io::{ResourceHash, wgpu_available};
 use graph_craft::descriptor;
 use graph_craft::document::value::TaggedValue;
 use graph_craft::document::{NodeId, NodeInput, NodeNetwork, OldNodeNetwork};
@@ -3339,6 +3339,14 @@ impl DocumentMessageHandler {
 
 	pub fn graph_view_overlay_open(&self) -> bool {
 		self.graph_view_overlay_open
+	}
+
+	pub fn used_resources(&self) -> HashSet<ResourceHash> {
+		let mut resources = HashSet::new();
+		self.network_interface.collect_used_resources(&mut resources);
+		self.document_undo_history.iter().for_each(|interface| interface.collect_used_resources(&mut resources));
+		self.document_redo_history.iter().for_each(|interface| interface.collect_used_resources(&mut resources));
+		resources
 	}
 }
 
