@@ -123,11 +123,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 	log::info!("Creating GPU context");
 	let application_io = block_on(PlatformApplicationIo::new(Box::new(HashMapResourceStorage::new())));
 
-	if let Command::Export { image: Some(ref image_path), .. } = app.command {
-		let data = std::fs::read(image_path).expect("Failed to read image");
-		application_io.store_resource(&data);
-	}
-
 	// Convert application_io to Arc first
 	let application_io_arc = Arc::new(application_io);
 

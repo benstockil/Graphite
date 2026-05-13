@@ -50,8 +50,6 @@ pub trait ApplicationIo {
 		None
 	}
 	fn load_resource(&self, hash: &ResourceHash) -> Option<Resource>;
-	fn store_resource(&self, data: &[u8]) -> ResourceHash;
-	fn contains_resource(&self, hash: &ResourceHash) -> bool;
 }
 
 impl<T: ApplicationIo> ApplicationIo for &T {
@@ -64,20 +62,6 @@ impl<T: ApplicationIo> ApplicationIo for &T {
 	fn load_resource(&self, hash: &ResourceHash) -> Option<Resource> {
 		(**self).load_resource(hash)
 	}
-
-	fn store_resource(&self, data: &[u8]) -> ResourceHash {
-		(**self).store_resource(data)
-	}
-
-	fn contains_resource(&self, hash: &ResourceHash) -> bool {
-		(**self).contains_resource(hash)
-	}
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ApplicationError {
-	NotFound,
-	InvalidUrl,
 }
 
 #[derive(Debug, Clone)]

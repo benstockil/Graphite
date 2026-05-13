@@ -99,6 +99,35 @@ impl ResourceStorage for MmapResourceStorage {
 	fn contains(&mut self, hash: &ResourceHash) -> bool {
 		self.cache.contains_key(hash) || self.path_for(hash).exists()
 	}
+
+	fn garbage_collect(&mut self, used: &[ResourceHash]) {
+		let used_set: std::collections::HashSet<ResourceHash> = used.iter().cloned().collect();
+		self.cache.retain(|hash, _| used_set.contains(hash));
+
+		let Ok(top_entries) = fs::read_dir(&self.root) else { return };
+		for top_entry in top_entries.flatten() {
+			let top_path = top_entry.path();
+			if !top_path.is_dir() {
+				continue;
+			}
+			let Ok(entries) = fs::read_dir(&top_path) else { continue };
+			for entry in entries.flatten() {
+				let path = entry.path();
+				let Some(prefix) = top_path.file_name().and_then(|n| n.to_str()) else { continue };
+				let Some(suffix) = path.file_name().and_then(|n| n.to_str()) else { continue };
+				if suffix.starts_with("tmp.") {
+					continue;
+				}
+				let hex = format!("{prefix}{suffix}");
+				let Ok(hash) = ResourceHash::try_from(hex.as_str()) else { continue };
+				if !used_set.contains(&hash) {
+					if let Err(error) = fs::remove_file(&path) {
+						log::error!("Failed to remove unused resource {path:?}: {error}");
+					}
+				}
+			}
+		}
+	}
 }
 
 struct MmappedBytes(MemoryMappedFile);

@@ -62,15 +62,13 @@ impl ApplicationIo for PlatformApplicationIo {
 	}
 
 	fn load_resource(&self, hash: &ResourceHash) -> Option<Resource> {
-		self.resources.lock().ok()?.read(hash)
+		self.resources().read(hash)
 	}
+}
 
-	fn store_resource(&self, data: &[u8]) -> ResourceHash {
-		self.resources.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).write(data)
-	}
-
-	fn contains_resource(&self, hash: &ResourceHash) -> bool {
-		self.resources.lock().is_ok_and(|mut storage| storage.contains(hash))
+impl PlatformApplicationIo {
+	pub fn resources(&self) -> std::sync::MutexGuard<'_, Box<dyn ResourceStorage>> {
+		self.resources.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 	}
 }
 

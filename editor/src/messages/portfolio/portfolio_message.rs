@@ -53,6 +53,7 @@ pub enum PortfolioMessage {
 	StoreResource {
 		data: std::sync::Arc<[u8]>,
 	},
+	GarbageCollectResources,
 	FontCatalogLoaded {
 		catalog: FontCatalog,
 	},

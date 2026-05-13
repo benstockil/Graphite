@@ -159,8 +159,6 @@ impl CacheHash for Resource {
 	}
 }
 
-// SAFETY: `Resource` does not borrow any non-'static data — its only field is `Arc<dyn AsRef<[u8]> + Send + Sync>`,
-// which owns its bytes. The trait object has no lifetime parameter.
 unsafe impl StaticType for Resource {
 	type Static = Resource;
 }
@@ -169,4 +167,5 @@ pub trait ResourceStorage: Send {
 	fn read(&mut self, hash: &ResourceHash) -> Option<Resource>;
 	fn write(&mut self, data: &[u8]) -> ResourceHash;
 	fn contains(&mut self, hash: &ResourceHash) -> bool;
+	fn garbage_collect(&mut self, used: &[ResourceHash]);
 }

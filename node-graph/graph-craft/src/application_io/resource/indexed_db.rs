@@ -107,6 +107,43 @@ impl IndexedDbResourceStorage {
 		Ok(())
 	}
 
+	fn enqueue_delete(&self, hash: ResourceHash) {
+		let db = self.db.clone();
+		let store_name = self.store_name.clone();
+
+		spawn_local(async move {
+			let transaction = match db.transaction_with_str_and_mode(&store_name, IdbTransactionMode::Readwrite) {
+				Ok(transaction) => transaction,
+				Err(error) => {
+					log::error!("Failed to open IndexedDB transaction: {error:?}");
+					return;
+				}
+			};
+
+			let store = match transaction.object_store(&store_name) {
+				Ok(store) => store,
+				Err(error) => {
+					log::error!("Failed to access IndexedDB object store {store_name:?}: {error:?}");
+					return;
+				}
+			};
+
+			let key = JsValue::from_str(&hash.to_hex());
+
+			let request = match store.delete(&key) {
+				Ok(request) => request,
+				Err(error) => {
+					log::error!("Failed to enqueue IndexedDB delete: {error:?}");
+					return;
+				}
+			};
+
+			if let Err(error) = await_request(&request).await {
+				log::error!("IndexedDB delete failed: {error:?}");
+			}
+		});
+	}
+
 	fn enqueue_put(&self, hash: ResourceHash, data: Vec<u8>) {
 		let db = self.db.clone();
 		let store_name = self.store_name.clone();
@@ -160,6 +197,15 @@ impl ResourceStorage for IndexedDbResourceStorage {
 
 	fn contains(&mut self, hash: &ResourceHash) -> bool {
 		self.cache.contains_key(hash)
+	}
+
+	fn garbage_collect(&mut self, used: &[ResourceHash]) {
+		let used_set: std::collections::HashSet<ResourceHash> = used.iter().cloned().collect();
+		let to_delete: Vec<ResourceHash> = self.cache.keys().filter(|h| !used_set.contains(h)).cloned().collect();
+		for hash in to_delete {
+			self.cache.remove(&hash);
+			self.enqueue_delete(hash);
+		}
 	}
 }
 

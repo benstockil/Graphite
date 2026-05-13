@@ -32,4 +32,9 @@ impl ResourceStorage for HashMapResourceStorage {
 	fn contains(&mut self, hash: &ResourceHash) -> bool {
 		self.resources.contains_key(hash)
 	}
+
+	fn garbage_collect(&mut self, used: &[ResourceHash]) {
+		let used_set: std::collections::HashSet<&ResourceHash> = used.iter().collect();
+		self.resources.retain(|hash, _| used_set.contains(hash));
+	}
 }

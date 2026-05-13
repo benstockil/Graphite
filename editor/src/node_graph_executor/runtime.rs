@@ -1,5 +1,6 @@
 use super::*;
 use crate::messages::frontend::utility_types::{ExportBounds, FileType};
+use crate::node_graph_executor::resources::{ResourceRequest, ResourceStorageExt};
 use glam::{DAffine2, DVec2, UVec2};
 use graph_craft::application_io::{PlatformApplicationIo, PlatformEditorApi};
 use graph_craft::document::value::{RenderOutput, RenderOutputType, TaggedValue};
@@ -69,9 +70,9 @@ pub struct NodeRuntime {
 pub enum GraphRuntimeRequest {
 	GraphUpdate(GraphUpdate),
 	ExecutionRequest(ExecutionRequest),
+	Resource(ResourceRequest),
 	FontCacheUpdate(FontCache),
 	EditorPreferencesUpdate(EditorPreferences),
-	StoreResource(Arc<[u8]>),
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -98,7 +99,7 @@ pub struct ExportConfig {
 struct InternalNodeGraphUpdateSender(Sender<NodeGraphUpdate>);
 
 impl InternalNodeGraphUpdateSender {
-	fn send_generation_response(&self, response: CompilationResponse) {
+	fn send_compilation_response(&self, response: CompilationResponse) {
 		self.0.send(NodeGraphUpdate::CompilationResponse(response)).expect("Failed to send response")
 	}
 
@@ -156,7 +157,7 @@ impl NodeRuntime {
 
 	pub async fn run(&mut self) -> Option<ImageTexture> {
 		if self.editor_api.application_io.is_none() {
-			let resources = Box::new(graphene_std::render_node::HashMapResourceStorage::new());
+			let resources = Box::new(graph_craft::application_io::HashMapResourceStorage::new());
 			self.editor_api = PlatformEditorApi {
 				application_io: Some(PlatformApplicationIo::new(resources).await.into()),
 				font_cache: self.editor_api.font_cache.clone(),
@@ -192,12 +193,12 @@ impl NodeRuntime {
 				}
 				GraphRuntimeRequest::FontCacheUpdate(_) => font = Some(request),
 				GraphRuntimeRequest::EditorPreferencesUpdate(_) => preferences = Some(request),
-				GraphRuntimeRequest::StoreResource(data) => {
-					if let Some(api) = self.editor_api.application_io.as_ref() {
-						api.store_resource(&data);
-					} else {
+				GraphRuntimeRequest::Resource(request) => {
+					let Some(api) = self.editor_api.application_io.as_ref() else {
 						log::error!("StoreResource received before ApplicationIo was initialized");
-					}
+						continue;
+					};
+					api.resources().process_request(request);
 				}
 			}
 		}
@@ -253,7 +254,7 @@ impl NodeRuntime {
 
 					self.update_thumbnails = true;
 
-					self.sender.send_generation_response(CompilationResponse { result, node_graph_errors });
+					self.sender.send_compilation_response(CompilationResponse { result, node_graph_errors });
 				}
 				GraphRuntimeRequest::ExecutionRequest(ExecutionRequest { execution_id, mut render_config, .. }) => {
 					// We may want to render via the SVG pipeline even though raster was requested, if SVG Preview render mode is active or WebGPU/Vello is unavailable
@@ -366,7 +367,7 @@ impl NodeRuntime {
 					});
 					return texture;
 				}
-				GraphRuntimeRequest::StoreResource(_) => unreachable!(),
+				GraphRuntimeRequest::Resource(_) => unreachable!(),
 			}
 		}
 		None
