@@ -2,9 +2,9 @@
 use base64::Engine;
 #[cfg(target_family = "wasm")]
 use canvas_utils::{Canvas, CanvasHandle};
-use core_types::Ctx;
 #[cfg(target_family = "wasm")]
 use core_types::Color;
+use core_types::Ctx;
 use core_types::list::{Item, List};
 #[cfg(target_family = "wasm")]
 use core_types::math::bbox::Bbox;
@@ -131,12 +131,10 @@ fn image_to_bytes(_: impl Ctx, image: List<Raster<CPU>>) -> List<u8> {
 #[node_macro::node(category("Web Request"))]
 async fn load_resource<'a: 'n>(_: impl Ctx, _primary: (), #[scope("editor-api")] editor_api: &'a PlatformEditorApi, hash: ResourceHash) -> Resource {
 	let Some(api) = editor_api.application_io.as_ref() else {
-		log::error!("ApplicationIo not available");
-		return Resource::new(Vec::<u8>::new());
+		panic!("ApplicationIo not available");
 	};
 	api.load_resource(&hash).unwrap_or_else(|| {
-		log::error!("Resource {hash} not found");
-		Resource::new(Vec::<u8>::new())
+		panic!("Resource {hash} not found");
 	})
 }
 

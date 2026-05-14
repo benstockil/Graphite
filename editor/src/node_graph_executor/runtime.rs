@@ -110,6 +110,10 @@ impl InternalNodeGraphUpdateSender {
 	fn send_eyedropper_preview(&self, raster: Raster<CPU>) {
 		self.0.send(NodeGraphUpdate::EyedropperPreview(raster)).expect("Failed to send response")
 	}
+
+	fn send_resource_response(&self, response: ResourceResponse) {
+		self.0.send(NodeGraphUpdate::ResourceResponse(response)).expect("Failed to send response")
+	}
 }
 
 impl NodeGraphUpdateSender for InternalNodeGraphUpdateSender {
@@ -198,7 +202,9 @@ impl NodeRuntime {
 						log::error!("StoreResource received before ApplicationIo was initialized");
 						continue;
 					};
-					api.resources().process_request(request);
+					if let Some(response) = api.resources().process_request(request) {
+						self.sender.send_resource_response(response);
+					}
 				}
 			}
 		}

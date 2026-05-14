@@ -43,9 +43,3 @@ impl ResourceStorageExt for Box<dyn ResourceStorage> {
 		}
 	}
 }
-
-impl std::fmt::Display for ResourceRequest {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		todo!()
-	}
-}

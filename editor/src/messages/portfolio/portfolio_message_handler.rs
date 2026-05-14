@@ -27,6 +27,7 @@ use crate::messages::viewport::ToPhysical;
 use crate::node_graph_executor::resources::ResourceRequest;
 use crate::node_graph_executor::{ExportConfig, NodeGraphExecutor};
 use glam::{DAffine2, DVec2};
+use graph_craft::application_io::ResourceHash;
 use graph_craft::document::NodeId;
 use graphene_std::Color;
 use graphene_std::raster_types::Image;
@@ -36,6 +37,7 @@ use graphene_std::text::Font;
 use graphene_std::vector::misc::HandleId;
 use graphene_std::vector::{PointId, SegmentId, Vector, VectorModificationType};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::vec;
 
 #[derive(ExtractField)]
@@ -763,6 +765,17 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 						return;
 					}
 				};
+
+				if let Some(resources) = document.resources.take() {
+					resources.into_iter().for_each(|(hash, data)| {
+						let data: Arc<[u8]> = Arc::from(data);
+						if ResourceHash::from(data.as_ref()) != hash {
+							log::error!("Resource hash mismatch for resource with hash {hash}");
+							return;
+						}
+						self.executor.queue_resource_request(ResourceRequest::Write(data));
+					});
+				}
 
 				// Upgrade the document's nodes to be compatible with the latest version
 				document_migration_upgrades(&mut document, reset_node_definitions_on_open);
