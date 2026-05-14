@@ -50,6 +50,10 @@ pub enum PortfolioMessage {
 	},
 	DestroyAllDocuments,
 	EditorPreferences,
+	StoreResource {
+		data: std::sync::Arc<[u8]>,
+	},
+	GarbageCollectResources,
 	FontCatalogLoaded {
 		catalog: FontCatalog,
 	},

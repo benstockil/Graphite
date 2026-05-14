@@ -24,8 +24,10 @@ use crate::messages::prelude::*;
 use crate::messages::tool::common_functionality::graph_modification_utils;
 use crate::messages::tool::utility_types::{HintData, ToolType};
 use crate::messages::viewport::ToPhysical;
+use crate::node_graph_executor::resources::ResourceRequest;
 use crate::node_graph_executor::{ExportConfig, NodeGraphExecutor};
 use glam::{DAffine2, DVec2};
+use graph_craft::application_io::ResourceHash;
 use graph_craft::document::NodeId;
 use graphene_std::Color;
 use graphene_std::raster_types::Image;
@@ -35,6 +37,7 @@ use graphene_std::text::Font;
 use graphene_std::vector::misc::HandleId;
 use graphene_std::vector::{PointId, SegmentId, Vector, VectorModificationType};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::vec;
 
 #[derive(ExtractField)]
@@ -183,6 +186,7 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 						responses.add(PortfolioMessage::AutoSaveDocument { document_id: *document_id });
 					}
 				}
+				responses.add(PortfolioMessage::GarbageCollectResources);
 			}
 			PortfolioMessage::AutoSaveDocument { document_id } => {
 				let Some(document) = self.document(document_id) else { return };
@@ -437,6 +441,13 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 				}
 			}
 			PortfolioMessage::EditorPreferences => self.executor.update_editor_preferences(preferences.editor_preferences()),
+			PortfolioMessage::StoreResource { data } => self.executor.queue_resource_request(ResourceRequest::Write(data)),
+			PortfolioMessage::GarbageCollectResources => {
+				let used_resources = self.documents.values().flat_map(|document| document.used_resources()).collect::<Vec<_>>();
+				self.executor.queue_resource_request(ResourceRequest::GarbageCollect {
+					used: used_resources.into_boxed_slice(),
+				});
+			}
 			PortfolioMessage::LoadDocumentResources { document_id } => {
 				let catalog = &self.cached_data.font_catalog;
 
@@ -754,6 +765,17 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 						return;
 					}
 				};
+
+				if let Some(resources) = document.resources.take() {
+					resources.into_iter().for_each(|(hash, data)| {
+						let data: Arc<[u8]> = Arc::from(data);
+						if ResourceHash::from(data.as_ref()) != hash {
+							log::error!("Resource hash mismatch for resource with hash {hash}");
+							return;
+						}
+						self.executor.queue_resource_request(ResourceRequest::Write(data));
+					});
+				}
 
 				// Upgrade the document's nodes to be compatible with the latest version
 				document_migration_upgrades(&mut document, reset_node_definitions_on_open);

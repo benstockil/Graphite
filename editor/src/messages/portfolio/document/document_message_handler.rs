@@ -29,13 +29,13 @@ use crate::messages::tool::tool_messages::tool_prelude::Key;
 use crate::messages::tool::utility_types::ToolType;
 use crate::node_graph_executor::NodeGraphExecutor;
 use glam::{DAffine2, DVec2};
+use graph_craft::application_io::{ResourceHash, wgpu_available};
 use graph_craft::descriptor;
 use graph_craft::document::value::TaggedValue;
 use graph_craft::document::{NodeId, NodeInput, NodeNetwork, OldNodeNetwork};
 use graphene_std::math::quad::Quad;
 use graphene_std::path_bool_nodes::boolean_intersect;
 use graphene_std::raster::BlendMode;
-use graphene_std::render_node::wgpu_available;
 use graphene_std::subpath::Subpath;
 use graphene_std::vector::PointId;
 use graphene_std::vector::click_target::{ClickTarget, ClickTargetType};
@@ -107,6 +107,10 @@ pub struct DocumentMessageHandler {
 	pub graph_view_overlay_open: bool,
 	/// The current opacity of the faded node graph background that covers up the artwork.
 	pub graph_fade_artwork_percentage: f64,
+	/// The resources that are currently used by the document.
+	#[allow(clippy::type_complexity)]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub resources: Option<Vec<(ResourceHash, Box<[u8]>)>>,
 
 	// =============================================
 	// Fields omitted from the saved document format
@@ -143,6 +147,9 @@ pub struct DocumentMessageHandler {
 	/// Whether or not the editor has executed the network to render the document yet. If this is opened as an inactive tab, it won't be loaded initially because the active tab is prioritized.
 	#[serde(skip)]
 	pub is_loaded: bool,
+	/// Last Pending save operation that needs to be completed once we receive the needed resources
+	#[serde(skip)]
+	pending_save_path: Option<PathBuf>,
 }
 
 impl Default for DocumentMessageHandler {
@@ -169,6 +176,7 @@ impl Default for DocumentMessageHandler {
 			graph_view_overlay_open: false,
 			snapping_state: SnappingState::default(),
 			graph_fade_artwork_percentage: 80.,
+			resources: None,
 			// =============================================
 			// Fields omitted from the saved document format
 			// =============================================
@@ -182,6 +190,7 @@ impl Default for DocumentMessageHandler {
 			auto_saved_hash: None,
 			layer_range_selection_reference: None,
 			is_loaded: false,
+			pending_save_path: None,
 		}
 	}
 }
@@ -894,19 +903,32 @@ impl MessageHandler<DocumentMessage, DocumentMessageContext<'_>> for DocumentMes
 			DocumentMessage::SaveDocument | DocumentMessage::SaveDocumentAs => {
 				responses.add(PortfolioMessage::AutoSaveActiveDocument);
 
-				let path = if let DocumentMessage::SaveDocumentAs = message { None } else { self.path.clone() };
+				self.pending_save_path = if let DocumentMessage::SaveDocumentAs = message { None } else { self.path.clone() };
+				executor.export_resources(document_id, Vec::from_iter(self.used_resources()).into());
+			}
+			DocumentMessage::SaveDocumentWithResources { resources } => {
+				let path = self.pending_save_path.take();
 				if path.is_some() {
 					responses.add(DocumentMessage::MarkAsSaved);
 				}
 
 				let folder = self.path.as_ref().and_then(|path| path.parent()).map(|parent| parent.to_path_buf());
 
+				let resources = resources.iter().map(|(hash, resource)| (*hash, Box::from(resource.as_ref()))).collect::<Vec<_>>();
+				if !resources.is_empty() {
+					self.resources = Some(resources);
+				}
+
+				let content = self.serialize_document();
+
+				self.resources = None;
+
 				responses.add(FrontendMessage::TriggerSaveDocument {
 					document_id,
 					name: format!("{}.{}", self.name.clone(), FILE_EXTENSION),
 					path,
 					folder,
-					content: self.serialize_document().into_bytes().into(),
+					content: content.into_bytes().into(),
 				});
 			}
 			DocumentMessage::SavedDocument { path } => {
@@ -1288,11 +1310,10 @@ impl MessageHandler<DocumentMessage, DocumentMessageContext<'_>> for DocumentMes
 				let layer_text_frames = text_frames
 					.into_iter()
 					.filter(|(node_id, _)| self.network_interface.document_network().nodes.contains_key(node_id))
-					.filter_map(|(node_id, frame)| {
-						self.network_interface.is_layer(&node_id, &[]).then(|| {
-							let layer = LayerNodeIdentifier::new(node_id, &self.network_interface);
-							(layer, frame)
-						})
+					.filter(|&(node_id, _)| self.network_interface.is_layer(&node_id, &[]))
+					.map(|(node_id, frame)| {
+						let layer = LayerNodeIdentifier::new(node_id, &self.network_interface);
+						(layer, frame)
 					})
 					.collect();
 				self.network_interface.update_text_frames(layer_text_frames);
@@ -2448,6 +2469,7 @@ impl DocumentMessageHandler {
 
 	/// Helper method for NudgeSelectedLayers message.
 	/// Handles keyboard nudging of selected layers with optional resize mode.
+	#[allow(clippy::too_many_arguments)]
 	fn handle_nudge_selected_layers(
 		&mut self,
 		delta_x: f64,
@@ -3339,6 +3361,14 @@ impl DocumentMessageHandler {
 
 	pub fn graph_view_overlay_open(&self) -> bool {
 		self.graph_view_overlay_open
+	}
+
+	pub fn used_resources(&self) -> HashSet<ResourceHash> {
+		let mut resources = HashSet::new();
+		self.network_interface.collect_used_resources(&mut resources);
+		self.document_undo_history.iter().for_each(|interface| interface.collect_used_resources(&mut resources));
+		self.document_redo_history.iter().for_each(|interface| interface.collect_used_resources(&mut resources));
+		resources
 	}
 }
 

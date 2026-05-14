@@ -1,7 +1,8 @@
 use crate::messages::frontend::utility_types::{ExportBounds, FileType};
 use crate::messages::prelude::*;
+use crate::node_graph_executor::resources::ResourceResponse;
 use glam::{DAffine2, DVec2, UVec2};
-use graph_craft::application_io::EditorPreferences;
+use graph_craft::application_io::{EditorPreferences, ResourceHash};
 use graph_craft::document::value::{RenderOutput, RenderOutputType, TaggedValue};
 use graph_craft::document::{DocumentNode, DocumentNodeImplementation, NodeId, NodeInput};
 use graph_craft::proto::GraphErrors;
@@ -18,6 +19,8 @@ pub use runtime_io::NodeRuntimeIO;
 
 mod runtime;
 pub use runtime::*;
+
+pub mod resources;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionRequest {
@@ -43,6 +46,7 @@ pub struct CompilationResponse {
 pub enum NodeGraphUpdate {
 	ExecutionResponse(ExecutionResponse),
 	CompilationResponse(CompilationResponse),
+	ResourceResponse(ResourceResponse),
 	EyedropperPreview(Raster<CPU>),
 	NodeGraphUpdateMessage(NodeGraphUpdateMessage),
 }
@@ -102,6 +106,10 @@ impl NodeGraphExecutor {
 		self.runtime_io
 			.send(GraphRuntimeRequest::EditorPreferencesUpdate(editor_preferences))
 			.expect("Failed to send editor preferences");
+	}
+
+	pub fn queue_resource_request(&self, request: resources::ResourceRequest) {
+		self.runtime_io.send(GraphRuntimeRequest::Resource(request)).expect("Failed to send resource request");
 	}
 
 	/// Updates the network to monitor all inputs. Useful for the testing.
@@ -380,6 +388,15 @@ impl NodeGraphExecutor {
 					});
 					responses.add(NodeGraphMessage::SendGraph);
 				}
+				NodeGraphUpdate::ResourceResponse(resource_response) => match resource_response {
+					ResourceResponse::Export { document_id, resources } => {
+						let message = PortfolioMessage::DocumentPassMessage {
+							document_id,
+							message: DocumentMessage::SaveDocumentWithResources { resources },
+						};
+						responses.add(message);
+					}
+				},
 				NodeGraphUpdate::EyedropperPreview(raster) => {
 					let (data, width, height) = raster.to_flat_u8();
 					responses.add(EyedropperToolMessage::PreviewImage { data, width, height });
@@ -537,6 +554,12 @@ impl NodeGraphExecutor {
 		};
 
 		Ok(())
+	}
+
+	pub fn export_resources(&mut self, document_id: DocumentId, resources: Box<[ResourceHash]>) {
+		self.runtime_io
+			.send(GraphRuntimeRequest::Resource(resources::ResourceRequest::Export { resources, document_id }))
+			.expect("Failed to send resource export request");
 	}
 }
 

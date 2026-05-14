@@ -21,6 +21,8 @@ use editor::messages::portfolio::document::utility_types::network_interface::Imp
 use editor::messages::portfolio::utility_types::{DockingSplitDirection, FontCatalog, FontCatalogFamily, PanelGroupId, PanelType};
 use editor::messages::prelude::*;
 use editor::messages::tool::tool_messages::tool_prelude::WidgetId;
+#[cfg(all(not(feature = "native"), target_family = "wasm"))]
+use graph_craft::application_io::{IndexedDbResourceStorage, PlatformApplicationIo};
 use graph_craft::document::NodeId;
 use graphene_std::graphene_hash::CacheHashWrapper;
 use graphene_std::raster::color::Color;
@@ -172,6 +174,20 @@ impl EditorWrapper {
 
 		#[cfg(feature = "native")]
 		crate::native_communication::initialize_native_communication();
+
+		// Initialize the persistent IndexedDB-backed resource storage on web. Native builds set up storage in the desktop wrapper instead.
+		#[cfg(all(not(feature = "native"), target_family = "wasm"))]
+		wasm_bindgen_futures::spawn_local(async {
+			let storage = match IndexedDbResourceStorage::load("graphite-resources").await {
+				Ok(storage) => storage,
+				Err(error) => {
+					log::error!("Failed to open IndexedDB resource storage: {error:?}");
+					return;
+				}
+			};
+			let application_io = PlatformApplicationIo::new(Box::new(storage)).await;
+			editor::node_graph_executor::replace_application_io(application_io).await;
+		});
 
 		self.dispatch(PortfolioMessage::Init);
 

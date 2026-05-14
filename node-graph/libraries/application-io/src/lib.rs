@@ -2,14 +2,15 @@ use core_types::transform::Footprint;
 use dyn_any::{DynAny, StaticType, StaticTypeSized};
 use glam::DVec2;
 use std::fmt::Debug;
-use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::pin::Pin;
 use std::ptr::addr_of;
 use std::sync::Arc;
 use std::time::Duration;
 use text_nodes::FontCache;
 use vector_types::vector::style::RenderMode;
+
+pub mod resource;
+pub use resource::{Resource, ResourceHash, ResourceStorage};
 
 #[cfg(feature = "wgpu")]
 #[derive(Debug, Clone, Hash, PartialEq, Eq, DynAny)]
@@ -42,17 +43,12 @@ impl From<ImageTexture> for Arc<wgpu::Texture> {
 #[derive(Debug, Clone, Hash, PartialEq, Eq, DynAny)]
 pub struct ImageTexture;
 
-#[cfg(target_family = "wasm")]
-pub type ResourceFuture = Pin<Box<dyn Future<Output = Result<Arc<[u8]>, ApplicationError>>>>;
-#[cfg(not(target_family = "wasm"))]
-pub type ResourceFuture = Pin<Box<dyn Future<Output = Result<Arc<[u8]>, ApplicationError>> + Send>>;
-
 pub trait ApplicationIo {
 	type Executor;
 	fn gpu_executor(&self) -> Option<&Self::Executor> {
 		None
 	}
-	fn load_resource(&self, url: impl AsRef<str>) -> Result<ResourceFuture, ApplicationError>;
+	fn load_resource(&self, hash: &ResourceHash) -> Option<Resource>;
 }
 
 impl<T: ApplicationIo> ApplicationIo for &T {
@@ -62,15 +58,9 @@ impl<T: ApplicationIo> ApplicationIo for &T {
 		(**self).gpu_executor()
 	}
 
-	fn load_resource<'a>(&self, url: impl AsRef<str>) -> Result<ResourceFuture, ApplicationError> {
-		(**self).load_resource(url)
+	fn load_resource(&self, hash: &ResourceHash) -> Option<Resource> {
+		(**self).load_resource(hash)
 	}
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ApplicationError {
-	NotFound,
-	InvalidUrl,
 }
 
 #[derive(Debug, Clone)]
