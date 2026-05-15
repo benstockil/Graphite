@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 #[cfg(target_family = "wasm")]
 use base64::Engine;
 #[cfg(target_family = "wasm")]
@@ -13,7 +15,6 @@ use core_types::{ATTR_EDITOR_MERGED_LAYERS, ATTR_TRANSFORM, WasmNotSend};
 use core_types::{Color, Ctx};
 pub use graph_craft::application_io::*;
 pub use graph_craft::document::value::RenderOutputType;
-use graphene_application_io::ApplicationIo;
 #[cfg(target_family = "wasm")]
 pub use graphene_canvas_utils as canvas_utils;
 #[cfg(target_family = "wasm")]
@@ -28,7 +29,6 @@ use graphic_types::raster_types::{CPU, Raster};
 use graphic_types::vector_types::gradient::GradientStops;
 #[cfg(target_family = "wasm")]
 use rendering::{Render, RenderParams, RenderSvgSegmentList, SvgRender};
-use std::sync::Arc;
 
 fn parse_headers(headers: &str) -> reqwest::header::HeaderMap {
 	use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -137,18 +137,24 @@ fn image_to_bytes(_: impl Ctx, image: List<Raster<CPU>>) -> List<u8> {
 
 /// Loads binary from URLs and local asset paths. Returns a transparent placeholder if the resource fails to load, allowing rendering to continue.
 #[node_macro::node(category("Web Request"))]
-async fn load_resource<'a: 'n>(_: impl Ctx, _primary: (), #[scope("editor-api")] editor_resources: &'a PlatformEditorApi, #[name("URL")] url: String) -> Arc<[u8]> {
-	let Some(api) = editor_resources.application_io.as_ref() else {
-		return Arc::from(include_bytes!("../../../graph-craft/src/null.png").to_vec());
-	};
-	let Ok(data) = api.load_resource(url) else {
-		return Arc::from(include_bytes!("../../../graph-craft/src/null.png").to_vec());
-	};
-	let Ok(data) = data.await else {
-		return Arc::from(include_bytes!("../../../graph-craft/src/null.png").to_vec());
+async fn load_resource<'a: 'n>(_: impl Ctx, _primary: (), #[scope("editor-api")] _editor: &'a PlatformEditorApi, #[name("URL")] url: String) -> Arc<[u8]> {
+	let placeholder = || -> Arc<[u8]> { Arc::from(Vec::<u8>::new()) };
+
+	let response = match reqwest::Client::new().get(&url).send().await {
+		Ok(response) => response,
+		Err(error) => {
+			log::error!("HTTP request for `{url}` failed: {error}");
+			return placeholder();
+		}
 	};
 
-	data
+	match response.bytes().await {
+		Ok(bytes) => Arc::from(bytes.to_vec()),
+		Err(error) => {
+			log::error!("Failed to read HTTP response for `{url}`: {error}");
+			placeholder()
+		}
+	}
 }
 
 /// Converts raw binary data to a raster image.
@@ -253,4 +259,36 @@ where
 			.with_attribute(ATTR_TRANSFORM, footprint.transform)
 			.with_attribute(ATTR_EDITOR_MERGED_LAYERS, upstream_graphic_list),
 	)
+}
+
+#[node_macro::node(category(""))]
+pub async fn resource<'a: 'n>(_: impl Ctx, _primary: (), #[scope("editor-api")] editor_api: &'a PlatformEditorApi, hash: ResourceHash) -> Resource {
+	let application_io = editor_api.application_io.as_ref().expect("ApplicationIo must be available when using resources");
+	application_io.load_resource(hash).await.unwrap_or_else(|| {
+		panic!("Resource {hash} not found");
+	})
+}
+
+#[node_macro::node(category(""))]
+pub fn resource_image<'a: 'n>(_: impl Ctx, resource: Resource) -> List<Raster<CPU>> {
+	let image_data = resource.as_ref();
+
+	let Some(image) = image::load_from_memory(image_data).ok() else {
+		return List::new();
+	};
+	let image = image.to_rgba32f();
+	let image = Image {
+		data: image
+			.chunks(4)
+			.map(|pixel| {
+				// Decoded image bytes are unassociated gamma sRGB; premultiply in gamma space, then lift RGB into linear light.
+				let alpha = pixel[3];
+				Color::from_gamma_srgb_channels(pixel[0] * alpha, pixel[1] * alpha, pixel[2] * alpha, alpha)
+			})
+			.collect(),
+		width: image.width(),
+		height: image.height(),
+		..Default::default()
+	};
+	List::new_from_element(Raster::new_cpu(image))
 }

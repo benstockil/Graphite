@@ -298,13 +298,20 @@ impl<'a> ModifyInputsContext<'a> {
 		let transform = resolve_proto_node_type(graphene_std::transform_nodes::transform::IDENTIFIER)
 			.expect("Transform node does not exist")
 			.default_node_template();
-		let image_node = resolve_proto_node_type(graphene_std::raster_nodes::std_nodes::image::IDENTIFIER)
-			.expect("Image node does not exist")
-			.node_template_input_override([Some(NodeInput::value(TaggedValue::None, false)), Some(NodeInput::value(TaggedValue::ImageData(image), false))]);
 
-		let image_id = NodeId::new();
-		self.network_interface.insert_node(image_id, image_node, &[]);
-		self.network_interface.move_node_to_chain_start(&image_id, layer, &[], self.import);
+		let png_bytes: std::sync::Arc<[u8]> = image.to_png().into();
+		let hash = graphene_std::application_io::ResourceHash::from(png_bytes.as_ref());
+		self.responses.add(ResourceMessage::Write { data: png_bytes });
+
+		// The resource hash placeholder is later swapped for a `resource` node by the preprocessor,
+		// which loads the actual `Resource` durring execution.
+		let resource_image = resolve_proto_node_type(graphene_std::platform_application_io::resource_image::IDENTIFIER)
+			.expect("Resource Image node does not exist")
+			.node_template_input_override([Some(NodeInput::value(TaggedValue::Resource(hash), false))]);
+
+		let resource_image_id = NodeId::new();
+		self.network_interface.insert_node(resource_image_id, resource_image, &[]);
+		self.network_interface.move_node_to_chain_start(&resource_image_id, layer, &[], self.import);
 
 		let transform_id = NodeId::new();
 		self.network_interface.insert_node(transform_id, transform, &[]);
