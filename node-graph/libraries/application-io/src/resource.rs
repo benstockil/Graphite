@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 /// Blake3 content hash of a resource, represented as 32 bytes
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord, DynAny)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ResourceHash([u8; 32]);
 
 impl ResourceHash {
@@ -96,6 +95,55 @@ impl TryFrom<&str> for ResourceHash {
 		}
 
 		Ok(Self(out))
+	}
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for ResourceHash {
+	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		if serializer.is_human_readable() {
+			serializer.serialize_str(&self.to_hex())
+		} else {
+			serializer.serialize_bytes(&self.0)
+		}
+	}
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for ResourceHash {
+	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		struct ResourceHashVisitor;
+
+		impl<'de> serde::de::Visitor<'de> for ResourceHashVisitor {
+			type Value = ResourceHash;
+
+			fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+				formatter.write_str("a 64-character hex string or 32 raw bytes")
+			}
+
+			fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+				ResourceHash::try_from(value).map_err(E::custom)
+			}
+
+			fn visit_bytes<E: serde::de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+				let bytes: [u8; 32] = value.try_into().map_err(|_| E::invalid_length(value.len(), &"32 bytes"))?;
+				Ok(ResourceHash(bytes))
+			}
+
+			fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+				let mut bytes = [0u8; 32];
+				for (i, slot) in bytes.iter_mut().enumerate() {
+					*slot = seq.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(i, &"32 bytes"))?;
+				}
+				Ok(ResourceHash(bytes))
+			}
+		}
+
+		if deserializer.is_human_readable() {
+			deserializer.deserialize_str(ResourceHashVisitor)
+		} else {
+			deserializer.deserialize_bytes(ResourceHashVisitor)
+		}
 	}
 }
 

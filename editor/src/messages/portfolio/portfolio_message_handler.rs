@@ -444,9 +444,20 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 			}
 			PortfolioMessage::EditorPreferences => self.executor.update_editor_preferences(preferences.editor_preferences()),
 			PortfolioMessage::GarbageCollectResources => {
-				let used_resources = self.documents.values().flat_map(|document| document.used_resources()).collect::<Vec<_>>();
+				let mut used_resources = HashSet::new();
+				for (id, info) in self.unloaded_documents.iter() {
+					if let Some(resources) = &info.resources {
+						used_resources.extend(resources.iter());
+					} else {
+						responses.add(PersistentStateMessage::ReadDocument { document_id: *id });
+						return;
+					}
+				}
+				for document in self.documents.values() {
+					used_resources.extend(document.used_resources());
+				}
 				responses.add(ResourceMessage::GarbageCollect {
-					used: used_resources.into_boxed_slice(),
+					used: Vec::from_iter(used_resources).into_boxed_slice(),
 				});
 			}
 			PortfolioMessage::LoadDocumentResources { document_id } => {
@@ -1892,6 +1903,7 @@ impl PortfolioMessageHandler {
 				name: document.name.clone(),
 				path: document.path.clone(),
 				is_saved: document.is_saved(),
+				resources: Some(document.used_resources().into_iter().collect()),
 			})
 		} else {
 			self.unloaded_documents.get(&document_id).cloned()
