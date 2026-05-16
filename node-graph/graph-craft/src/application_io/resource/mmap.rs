@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 pub struct MmapResourceStorage {
 	root: PathBuf,
-	cache: Mutex<HashMap<ResourceHash, Resource>>,
+	cache: RwLock<HashMap<ResourceHash, Resource>>,
 }
 
 impl MmapResourceStorage {
@@ -17,7 +17,7 @@ impl MmapResourceStorage {
 		fs::create_dir_all(&root)?;
 		Ok(Self {
 			root,
-			cache: Mutex::new(HashMap::new()),
+			cache: RwLock::new(HashMap::new()),
 		})
 	}
 
@@ -45,20 +45,9 @@ impl MmapResourceStorage {
 			}
 		}
 	}
-}
 
-impl Resources for MmapResourceStorage {
-	fn load(&self, hash: ResourceHash) -> ResourceFuture {
-		// Cache-only lookup; the on-demand mmap path lives in `ResourceStorage::read` and is reachable
-		// only through the message handler's mut access.
-		let result = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&hash).cloned();
-		Box::pin(async move { result })
-	}
-}
-
-impl ResourceStorage for MmapResourceStorage {
-	fn read(&mut self, hash: &ResourceHash) -> Option<Resource> {
-		if let Some(resource) = self.cache.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner()).get(hash) {
+	fn lookup(&self, hash: &ResourceHash) -> Option<Resource> {
+		if let Some(resource) = self.cache.read().unwrap_or_else(|poisoned| poisoned.into_inner()).get(hash) {
 			return Some(resource.clone());
 		}
 
@@ -66,8 +55,21 @@ impl ResourceStorage for MmapResourceStorage {
 		let mmap = Self::open_mmap(&path)?;
 		let resource = Resource::new(MmappedBytes(mmap));
 
-		self.cache.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(*hash, resource.clone());
+		self.cache.write().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(*hash, resource.clone());
 		Some(resource)
+	}
+}
+
+impl Resources for MmapResourceStorage {
+	fn load(&self, hash: ResourceHash) -> ResourceFuture {
+		let result = self.lookup(&hash);
+		Box::pin(async move { result })
+	}
+}
+
+impl ResourceStorage for MmapResourceStorage {
+	fn read(&mut self, hash: &ResourceHash) -> Option<Resource> {
+		self.lookup(hash)
 	}
 
 	fn write(&mut self, data: &[u8]) -> ResourceHash {
