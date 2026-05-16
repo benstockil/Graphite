@@ -281,7 +281,6 @@ pub fn resource_image<'a: 'n>(_: impl Ctx, resource: Resource) -> List<Raster<CP
 		data: image
 			.chunks(4)
 			.map(|pixel| {
-				// Decoded image bytes are unassociated gamma sRGB; premultiply in gamma space, then lift RGB into linear light.
 				let alpha = pixel[3];
 				Color::from_gamma_srgb_channels(pixel[0] * alpha, pixel[1] * alpha, pixel[2] * alpha, alpha)
 			})

@@ -14,7 +14,7 @@ pub use resource::mmap::MmapResourceStorage;
 pub struct PlatformApplicationIo {
 	#[cfg(feature = "wgpu")]
 	pub(crate) gpu_executor: Option<WgpuExecutor>,
-	pub resources: Option<std::sync::Arc<dyn Resources>>,
+	resources: Option<Box<dyn Resources>>,
 }
 
 impl PlatformApplicationIo {
@@ -46,6 +46,10 @@ impl PlatformApplicationIo {
 			gpu_executor: executor,
 			resources: None,
 		}
+	}
+
+	pub fn inject_resources(&mut self, resources: Box<dyn Resources>) {
+		self.resources = Some(resources);
 	}
 }
 

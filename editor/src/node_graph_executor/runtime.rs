@@ -154,9 +154,7 @@ impl NodeRuntime {
 	}
 
 	pub async fn run(&mut self) -> Option<ImageTexture> {
-		if self.editor_api.application_io.is_none() {
-			return None;
-		}
+		// self.editor_api.application_io.as_ref()?;
 
 		let mut font = None;
 		let mut preferences = None;
@@ -566,7 +564,7 @@ pub async fn replace_node_runtime(runtime: NodeRuntime) -> Option<NodeRuntime> {
 	let mut node_runtime = NODE_RUNTIME.lock();
 	node_runtime.replace(runtime)
 }
-pub async fn replace_application_io(application_io: PlatformApplicationIo) {
+pub(crate) async fn replace_application_io(application_io: PlatformApplicationIo) {
 	let mut node_runtime = NODE_RUNTIME.lock();
 	if let Some(node_runtime) = &mut *node_runtime {
 		node_runtime.editor_api = PlatformEditorApi {

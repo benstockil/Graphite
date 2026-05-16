@@ -37,9 +37,9 @@ impl DesktopWrapper {
 		}
 	}
 
-	pub fn init(&self, wgpu_context: WgpuContext) {
+	pub fn init(&mut self, wgpu_context: WgpuContext) {
 		let application_io = PlatformApplicationIo::new_with_context(wgpu_context);
-		futures::executor::block_on(graphite_editor::node_graph_executor::replace_application_io(application_io));
+		futures::executor::block_on(self.editor.replace_application_io(application_io));
 	}
 
 	pub fn dispatch(&mut self, message: DesktopWrapperMessage) -> Vec<DesktopFrontendMessage> {

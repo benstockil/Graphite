@@ -48,6 +48,7 @@ pub struct PortfolioMessageContext<'a> {
 	pub reset_node_definitions_on_open: bool,
 	pub timing_information: TimingInformation,
 	pub viewport: &'a ViewportMessageHandler,
+	pub resources: &'a ResourceMessageHandler,
 }
 
 #[derive(Debug, Default, ExtractField)]
@@ -76,6 +77,7 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 			reset_node_definitions_on_open,
 			timing_information,
 			viewport,
+			resources,
 		} = context;
 
 		match message {
@@ -92,6 +94,7 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 						current_tool,
 						preferences,
 						viewport,
+						resources,
 						data_panel_open: self.workspace_panel_layout.is_panel_visible(PanelType::Data) && !self.workspace_panel_layout.focus_document,
 						layers_panel_open: self.workspace_panel_layout.is_panel_visible(PanelType::Layers) && !self.workspace_panel_layout.focus_document,
 						properties_panel_open: self.workspace_panel_layout.is_panel_visible(PanelType::Properties) && !self.workspace_panel_layout.focus_document,
@@ -160,6 +163,7 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 						current_tool,
 						preferences,
 						viewport,
+						resources,
 						data_panel_open: self.workspace_panel_layout.is_panel_visible(PanelType::Data) && !self.workspace_panel_layout.focus_document,
 						layers_panel_open: self.workspace_panel_layout.is_panel_visible(PanelType::Layers) && !self.workspace_panel_layout.focus_document,
 						properties_panel_open: self.workspace_panel_layout.is_panel_visible(PanelType::Properties) && !self.workspace_panel_layout.focus_document,

@@ -10,7 +10,6 @@ use crate::messages::portfolio::document::utility_types::misc::{AlignAggregate, 
 use crate::messages::portfolio::utility_types::PanelType;
 use crate::messages::prelude::*;
 use glam::{DAffine2, IVec2};
-use graph_craft::application_io::{Resource, ResourceHash};
 use graph_craft::document::NodeId;
 use graphene_std::Color;
 use graphene_std::raster::BlendMode;
@@ -131,10 +130,6 @@ pub enum DocumentMessage {
 	RenderScrollbars,
 	SaveDocument,
 	SaveDocumentAs,
-	SaveDocumentWithResources {
-		#[serde(skip)]
-		resources: Box<[(ResourceHash, Resource)]>,
-	},
 	SavedDocument {
 		path: Option<PathBuf>,
 	},

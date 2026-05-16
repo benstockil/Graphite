@@ -59,6 +59,7 @@ pub struct DocumentMessageContext<'a> {
 	pub layers_panel_open: bool,
 	pub properties_panel_open: bool,
 	pub viewport: &'a ViewportMessageHandler,
+	pub resources: &'a ResourceMessageHandler,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, ExtractField)]
@@ -147,9 +148,6 @@ pub struct DocumentMessageHandler {
 	/// Whether or not the editor has executed the network to render the document yet. If this is opened as an inactive tab, it won't be loaded initially because the active tab is prioritized.
 	#[serde(skip)]
 	pub is_loaded: bool,
-	/// Last Pending save operation that needs to be completed once we receive the needed resources
-	#[serde(skip)]
-	pending_save_path: Option<PathBuf>,
 }
 
 impl Default for DocumentMessageHandler {
@@ -190,7 +188,6 @@ impl Default for DocumentMessageHandler {
 			auto_saved_hash: None,
 			layer_range_selection_reference: None,
 			is_loaded: false,
-			pending_save_path: None,
 		}
 	}
 }
@@ -209,6 +206,7 @@ impl MessageHandler<DocumentMessage, DocumentMessageContext<'_>> for DocumentMes
 			data_panel_open,
 			layers_panel_open,
 			properties_panel_open,
+			resources,
 		} = context;
 
 		match message {
@@ -921,20 +919,13 @@ impl MessageHandler<DocumentMessage, DocumentMessageContext<'_>> for DocumentMes
 			DocumentMessage::SaveDocument | DocumentMessage::SaveDocumentAs => {
 				responses.add(PortfolioMessage::AutoSaveActiveDocument);
 
-				self.pending_save_path = if let DocumentMessage::SaveDocumentAs = message { None } else { self.path.clone() };
-				responses.add(ResourceMessage::Export {
-					document_id,
-					resources: Vec::from_iter(self.used_resources()).into(),
-				});
-			}
-			DocumentMessage::SaveDocumentWithResources { resources } => {
-				let path = self.pending_save_path.take();
+				let path = if let DocumentMessage::SaveDocumentAs = message { None } else { self.path.clone() };
 				if path.is_some() {
 					responses.add(DocumentMessage::MarkAsSaved);
 				}
-
 				let folder = self.path.as_ref().and_then(|path| path.parent()).map(|parent| parent.to_path_buf());
 
+				let resources = resources.export(&Vec::from_iter(self.used_resources()));
 				let resources = resources.iter().map(|(hash, resource)| (*hash, Box::from(resource.as_ref()))).collect::<Vec<_>>();
 				if !resources.is_empty() {
 					self.resources = Some(resources);

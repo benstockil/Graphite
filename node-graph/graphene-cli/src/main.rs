@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand};
 use fern::colors::{Color, ColoredLevelConfig};
 use futures::executor::block_on;
 use graph_craft::application_io::EditorPreferences;
-use graph_craft::application_io::{PlatformApplicationIo, PlatformEditorApi};
+use graph_craft::application_io::{HashMapResourceStorage, PlatformApplicationIo, PlatformEditorApi};
 use graph_craft::document::*;
 use graph_craft::graphene_compiler::Compiler;
 use graph_craft::proto::ProtoNetwork;
@@ -122,10 +122,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 	log::info!("Creating GPU context");
 	let mut application_io = block_on(PlatformApplicationIo::new());
-
-	if let Command::Export { image: Some(ref image_path), .. } = app.command {
-		application_io.resources.insert("null".to_string(), Arc::from(std::fs::read(image_path).expect("Failed to read image")));
-	}
 
 	// Convert application_io to Arc first
 	let application_io_arc = Arc::new(application_io);
