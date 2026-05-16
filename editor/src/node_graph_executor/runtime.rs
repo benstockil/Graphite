@@ -154,8 +154,6 @@ impl NodeRuntime {
 	}
 
 	pub async fn run(&mut self) -> Option<ImageTexture> {
-		self.editor_api.application_io.as_ref()?;
-
 		let mut font = None;
 		let mut preferences = None;
 		let mut graph = None;
