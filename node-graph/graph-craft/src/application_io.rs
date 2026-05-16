@@ -69,6 +69,16 @@ impl ApplicationIo for PlatformApplicationIo {
 	}
 }
 
+impl Default for PlatformApplicationIo {
+	fn default() -> Self {
+		Self {
+			#[cfg(feature = "wgpu")]
+			gpu_executor: None,
+			resources: None,
+		}
+	}
+}
+
 impl std::fmt::Debug for PlatformApplicationIo {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("PlatformApplicationIo").finish_non_exhaustive()
