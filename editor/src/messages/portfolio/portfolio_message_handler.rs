@@ -778,9 +778,9 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 					}
 				};
 
-				if let Some(resources) = document.resources.take() {
-					resources.into_iter().for_each(|(hash, data)| {
-						let data: Arc<[u8]> = Arc::from(data);
+				if let Some(resources) = document.embedded_resources.take() {
+					resources.into_iter().for_each(|(hash, resource)| {
+						let data: Arc<[u8]> = Arc::from(resource.as_ref());
 						if ResourceHash::from(data.as_ref()) != hash {
 							log::error!("Resource hash mismatch for resource with hash {hash}");
 							return;

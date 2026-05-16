@@ -19,6 +19,7 @@ use crate::messages::portfolio::document::overlays::grid_overlays::{grid_overlay
 use crate::messages::portfolio::document::overlays::utility_types::{OverlaysType, OverlaysVisibilitySettings, Pivot};
 use crate::messages::portfolio::document::properties_panel::properties_panel_message_handler::PropertiesPanelMessageContext;
 use crate::messages::portfolio::document::utility_types::document_metadata::{DocumentMetadata, LayerNodeIdentifier};
+use crate::messages::portfolio::document::utility_types::embedded_resources::EmbeddedResources;
 use crate::messages::portfolio::document::utility_types::misc::{AlignAggregate, AlignAxis, FlipAxis, PTZ};
 use crate::messages::portfolio::document::utility_types::network_interface::{FlowType, InputConnector, NodeTemplate, OutputConnector};
 use crate::messages::portfolio::utility_types::{CachedData, PanelType};
@@ -109,9 +110,8 @@ pub struct DocumentMessageHandler {
 	/// The current opacity of the faded node graph background that covers up the artwork.
 	pub graph_fade_artwork_percentage: f64,
 	/// The resources that are currently used by the document.
-	#[allow(clippy::type_complexity)]
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub resources: Option<Vec<(ResourceHash, Box<[u8]>)>>,
+	#[serde(skip_serializing_if = "Option::is_none", rename = "resources")]
+	pub embedded_resources: Option<EmbeddedResources>,
 
 	// =============================================
 	// Fields omitted from the saved document format
@@ -174,7 +174,7 @@ impl Default for DocumentMessageHandler {
 			graph_view_overlay_open: false,
 			snapping_state: SnappingState::default(),
 			graph_fade_artwork_percentage: 80.,
-			resources: None,
+			embedded_resources: None,
 			// =============================================
 			// Fields omitted from the saved document format
 			// =============================================
@@ -925,15 +925,15 @@ impl MessageHandler<DocumentMessage, DocumentMessageContext<'_>> for DocumentMes
 				}
 				let folder = self.path.as_ref().and_then(|path| path.parent()).map(|parent| parent.to_path_buf());
 
-				let resources = resources.export(&Vec::from_iter(self.used_resources()));
-				let resources = resources.iter().map(|(hash, resource)| (*hash, Box::from(resource.as_ref()))).collect::<Vec<_>>();
-				if !resources.is_empty() {
-					self.resources = Some(resources);
+				let exported = resources.export(&Vec::from_iter(self.used_resources()));
+				let embedded = EmbeddedResources::from_iter(exported);
+				if !embedded.is_empty() {
+					self.embedded_resources = Some(embedded);
 				}
 
 				let content = self.serialize_document();
 
-				self.resources = None;
+				self.embedded_resources = None;
 
 				responses.add(FrontendMessage::TriggerSaveDocument {
 					document_id,
