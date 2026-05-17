@@ -24,7 +24,7 @@ impl Editor {
 		graphene_std::uuid::set_uuid_seed(0);
 
 		let (runtime, executor) = crate::node_graph_executor::NodeGraphExecutor::new_with_local_runtime();
-		let editor = Self {
+		let mut editor = Self {
 			dispatcher: Dispatcher::with_executor(executor),
 		};
 
