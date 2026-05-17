@@ -19,7 +19,7 @@ pub enum GradientType {
 ///
 /// Not exposed via Tsify; use [`GradientStopsUI`] at the JS boundary.
 #[derive(Debug, Clone, PartialEq, graphene_hash::CacheHash, DynAny)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GradientStops {
 	/// The position of this stop, a factor from 0-1 along the length of the full gradient.
 	pub position: Vec<f64>,
@@ -79,41 +79,6 @@ impl GradientStopsUI {
 			.collect::<Vec<_>>()
 			.join(", ");
 		format!("linear-gradient(to right, {pieces})")
-	}
-}
-
-// TODO: Eventually remove this migration document upgrade code
-impl<'de> serde::Deserialize<'de> for GradientStops {
-	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-		#[derive(serde::Deserialize)]
-		struct NewFormat {
-			position: Vec<f64>,
-			midpoint: Vec<f64>,
-			color: Vec<Color>,
-		}
-
-		#[derive(serde::Deserialize)]
-		#[cfg_attr(feature = "serde", serde(untagged))]
-		enum GradientStopsFormat {
-			New(NewFormat),
-			Old(Vec<(f64, Color)>),
-		}
-
-		Ok(match GradientStopsFormat::deserialize(deserializer)? {
-			GradientStopsFormat::New(new) => Self {
-				position: new.position,
-				midpoint: new.midpoint,
-				color: new.color,
-			},
-			GradientStopsFormat::Old(stops) => {
-				let count = stops.len();
-				Self {
-					position: stops.iter().map(|(p, _)| *p).collect(),
-					midpoint: vec![0.5; count],
-					color: stops.into_iter().map(|(_, c)| c).collect(),
-				}
-			}
-		})
 	}
 }
 
@@ -587,29 +552,6 @@ impl Gradient {
 
 		Some(index)
 	}
-}
-
-// TODO: Eventually remove this migration document upgrade code
-pub fn migrate_to_gradient_stops<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<GradientStops, D::Error> {
-	use serde::Deserialize;
-
-	#[derive(serde::Deserialize)]
-	struct LegacyTable {
-		#[serde(alias = "instances", alias = "instance")]
-		element: Vec<GradientStops>,
-	}
-
-	#[derive(serde::Deserialize)]
-	#[cfg_attr(feature = "serde", serde(untagged))]
-	enum GradientStopsFormat {
-		Stops(GradientStops),
-		List(LegacyTable),
-	}
-
-	Ok(match GradientStopsFormat::deserialize(deserializer)? {
-		GradientStopsFormat::Stops(stops) => stops,
-		GradientStopsFormat::List(list) => list.element.into_iter().next().unwrap_or_default(),
-	})
 }
 
 impl core_types::bounds::BoundingBox for GradientStops {

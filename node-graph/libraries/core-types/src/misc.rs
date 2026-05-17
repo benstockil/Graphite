@@ -61,48 +61,6 @@ impl Clampable for DVec2 {
 	}
 }
 
-#[cfg(feature = "serde")]
-#[derive(serde::Deserialize)]
-struct LegacyTable<T> {
-	#[serde(alias = "instances", alias = "instance")]
-	element: Vec<T>,
-}
-
-// TODO: Eventually remove this migration document upgrade code
-pub fn migrate_to_optional_color<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<no_std_types::color::Color>, D::Error> {
-	use no_std_types::color::Color;
-	use serde::Deserialize;
-
-	#[cfg_attr(feature = "serde", derive(serde::Deserialize))]
-	#[cfg_attr(feature = "serde", serde(untagged))]
-	enum ColorFormat {
-		OptionalColor(Option<Color>),
-		List(LegacyTable<Color>),
-	}
-
-	Ok(match ColorFormat::deserialize(deserializer)? {
-		ColorFormat::OptionalColor(color) => color,
-		ColorFormat::List(list) => list.element.into_iter().next(),
-	})
-}
-
-// TODO: Eventually remove this migration document upgrade code
-pub fn migrate_to_f64_array<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<f64>, D::Error> {
-	use serde::Deserialize;
-
-	#[cfg_attr(feature = "serde", derive(serde::Deserialize))]
-	#[cfg_attr(feature = "serde", serde(untagged))]
-	enum F64ArrayFormat {
-		Array(Vec<f64>),
-		List(LegacyTable<f64>),
-	}
-
-	Ok(match F64ArrayFormat::deserialize(deserializer)? {
-		F64ArrayFormat::Array(values) => values,
-		F64ArrayFormat::List(list) => list.element,
-	})
-}
-
 /// Parse a CSS color string (named color, hex, `rgb(...)`, `hsl(...)`, etc.) into a linear-light [`Color`] using the `color` crate's CSS Color 4 parser.
 /// Tries the input as-is first (catches CSS named colors like `red`, `rgb(...)`, and well-formed hex like `#abcdef`), then falls back to treating the input as bare hex with length-based expansion to a CSS-parseable form:
 /// - 1 char `f` → `#fff` (CSS 3-char shorthand)

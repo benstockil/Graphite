@@ -53,21 +53,17 @@ macro_rules! tagged_value {
 			/// Stores a type, from which its `Default::default()` value can be obtained, rather than storing an actual type's value.
 			/// Example: `TaggedValue::TypeDefault(descriptor!(String))` stores the type `String` but no specific string value.
 			TypeDefault(TypeDescriptor),
-			/// Stored compactly as a `Vec<f64>`, materializes as `List<f64>` at runtime via `to_dynany`/`to_any`. Aliases recover legacy on-disk shapes.
-			#[serde(deserialize_with = "core_types::misc::migrate_to_f64_array")] // TODO: Eventually remove this migration document upgrade code
+			/// Stored compactly as a `Vec<f64>`, materializes as `List<f64>` at runtime via `to_dynany`/`to_any`. Aliases recover legacy on-disk tag spellings; legacy `LegacyTable` payload shapes are unwrapped in [`deserialize_tagged_value_with_legacy_migration`].
 			#[serde(alias = "F64Table", alias = "VecF64", alias = "VecF32", alias = "F64Array4")]
 			F64Array(Vec<f64>),
-			/// Stored compactly as an `Option<Color>`, materializes as `List<Color>` at runtime via `to_dynany`/`to_any`. Aliases recover legacy on-disk shapes.
-			#[serde(deserialize_with = "core_types::misc::migrate_to_optional_color")] // TODO: Eventually remove this migration document upgrade code
+			/// Stored compactly as an `Option<Color>`, materializes as `List<Color>` at runtime via `to_dynany`/`to_any`. Aliases recover legacy on-disk tag spellings; legacy `LegacyTable` payload shapes are unwrapped in [`deserialize_tagged_value_with_legacy_migration`].
 			#[serde(alias = "ColorTable", alias = "OptionalColor", alias = "ColorNotInTable")]
 			Color(Option<Color>),
-			/// Stored compactly as a `GradientStops`, materializes as a single-row `List<GradientStops>` at runtime via `to_dynany`/`to_any`. Aliases recover legacy on-disk shapes.
+			/// Stored compactly as a `GradientStops`, materializes as a single-row `List<GradientStops>` at runtime via `to_dynany`/`to_any`. Aliases recover legacy on-disk tag spellings; legacy `LegacyTable` payload shapes are unwrapped in [`deserialize_tagged_value_with_legacy_migration`].
 			/// (Old documents that stored a full `Gradient` struct under this same `"Gradient"` tag are routed to `FillGradient` by `deserialize_tagged_value_with_legacy_migration`.)
-			#[serde(deserialize_with = "graphic_types::vector_types::gradient::migrate_to_gradient_stops")] // TODO: Eventually remove this migration document upgrade code
 			#[serde(alias = "GradientTable", alias = "GradientPositions", alias = "GradientStops")]
 			Gradient(GradientStops),
-			/// Stored compactly as a `Vec<BrushStroke>`, materializes as `List<BrushStroke>` at runtime via `to_dynany`/`to_any`. Aliases recover legacy on-disk shapes.
-			#[serde(deserialize_with = "brush_nodes::migrations::migrate_to_brush_strokes")] // TODO: Eventually remove this migration document upgrade code
+			/// Stored compactly as a `Vec<BrushStroke>`, materializes as `List<BrushStroke>` at runtime via `to_dynany`/`to_any`. Aliases recover legacy on-disk tag spellings; legacy `LegacyTable` payload shapes are unwrapped in [`deserialize_tagged_value_with_legacy_migration`].
 			#[serde(alias = "BrushStrokeTable")]
 			BrushStrokes(Vec<BrushStroke>),
 			// =======================
@@ -647,8 +643,69 @@ pub fn deserialize_tagged_value_with_legacy_migration<'de, D: serde::Deserialize
 		}
 	}
 
+	// Rewrite legacy `LegacyTable`-wrapped payloads inside the variants that used to carry one-row tables.
+	// Done as a JSON-Value rewrite (rather than a `deserialize_with` shim on each variant) so postcard never has to traverse an `#[serde(untagged)]` enum.
+	let value = unwrap_legacy_table_payloads(value);
+
 	let tagged_value: TaggedValue = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
 	Ok(MemoHash::new(tagged_value))
+}
+
+/// For variants whose payload was historically wrapped in a `{"element": [...]}` (with aliases `instances`/`instance`) `LegacyTable`, unwrap the payload to the modern shape.
+///
+/// Operates on the *outer* `{ "<Variant>": <payload> }` JSON object that wraps a `TaggedValue`. Variant names listed below are matched against the historical aliases too, since old documents may use either spelling.
+///
+/// Reductions per variant (your domain knowledge — fill in each `TODO`):
+///
+/// - `F64Array` (aliases: `F64Table`, `VecF64`, `VecF32`, `F64Array4`):
+///     - legacy `{"element": [f64, ...]}` → `[f64, ...]`
+/// - `Color` (aliases: `ColorTable`, `OptionalColor`, `ColorNotInTable`):
+///     - legacy `{"element": [Color]}` → `Color`; empty → `null`
+/// - `Gradient` (aliases: `GradientTable`, `GradientPositions`):
+///     - legacy `{"element": [GradientStops]}` → `GradientStops`; empty → default `GradientStops`
+/// - `BrushStrokes` (alias: `BrushStrokeTable`):
+///     - legacy `{"element": [BrushStroke, ...]}` → `[BrushStroke, ...]`
+// TODO: Eventually remove this migration document upgrade code
+#[cfg(feature = "loading")]
+fn unwrap_legacy_table_payloads(mut value: serde_json::Value) -> serde_json::Value {
+	let Some(map) = value.as_object_mut() else { return value };
+	if map.len() != 1 {
+		return value;
+	}
+	let Some((tag, payload)) = map.iter_mut().next() else { return value };
+
+	let legacy_elements = |payload: &serde_json::Value| -> Option<Vec<serde_json::Value>> {
+		let obj = payload.as_object()?;
+		let key = ["element", "instances", "instance"].iter().find(|k| obj.contains_key(**k))?;
+		obj.get(*key)?.as_array().cloned()
+	};
+
+	match tag.as_str() {
+		"F64Array" | "F64Table" | "VecF64" | "VecF32" | "F64Array4" => {
+			if let Some(elements) = legacy_elements(payload) {
+				*payload = serde_json::Value::Array(elements);
+			}
+		}
+		"Color" | "ColorTable" | "OptionalColor" | "ColorNotInTable" => {
+			if let Some(elements) = legacy_elements(payload) {
+				*payload = elements.into_iter().next().unwrap_or(serde_json::Value::Null);
+			}
+		}
+		"Gradient" | "GradientTable" | "GradientPositions" => {
+			if let Some(mut elements) = legacy_elements(payload)
+				&& let Some(first) = elements.drain(..).next()
+			{
+				*payload = first;
+			}
+		}
+		"BrushStrokes" | "BrushStrokeTable" => {
+			if let Some(elements) = legacy_elements(payload) {
+				*payload = serde_json::Value::Array(elements);
+			}
+		}
+		_ => {}
+	}
+	value
 }
 
 impl Display for TaggedValue {

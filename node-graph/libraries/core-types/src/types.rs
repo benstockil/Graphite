@@ -169,7 +169,7 @@ pub struct TypeDescriptor {
 	#[cfg_attr(feature = "serde", serde(skip))]
 	pub id: Option<TypeId>,
 	pub name: Cow<'static, str>,
-	#[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+	#[cfg_attr(feature = "serde", serde(default))]
 	pub alias: Option<Cow<'static, str>>,
 	#[cfg_attr(feature = "serde", serde(skip))]
 	pub size: usize,
