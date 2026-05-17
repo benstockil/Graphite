@@ -4,52 +4,22 @@ use graph_craft::application_io::{Resource, ResourceHash};
 use std::collections::HashMap;
 use std::fmt;
 
-#[derive(Clone, Default, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EmbeddedResources {
 	resources: HashMap<ResourceHash, Resource>,
 }
 
 impl EmbeddedResources {
-	pub fn new() -> Self {
-		Self::default()
-	}
-
-	pub fn insert(&mut self, hash: ResourceHash, resource: Resource) -> Option<Resource> {
-		self.resources.insert(hash, resource)
-	}
-
-	pub fn get(&self, hash: &ResourceHash) -> Option<&Resource> {
-		self.resources.get(hash)
-	}
-
-	pub fn remove(&mut self, hash: &ResourceHash) -> Option<Resource> {
-		self.resources.remove(hash)
-	}
-
-	pub fn contains(&self, hash: &ResourceHash) -> bool {
-		self.resources.contains_key(hash)
-	}
-
-	pub fn len(&self) -> usize {
-		self.resources.len()
-	}
-
 	pub fn is_empty(&self) -> bool {
 		self.resources.is_empty()
-	}
-
-	pub fn iter(&self) -> impl Iterator<Item = (&ResourceHash, &Resource)> {
-		self.resources.iter()
-	}
-
-	pub fn hashes(&self) -> impl Iterator<Item = &ResourceHash> {
-		self.resources.keys()
 	}
 }
 
 impl FromIterator<(ResourceHash, Resource)> for EmbeddedResources {
 	fn from_iter<T: IntoIterator<Item = (ResourceHash, Resource)>>(iter: T) -> Self {
-		Self { resources: iter.into_iter().collect() }
+		Self {
+			resources: iter.into_iter().collect(),
+		}
 	}
 }
 

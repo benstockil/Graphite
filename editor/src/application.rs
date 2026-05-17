@@ -28,6 +28,10 @@ impl Editor {
 			dispatcher: Dispatcher::with_executor(executor),
 		};
 
+		futures::executor::block_on(async {
+			editor.replace_application_io(PlatformApplicationIo::new().await).await;
+		});
+
 		(editor, runtime)
 	}
 

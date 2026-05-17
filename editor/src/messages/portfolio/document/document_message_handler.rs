@@ -109,8 +109,8 @@ pub struct DocumentMessageHandler {
 	pub graph_view_overlay_open: bool,
 	/// The current opacity of the faded node graph background that covers up the artwork.
 	pub graph_fade_artwork_percentage: f64,
-	/// The resources that are currently used by the document.
-	#[serde(skip_serializing_if = "Option::is_none", rename = "resources")]
+	/// Resources embedded in the document.
+	#[serde(rename = "resources", skip_serializing_if = "Option::is_none")]
 	pub embedded_resources: Option<EmbeddedResources>,
 
 	// =============================================
@@ -930,9 +930,7 @@ impl MessageHandler<DocumentMessage, DocumentMessageContext<'_>> for DocumentMes
 				if !embedded.is_empty() {
 					self.embedded_resources = Some(embedded);
 				}
-
 				let content = self.serialize_document();
-
 				self.embedded_resources = None;
 
 				responses.add(FrontendMessage::TriggerSaveDocument {
