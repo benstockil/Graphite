@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{AttributeDelta, ExportSlot, NetworkId, Node, NodeId, NodeInput, Registry, RegistryDelta};
+use crate::{AttributeDelta, ExportSlot, NetworkId, Node, NodeId, NodeInput, Registry, RegistryDelta, TimeStamp};
 
 /// Computes the minimal set of deltas to transform `from` into `to`
 pub fn compute_deltas(from: &Registry, to: &Registry) -> Vec<RegistryDelta> {
@@ -34,13 +34,15 @@ pub fn compute_deltas(from: &Registry, to: &Registry) -> Vec<RegistryDelta> {
 			continue;
 		}
 
-		// Check for input changes
-		for (input_idx, (from_input, to_input)) in from_node.inputs.iter().zip(to_node.inputs.iter()).enumerate() {
-			if from_input != to_input {
+		// Check for input changes. The diff path carries forward the slot's existing timestamp;
+		// callers that need a fresh clock-tick must mint timestamps themselves.
+		for (input_idx, (from_slot, to_slot)) in from_node.inputs.iter().zip(to_node.inputs.iter()).enumerate() {
+			if from_slot != to_slot {
 				deltas.push(RegistryDelta::ChangeNodeInput {
 					node_id,
 					input_idx,
-					new_input: to_input.clone(),
+					new_input: to_slot.input.clone(),
+					timestamp: to_slot.timestamp,
 				});
 			}
 		}
@@ -68,25 +70,35 @@ pub fn compute_deltas(from: &Registry, to: &Registry) -> Vec<RegistryDelta> {
 		}
 	}
 
-	// 4. Handle network changes — per-slot SetExport diffs.
+	// 4. Handle network changes.
 	let from_network_ids: HashSet<NetworkId> = from.networks.keys().copied().collect();
 	let to_network_ids: HashSet<NetworkId> = to.networks.keys().copied().collect();
 
+	// Disappeared networks: snapshot the `from` state so the reverse can rebuild.
 	for &network_id in from_network_ids.difference(&to_network_ids) {
-		deltas.push(RegistryDelta::RemoveNetwork { network: network_id });
+		let snapshot = from.networks[&network_id].clone();
+		deltas.push(RegistryDelta::RemoveNetwork { network: network_id, snapshot });
 	}
 
-	for &network_id in &to_network_ids {
-		let to_network = &to.networks[&network_id];
-		let from_exports: &[ExportSlot] = from.networks.get(&network_id).map(|n| n.exports.as_slice()).unwrap_or(&[]);
+	// New networks: emit `AddNetwork` carrying the full contents. Per-slot diffs only run for
+	// networks present in both sides; new ones are added wholesale.
+	for &network_id in to_network_ids.difference(&from_network_ids) {
+		let contents = to.networks[&network_id].clone();
+		deltas.push(RegistryDelta::AddNetwork { network: network_id, contents });
+	}
 
-		let max_len = from_exports.len().max(to_network.exports.len());
+	// Per-slot diff for networks present in both.
+	for &network_id in from_network_ids.intersection(&to_network_ids) {
+		let from_network = &from.networks[&network_id];
+		let to_network = &to.networks[&network_id];
+
+		let max_len = from_network.exports.len().max(to_network.exports.len());
 		for slot_idx in 0..max_len {
-			let from_slot = from_exports.get(slot_idx);
+			let from_slot = from_network.exports.get(slot_idx);
 			let to_slot = to_network.exports.get(slot_idx);
 
 			if from_slot != to_slot {
-				let (target, timestamp) = to_slot.map(|s| (s.target.clone(), s.timestamp)).unwrap_or((None, 0));
+				let (target, timestamp) = to_slot.map(|s| (s.target.clone(), s.timestamp)).unwrap_or((None, TimeStamp::ORIGIN));
 				deltas.push(RegistryDelta::SetExport {
 					network: network_id,
 					slot: slot_idx as u32,
@@ -109,36 +121,32 @@ fn nodes_have_same_implementation(a: &Node, b: &Node) -> bool {
 	}
 }
 
-/// Compute attribute deltas between two attribute maps
+/// Compute attribute deltas between two attribute maps.
+///
+/// The diff carries forward the timestamps already present on the `to` side. Removals are
+/// stamped with `TimeStamp::ORIGIN` since the diff path has no clock; callers that need
+/// causally-ordered removes must mint the timestamp themselves.
 fn compute_attribute_deltas(from: &crate::Attributes, to: &crate::Attributes) -> Vec<AttributeDelta> {
 	let mut deltas = Vec::new();
 
-	// Find all keys
 	let from_keys: HashSet<&String> = from.keys().collect();
 	let to_keys: HashSet<&String> = to.keys().collect();
 
-	// Removed attributes
 	for key in from_keys.difference(&to_keys) {
-		deltas.push(AttributeDelta::Remove { key: (*key).clone() });
+		deltas.push(AttributeDelta::Remove {
+			key: (*key).clone(),
+			timestamp: TimeStamp::ORIGIN,
+		});
 	}
 
-	// Added or modified attributes
 	for key in &to_keys {
 		let to_value = &to[*key];
-
-		if let Some(from_value) = from.get(*key) {
-			// Check if value changed (comparing both value and timestamp)
-			if from_value != to_value {
-				deltas.push(AttributeDelta::Set {
-					key: (*key).clone(),
-					value: to_value.clone(),
-				});
-			}
-		} else {
-			// New attribute
+		let changed = from.get(*key).is_none_or(|from_value| from_value != to_value);
+		if changed {
 			deltas.push(AttributeDelta::Set {
 				key: (*key).clone(),
-				value: to_value.clone(),
+				value: to_value.value.clone(),
+				timestamp: to_value.timestamp,
 			});
 		}
 	}
@@ -209,11 +217,24 @@ mod tests {
 			attributes: HashMap::new(),
 			network: 0,
 		};
-		node.attributes.insert("test".to_string(), (serde_json::json!("old"), 0));
+		let stamp = |counter: u64| TimeStamp { counter, peer: crate::PeerId(0) };
+		node.attributes.insert(
+			"test".to_string(),
+			crate::Value {
+				value: serde_json::json!("old"),
+				timestamp: stamp(0),
+			},
+		);
 		from.node_instances.insert(42, node);
 
 		let mut to = from.clone();
-		to.node_instances.get_mut(&42).unwrap().attributes.insert("test".to_string(), (serde_json::json!("new"), 1));
+		to.node_instances.get_mut(&42).unwrap().attributes.insert(
+			"test".to_string(),
+			crate::Value {
+				value: serde_json::json!("new"),
+				timestamp: stamp(1),
+			},
+		);
 
 		let deltas = compute_deltas(&from, &to);
 		assert_eq!(deltas.len(), 1);
@@ -227,7 +248,7 @@ mod tests {
 	fn test_compute_deltas_network_changes() {
 		let make_slot = |id: u64| ExportSlot {
 			target: Some(NodeInput::Node { node_id: id, output_index: 0 }),
-			timestamp: 0,
+			timestamp: TimeStamp::ORIGIN,
 		};
 
 		let mut from = Registry::default();

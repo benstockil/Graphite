@@ -5,10 +5,11 @@ use std::sync::Arc;
 use core_types::uuid::NodeId as RuntimeNodeId;
 use graph_craft::document::value::TaggedValue;
 use graph_craft::document::{DocumentNode, DocumentNodeImplementation, NodeInput as GraphCraftNodeInput, NodeNetwork};
+use xxhash_rust::xxh3::Xxh3;
 
 use crate::{
 	ATTR_CALL_ARGUMENT, ATTR_CONTEXT_FEATURES, ATTR_IMPORT_TYPE, ATTR_ORIGINAL_NODE_ID, ATTR_REFLECTION_METADATA, ATTR_SKIP_DEDUPLICATION, ATTR_VISIBLE, DeclarationId, ExportSlot, Implementation,
-	Network, NetworkId, Node, NodeId, NodeInput, ProtoNode, ROOT_NETWORK, Registry,
+	InputSlot, Network, NetworkId, Node, NodeId, NodeInput, ProtoNode, ROOT_NETWORK, Registry, TimeStamp, Value,
 };
 
 /// Represents a path to a node in the document structure for generating stable IDs
@@ -34,15 +35,18 @@ impl NodePath {
 		Self { path, local_id }
 	}
 
-	/// Generate a stable, globally unique ID by hashing this path
+	/// Generate a stable, globally unique ID by hashing this path.
+	///
+	/// Uses xxh3 (deterministic across runs) rather than `DefaultHasher` (process-randomized), so
+	/// IDs are stable on disk. Path-hashed IDs are a one-shot bootstrap for legacy `from_runtime`
+	/// conversion; once peer-scoped ID issuance lands, `AddNode` ops mint IDs directly without hashing.
 	fn to_global_id(&self) -> NodeId {
-		// For root network nodes (empty path), use the original ID
+		// For root network nodes (empty path), use the original ID.
 		if self.path.is_empty() {
 			return self.local_id;
 		}
 
-		// For nested nodes, hash the entire path
-		let mut hasher = std::collections::hash_map::DefaultHasher::new();
+		let mut hasher = Xxh3::new();
 		self.hash(&mut hasher);
 		hasher.finish()
 	}
@@ -136,8 +140,14 @@ fn convert_network(
 
 		let mut node = convert_node(doc_node, local_id, network_id, parent_path, registry, next_network_id, next_decl_id, proto_node_map)?;
 
-		let timestamp = 0;
-		node.attributes.insert(ATTR_ORIGINAL_NODE_ID.to_string(), (serde_json::json!(local_id), timestamp));
+		let timestamp = TimeStamp::ORIGIN;
+		node.attributes.insert(
+			ATTR_ORIGINAL_NODE_ID.to_string(),
+			Value {
+				value: serde_json::json!(local_id),
+				timestamp,
+			},
+		);
 
 		registry.node_instances.insert(global_id, node);
 	}
@@ -148,7 +158,7 @@ fn convert_network(
 		.map(|export| {
 			Ok(ExportSlot {
 				target: Some(convert_input(export, parent_path, network_id)?),
-				timestamp: 0,
+				timestamp: TimeStamp::ORIGIN,
 			})
 		})
 		.collect::<Result<Vec<_>, ConversionError>>()?;
@@ -175,40 +185,50 @@ fn convert_node(
 		Some(parent) => NodePath::nested(parent, parent.local_id, network_id, local_id),
 	};
 
-	// Convert inputs, tracking their attributes
+	// Convert inputs, tracking their attributes. Initial conversion uses the origin timestamp;
+	// the CRDT system manages timestamps for subsequent ChangeNodeInput ops.
 	let mut inputs = Vec::new();
 	let mut inputs_attributes = Vec::new();
 
 	for input in &doc_node.inputs {
-		inputs.push(convert_input(input, parent_path, network_id)?);
+		inputs.push(InputSlot {
+			input: convert_input(input, parent_path, network_id)?,
+			timestamp: TimeStamp::ORIGIN,
+		});
 		inputs_attributes.push(convert_input_attributes(input)?);
 	}
 
 	// Convert implementation (pass this node's path for nested networks)
 	let implementation = convert_implementation(&doc_node.implementation, &node_path, registry, next_network_id, next_decl_id, proto_node_map)?;
 
-	// Store DocumentNode metadata in attributes for lossless conversion
+	// Store DocumentNode metadata in attributes for lossless conversion.
+	// Initial conversion uses the origin timestamp; the CRDT system manages timestamps for subsequent deltas.
 	let mut attributes = HashMap::new();
-	// TODO: Implement proper timestamp management for attributes.
-	// For initial conversion from NodeNetwork, we use timestamp 0.
-	// The CRDT system will manage timestamps when applying deltas.
-	let timestamp = 0;
+	let timestamp = TimeStamp::ORIGIN;
 
-	// Store call_argument
 	let serialized_call_arg = serde_json::to_value(&doc_node.call_argument).map_err(|e| ConversionError::SerializationError(format!("call_argument: {:?}", e)))?;
-	attributes.insert(ATTR_CALL_ARGUMENT.to_string(), (serialized_call_arg, timestamp));
+	attributes.insert(
+		ATTR_CALL_ARGUMENT.to_string(),
+		Value {
+			value: serialized_call_arg,
+			timestamp,
+		},
+	);
 
-	// Store context_features
 	let serialized_context = serde_json::to_value(&doc_node.context_features).map_err(|e| ConversionError::SerializationError(format!("context_features: {:?}", e)))?;
-	attributes.insert(ATTR_CONTEXT_FEATURES.to_string(), (serialized_context, timestamp));
+	attributes.insert(ATTR_CONTEXT_FEATURES.to_string(), Value { value: serialized_context, timestamp });
 
-	// Store visible
 	let serialized_visible = serde_json::to_value(&doc_node.visible).map_err(|e| ConversionError::SerializationError(format!("visible: {:?}", e)))?;
-	attributes.insert(ATTR_VISIBLE.to_string(), (serialized_visible, timestamp));
+	attributes.insert(ATTR_VISIBLE.to_string(), Value { value: serialized_visible, timestamp });
 
-	// Store skip_deduplication
 	let serialized_skip_dedup = serde_json::to_value(&doc_node.skip_deduplication).map_err(|e| ConversionError::SerializationError(format!("skip_deduplication: {:?}", e)))?;
-	attributes.insert(ATTR_SKIP_DEDUPLICATION.to_string(), (serialized_skip_dedup, timestamp));
+	attributes.insert(
+		ATTR_SKIP_DEDUPLICATION.to_string(),
+		Value {
+			value: serialized_skip_dedup,
+			timestamp,
+		},
+	);
 
 	Ok(Node {
 		implementation,
@@ -257,23 +277,26 @@ fn convert_input(input: &GraphCraftNodeInput, parent_path: Option<&NodePath>, ne
 	})
 }
 
-/// Extracts input metadata and stores it in attributes for lossless conversion
+/// Extracts input metadata and stores it in attributes for lossless conversion.
+/// Initial conversion uses the origin timestamp.
 fn convert_input_attributes(input: &GraphCraftNodeInput) -> Result<crate::Attributes, ConversionError> {
 	let mut attributes = HashMap::new();
-	// TODO: Implement proper timestamp management for attributes.
-	// For initial conversion from NodeNetwork, we use timestamp 0.
-	let timestamp = 0;
+	let timestamp = TimeStamp::ORIGIN;
 
-	// Store import_type for Import inputs
 	if let GraphCraftNodeInput::Import { import_type, .. } = input {
 		let serialized_type = serde_json::to_value(import_type).map_err(|e| ConversionError::SerializationError(format!("import_type: {:?}", e)))?;
-		attributes.insert(ATTR_IMPORT_TYPE.to_string(), (serialized_type, timestamp));
+		attributes.insert(ATTR_IMPORT_TYPE.to_string(), Value { value: serialized_type, timestamp });
 	}
 
-	// Store reflection_metadata for Reflection inputs
 	if let GraphCraftNodeInput::Reflection(metadata) = input {
 		let serialized_metadata = serde_json::to_value(metadata).map_err(|e| ConversionError::SerializationError(format!("reflection_metadata: {:?}", e)))?;
-		attributes.insert(ATTR_REFLECTION_METADATA.to_string(), (serialized_metadata, timestamp));
+		attributes.insert(
+			ATTR_REFLECTION_METADATA.to_string(),
+			Value {
+				value: serialized_metadata,
+				timestamp,
+			},
+		);
 	}
 
 	Ok(attributes)

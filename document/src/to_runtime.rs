@@ -83,7 +83,7 @@ fn convert_network(registry: &Registry, network_id: NetworkId) -> Result<NodeNet
 		.iter()
 		.filter(|(_, node)| node.network == network_id)
 		.map(|(&global_id, node)| {
-			let local_id = node.attributes.get(ATTR_ORIGINAL_NODE_ID).and_then(|(value, _)| value.as_u64()).unwrap_or(global_id);
+			let local_id = node.attributes.get(ATTR_ORIGINAL_NODE_ID).and_then(|v| v.value.as_u64()).unwrap_or(global_id);
 
 			convert_node(registry, node).map(|doc_node| (RuntimeNodeId(local_id), doc_node))
 		})
@@ -116,36 +116,28 @@ fn convert_node(registry: &Registry, node: &crate::Node) -> Result<DocumentNode,
 		.inputs
 		.iter()
 		.zip(node.inputs_attributes.iter())
-		.map(|(input, input_attrs)| convert_input(registry, input, input_attrs))
+		.map(|(slot, input_attrs)| convert_input(registry, &slot.input, input_attrs))
 		.collect::<Result<Vec<_>, _>>()?;
 
 	// Extract call_argument from attributes
 	let call_argument = node
 		.attributes
 		.get(ATTR_CALL_ARGUMENT)
-		.and_then(|(value, _timestamp)| serde_json::from_value(value.clone()).ok())
+		.and_then(|v| serde_json::from_value(v.value.clone()).ok())
 		.unwrap_or_else(|| concrete!(())); // Default to unit type if not found
 
 	// Extract context_features from attributes
 	let context_features = node
 		.attributes
 		.get(ATTR_CONTEXT_FEATURES)
-		.and_then(|(value, _timestamp)| serde_json::from_value(value.clone()).ok())
+		.and_then(|v| serde_json::from_value(v.value.clone()).ok())
 		.unwrap_or_default(); // Default to empty context features if not found
 
 	// Extract visible from attributes
-	let visible = node
-		.attributes
-		.get(ATTR_VISIBLE)
-		.and_then(|(value, _timestamp)| serde_json::from_value(value.clone()).ok())
-		.unwrap_or(true); // Default to true if not found
+	let visible = node.attributes.get(ATTR_VISIBLE).and_then(|v| serde_json::from_value(v.value.clone()).ok()).unwrap_or(true); // Default to true if not found
 
 	// Extract skip_deduplication from attributes
-	let skip_deduplication = node
-		.attributes
-		.get(ATTR_SKIP_DEDUPLICATION)
-		.and_then(|(value, _timestamp)| serde_json::from_value(value.clone()).ok())
-		.unwrap_or(false); // Default to false if not found
+	let skip_deduplication = node.attributes.get(ATTR_SKIP_DEDUPLICATION).and_then(|v| serde_json::from_value(v.value.clone()).ok()).unwrap_or(false); // Default to false if not found
 
 	Ok(DocumentNode {
 		inputs,
@@ -165,7 +157,7 @@ fn convert_input(registry: &Registry, input: &NodeInput, input_attributes: &crat
 		NodeInput::Node { node_id, output_index } => {
 			// Look up the referenced node and extract its original local ID
 			let referenced_node = registry.node_instances.get(node_id).ok_or(ConversionError::NodeNotFound(*node_id))?;
-			let local_id = referenced_node.attributes.get(ATTR_ORIGINAL_NODE_ID).and_then(|(value, _)| value.as_u64()).unwrap_or(*node_id); // Fallback to global ID if not found
+			let local_id = referenced_node.attributes.get(ATTR_ORIGINAL_NODE_ID).and_then(|v| v.value.as_u64()).unwrap_or(*node_id); // Fallback to global ID if not found
 
 			GraphCraftNodeInput::Node {
 				node_id: RuntimeNodeId(local_id),
@@ -185,7 +177,7 @@ fn convert_input(registry: &Registry, input: &NodeInput, input_attributes: &crat
 			// Extract import_type from input_attributes if available
 			let import_type = input_attributes
 				.get(ATTR_IMPORT_TYPE)
-				.and_then(|(value, _timestamp)| serde_json::from_value(value.clone()).ok())
+				.and_then(|v| serde_json::from_value(v.value.clone()).ok())
 				.unwrap_or_else(|| Type::Generic(Cow::Borrowed("T"))); // Default to generic if not found
 
 			GraphCraftNodeInput::Import {
@@ -197,7 +189,7 @@ fn convert_input(registry: &Registry, input: &NodeInput, input_attributes: &crat
 			// Extract reflection_metadata from input_attributes
 			let metadata = input_attributes
 				.get(ATTR_REFLECTION_METADATA)
-				.and_then(|(value, _timestamp)| serde_json::from_value(value.clone()).ok())
+				.and_then(|v| serde_json::from_value(v.value.clone()).ok())
 				.ok_or_else(|| ConversionError::DeserializationError("Missing reflection_metadata in input_attributes".to_string()))?;
 
 			GraphCraftNodeInput::Reflection(metadata)
