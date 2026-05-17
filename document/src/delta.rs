@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{AttributeDelta, NetworkId, Node, NodeId, NodeInput, Registry, RegistryDelta};
+use crate::{AttributeDelta, ExportSlot, NetworkId, Node, NodeId, NodeInput, Registry, RegistryDelta};
 
 /// Computes the minimal set of deltas to transform `from` into `to`
 pub fn compute_deltas(from: &Registry, to: &Registry) -> Vec<RegistryDelta> {
@@ -30,16 +30,13 @@ pub fn compute_deltas(from: &Registry, to: &Registry) -> Vec<RegistryDelta> {
 		// (since we don't have a ChangeImplementation delta variant)
 		if !nodes_have_same_implementation(from_node, to_node) {
 			deltas.push(RegistryDelta::RemoveNode { node_id });
-			deltas.push(RegistryDelta::AddNode {
-				node_id,
-				node: to_node.clone(),
-			});
+			deltas.push(RegistryDelta::AddNode { node_id, node: to_node.clone() });
 			continue;
 		}
 
 		// Check for input changes
 		for (input_idx, (from_input, to_input)) in from_node.inputs.iter().zip(to_node.inputs.iter()).enumerate() {
-			if !inputs_equal(from_input, to_input) {
+			if from_input != to_input {
 				deltas.push(RegistryDelta::ChangeNodeInput {
 					node_id,
 					input_idx,
@@ -52,62 +49,51 @@ pub fn compute_deltas(from: &Registry, to: &Registry) -> Vec<RegistryDelta> {
 		if from_node.inputs.len() != to_node.inputs.len() {
 			// If input count changed, we need to remove and re-add the node
 			deltas.push(RegistryDelta::RemoveNode { node_id });
-			deltas.push(RegistryDelta::AddNode {
-				node_id,
-				node: to_node.clone(),
-			});
+			deltas.push(RegistryDelta::AddNode { node_id, node: to_node.clone() });
 			continue;
 		}
 
 		// Check for attribute changes
 		let attribute_deltas = compute_attribute_deltas(&from_node.attributes, &to_node.attributes);
 		for delta in attribute_deltas {
-			deltas.push(RegistryDelta::ChangeNodeAttribute {
-				node_id,
-				delta,
-			});
+			deltas.push(RegistryDelta::ChangeNodeAttribute { node_id, delta });
 		}
 
 		// Check for input attribute changes
 		for (input_idx, (from_attrs, to_attrs)) in from_node.inputs_attributes.iter().zip(to_node.inputs_attributes.iter()).enumerate() {
 			let input_attr_deltas = compute_attribute_deltas(from_attrs, to_attrs);
 			for delta in input_attr_deltas {
-				deltas.push(RegistryDelta::ChangeNodeInputAttribute {
-					node_id,
-					input_idx,
-					delta,
-				});
+				deltas.push(RegistryDelta::ChangeNodeInputAttribute { node_id, input_idx, delta });
 			}
 		}
 	}
 
-	// 4. Handle network changes
+	// 4. Handle network changes — per-slot SetExport diffs.
 	let from_network_ids: HashSet<NetworkId> = from.networks.keys().copied().collect();
 	let to_network_ids: HashSet<NetworkId> = to.networks.keys().copied().collect();
 
-	// Find removed networks
 	for &network_id in from_network_ids.difference(&to_network_ids) {
 		deltas.push(RegistryDelta::RemoveNetwork { network: network_id });
 	}
 
-	// Find added or modified networks
 	for &network_id in &to_network_ids {
 		let to_network = &to.networks[&network_id];
+		let from_exports: &[ExportSlot] = from.networks.get(&network_id).map(|n| n.exports.as_slice()).unwrap_or(&[]);
 
-		// Check if this is a new network or if exports changed
-		if let Some(from_network) = from.networks.get(&network_id) {
-			if from_network.exports != to_network.exports {
-				deltas.push(RegistryDelta::SetNetwork {
+		let max_len = from_exports.len().max(to_network.exports.len());
+		for slot_idx in 0..max_len {
+			let from_slot = from_exports.get(slot_idx);
+			let to_slot = to_network.exports.get(slot_idx);
+
+			if from_slot != to_slot {
+				let (target, timestamp) = to_slot.map(|s| (s.target.clone(), s.timestamp)).unwrap_or((None, 0));
+				deltas.push(RegistryDelta::SetExport {
 					network: network_id,
-					network_output_nodes: to_network.exports.clone(),
+					slot: slot_idx as u32,
+					target,
+					timestamp,
 				});
 			}
-		} else {
-			// New network
-			deltas.push(RegistryDelta::SetNetwork {
-				network: network_id,
-				network_output_nodes: to_network.exports.clone(),
-			});
 		}
 	}
 
@@ -119,22 +105,6 @@ fn nodes_have_same_implementation(a: &Node, b: &Node) -> bool {
 	match (&a.implementation, &b.implementation) {
 		(crate::Implementation::ProtoNode(a_id), crate::Implementation::ProtoNode(b_id)) => a_id == b_id,
 		(crate::Implementation::Network(a_id), crate::Implementation::Network(b_id)) => a_id == b_id,
-		_ => false,
-	}
-}
-
-/// Check if two inputs are equal
-fn inputs_equal(a: &NodeInput, b: &NodeInput) -> bool {
-	match (a, b) {
-		(NodeInput::Node { node_id: a_id, output_index: a_idx }, NodeInput::Node { node_id: b_id, output_index: b_idx }) => {
-			a_id == b_id && a_idx == b_idx
-		}
-		(NodeInput::Value { raw_value: a_val, exposed: a_exp }, NodeInput::Value { raw_value: b_val, exposed: b_exp }) => {
-			a_val == b_val && a_exp == b_exp
-		}
-		(NodeInput::Scope(a), NodeInput::Scope(b)) => a == b,
-		(NodeInput::Import { import_idx: a_idx }, NodeInput::Import { import_idx: b_idx }) => a_idx == b_idx,
-		(NodeInput::Reflection, NodeInput::Reflection) => true,
 		_ => false,
 	}
 }
@@ -183,12 +153,7 @@ mod tests {
 
 	#[test]
 	fn test_compute_deltas_empty() {
-		let registry = Registry {
-			node_declarations: HashMap::new(),
-			node_instances: HashMap::new(),
-			networks: HashMap::new(),
-			exported_nodes: vec![],
-		};
+		let registry = Registry::default();
 
 		let deltas = compute_deltas(&registry, &registry);
 		assert_eq!(deltas.len(), 0, "No deltas should be generated for identical registries");
@@ -196,12 +161,7 @@ mod tests {
 
 	#[test]
 	fn test_compute_deltas_add_node() {
-		let from = Registry {
-			node_declarations: HashMap::new(),
-			node_instances: HashMap::new(),
-			networks: HashMap::new(),
-			exported_nodes: vec![],
-		};
+		let from = Registry::default();
 
 		let mut to = from.clone();
 		let node = Node {
@@ -220,12 +180,7 @@ mod tests {
 
 	#[test]
 	fn test_compute_deltas_remove_node() {
-		let mut from = Registry {
-			node_declarations: HashMap::new(),
-			node_instances: HashMap::new(),
-			networks: HashMap::new(),
-			exported_nodes: vec![],
-		};
+		let mut from = Registry::default();
 
 		let node = Node {
 			implementation: Implementation::ProtoNode(1),
@@ -236,12 +191,7 @@ mod tests {
 		};
 		from.node_instances.insert(42, node);
 
-		let to = Registry {
-			node_declarations: HashMap::new(),
-			node_instances: HashMap::new(),
-			networks: HashMap::new(),
-			exported_nodes: vec![],
-		};
+		let to = Registry::default();
 
 		let deltas = compute_deltas(&from, &to);
 		assert_eq!(deltas.len(), 1);
@@ -250,12 +200,7 @@ mod tests {
 
 	#[test]
 	fn test_compute_deltas_modify_attribute() {
-		let mut from = Registry {
-			node_declarations: HashMap::new(),
-			node_instances: HashMap::new(),
-			networks: HashMap::new(),
-			exported_nodes: vec![],
-		};
+		let mut from = Registry::default();
 
 		let mut node = Node {
 			implementation: Implementation::ProtoNode(1),
@@ -268,8 +213,7 @@ mod tests {
 		from.node_instances.insert(42, node);
 
 		let mut to = from.clone();
-		to.node_instances.get_mut(&42).unwrap()
-			.attributes.insert("test".to_string(), (serde_json::json!("new"), 1));
+		to.node_instances.get_mut(&42).unwrap().attributes.insert("test".to_string(), (serde_json::json!("new"), 1));
 
 		let deltas = compute_deltas(&from, &to);
 		assert_eq!(deltas.len(), 1);
@@ -281,22 +225,33 @@ mod tests {
 
 	#[test]
 	fn test_compute_deltas_network_changes() {
-		let mut from = Registry {
-			node_declarations: HashMap::new(),
-			node_instances: HashMap::new(),
-			networks: HashMap::new(),
-			exported_nodes: vec![],
+		let make_slot = |id: u64| ExportSlot {
+			target: Some(NodeInput::Node { node_id: id, output_index: 0 }),
+			timestamp: 0,
 		};
-		from.networks.insert(0, Network { exports: vec![1, 2] });
+
+		let mut from = Registry::default();
+		from.networks.insert(
+			0,
+			Network {
+				exports: vec![make_slot(1), make_slot(2)],
+			},
+		);
 
 		let mut to = from.clone();
-		to.networks.get_mut(&0).unwrap().exports = vec![1, 2, 3];
+		to.networks.get_mut(&0).unwrap().exports.push(make_slot(3));
 
 		let deltas = compute_deltas(&from, &to);
+		// Only slot 2 changed (added). Slots 0 and 1 are unchanged so they don't emit ops.
 		assert_eq!(deltas.len(), 1);
 		assert!(matches!(
 			&deltas[0],
-			RegistryDelta::SetNetwork { network: 0, network_output_nodes } if network_output_nodes == &vec![1, 2, 3]
+			RegistryDelta::SetExport {
+				network: 0,
+				slot: 2,
+				target: Some(NodeInput::Node { node_id: 3, .. }),
+				..
+			}
 		));
 	}
 }
