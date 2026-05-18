@@ -1,6 +1,7 @@
 mod deserialization;
 mod memo_network;
 mod resolved_types;
+mod storage_metadata;
 
 use super::document_metadata::{DocumentMetadata, LayerNodeIdentifier, NodeRelations};
 use super::misc::PTZ;
@@ -6655,6 +6656,9 @@ pub struct NodePersistentMetadata {
 impl NodePersistentMetadata {
 	pub fn new(position: NodePosition) -> Self {
 		Self { position }
+	}
+	pub fn position(&self) -> &NodePosition {
+		&self.position
 	}
 }
 

@@ -69,7 +69,12 @@ Library import (how `.gdd` files reference each other and surface library nodes)
 All metadata that isn't structural — node positions, display names, `call_argument` overrides, visibility, `context_features`, locked/pinned flags, input type hints, reflection metadata — lives in a single `Attributes` bucket per node, per input, and at the document level:
 
 ```rs
-pub type Attributes = HashMap<String, (serde_json::Value, TimeStamp)>;
+pub struct Value {
+    pub value: serde_json::Value,
+    pub timestamp: TimeStamp,
+}
+
+pub type Attributes = HashMap<String, Value>;
 ```
 
 Keys are namespaced (`ui::position`, `compute::call_argument`, `library::display_name`, ...). Values are JSON; the per-value `TimeStamp` drives LWW on concurrent edits.
@@ -88,6 +93,7 @@ pub enum RegistryDelta {
     ChangeNodeAttribute      { node_id: NodeId, delta: AttributeDelta },
     ChangeNodeInputAttribute { node_id: NodeId, input_idx: usize, delta: AttributeDelta },
     SetExport     { network: NetworkId, slot: u32, target: Option<NodeInput>, timestamp: TimeStamp },
+    AddNetwork    { network: NetworkId, contents: Network },
     RemoveNetwork { network: NetworkId, snapshot: Network },
     SetExportedNodes        { nodes: Vec<NodeId>, timestamp: TimeStamp },
     ChangeDocumentAttribute { delta: AttributeDelta },

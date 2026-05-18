@@ -7,10 +7,9 @@ use graph_craft::document::value::TaggedValue;
 use graph_craft::document::{DocumentNode, DocumentNodeImplementation, NodeInput as GraphCraftNodeInput, NodeNetwork};
 use xxhash_rust::xxh3::Xxh3;
 
-use crate::{
-	ATTR_CALL_ARGUMENT, ATTR_CONTEXT_FEATURES, ATTR_IMPORT_TYPE, ATTR_ORIGINAL_NODE_ID, ATTR_REFLECTION_METADATA, ATTR_SKIP_DEDUPLICATION, ATTR_VISIBLE, DeclarationId, ExportSlot, Implementation,
-	InputSlot, Network, NetworkId, Node, NodeId, NodeInput, ProtoNode, ROOT_NETWORK, Registry, TimeStamp, Value,
-};
+use crate::attr::*;
+use crate::metadata_source::{NoMetadata, NodeMetadataSource};
+use crate::{DeclarationId, ExportSlot, Implementation, InputSlot, Network, NetworkId, Node, NodeId, NodeInput, Position, ProtoNode, ROOT_NETWORK, Registry, TimeStamp, Value};
 
 /// Represents a path to a node in the document structure for generating stable IDs
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -78,56 +77,60 @@ pub enum ConversionError {
 /// - Each nested NodeNetwork is assigned a unique NetworkId
 /// - All nodes (including from nested networks) are added to the flat registry.node_instances map
 /// - Each node records which network it belongs to via the `network` field
+///
+/// This entry point provides no editor-side metadata. Use [`Registry::from_runtime_with_metadata`]
+/// to thread positions, display names, etc.
 impl TryFrom<&NodeNetwork> for Registry {
 	type Error = ConversionError;
 
 	fn try_from(node_network: &NodeNetwork) -> Result<Self, Self::Error> {
-		convert_node_network(node_network)
+		Registry::from_runtime_with_metadata(node_network, &NoMetadata)
 	}
 }
 
-/// Converts a NodeNetwork to a Registry by flattening the nested structure
-fn convert_node_network(node_network: &NodeNetwork) -> Result<Registry, ConversionError> {
-	let mut registry = Registry {
-		node_declarations: HashMap::new(),
-		node_instances: HashMap::new(),
-		networks: HashMap::new(),
-		exported_nodes: vec![],
-		attributes: HashMap::new(),
-	};
+impl Registry {
+	/// Convert a `NodeNetwork` to a `Registry`, attaching `ui::*` attributes pulled from `metadata`.
+	pub fn from_runtime_with_metadata<M: NodeMetadataSource>(node_network: &NodeNetwork, metadata: &M) -> Result<Self, ConversionError> {
+		let mut registry = Registry {
+			node_declarations: HashMap::new(),
+			node_instances: HashMap::new(),
+			networks: HashMap::new(),
+			exported_nodes: vec![],
+			attributes: HashMap::new(),
+		};
 
-	// Track the next available IDs. The root network uses the reserved `ROOT_NETWORK` constant (0).
-	let mut next_network_id = ROOT_NETWORK + 1;
-	let mut next_decl_id = 0;
+		let mut ctx = ConversionContext {
+			// Track the next available IDs. The root network uses the reserved `ROOT_NETWORK` constant (0).
+			next_network_id: ROOT_NETWORK + 1,
+			next_decl_id: 0,
+			proto_node_map: HashMap::new(),
+			metadata,
+		};
 
-	// Track proto node identifiers to declaration IDs.
-	let mut proto_node_map: HashMap<String, DeclarationId> = HashMap::new();
+		// Root network has no parent path on either side.
+		convert_network(node_network, ROOT_NETWORK, None, &[], &mut registry, &mut ctx)?;
 
-	// Root network has no parent path.
-	let root_parent_path = None;
+		Ok(registry)
+	}
+}
 
-	convert_network(
-		node_network,
-		ROOT_NETWORK,
-		root_parent_path,
-		&mut registry,
-		&mut next_network_id,
-		&mut next_decl_id,
-		&mut proto_node_map,
-	)?;
-
-	Ok(registry)
+/// Recursion-wide state shared across `convert_*` helpers. Holds the next-ID counters, the
+/// proto-node interning map, and the editor metadata source used to populate `ui::*` attributes.
+struct ConversionContext<'m, M: NodeMetadataSource + ?Sized> {
+	next_network_id: NetworkId,
+	next_decl_id: DeclarationId,
+	proto_node_map: HashMap<String, DeclarationId>,
+	metadata: &'m M,
 }
 
 /// Converts a single network and registers it in the registry. Exports become first-class `ExportSlot`s on `Network`.
-fn convert_network(
+fn convert_network<M: NodeMetadataSource + ?Sized>(
 	node_network: &NodeNetwork,
 	network_id: NetworkId,
 	parent_path: Option<&NodePath>,
+	metadata_path: &[RuntimeNodeId],
 	registry: &mut Registry,
-	next_network_id: &mut NetworkId,
-	next_decl_id: &mut DeclarationId,
-	proto_node_map: &mut HashMap<String, DeclarationId>,
+	ctx: &mut ConversionContext<'_, M>,
 ) -> Result<(), ConversionError> {
 	for (runtime_node_id, doc_node) in &node_network.nodes {
 		let local_id = runtime_node_id.0;
@@ -138,11 +141,11 @@ fn convert_network(
 		};
 		let global_id = node_path.to_global_id();
 
-		let mut node = convert_node(doc_node, local_id, network_id, parent_path, registry, next_network_id, next_decl_id, proto_node_map)?;
+		let mut node = convert_node(doc_node, local_id, network_id, parent_path, metadata_path, *runtime_node_id, registry, ctx)?;
 
 		let timestamp = TimeStamp::ORIGIN;
 		node.attributes.insert(
-			ATTR_ORIGINAL_NODE_ID.to_string(),
+			ORIGINAL_NODE_ID.to_string(),
 			Value {
 				value: serde_json::json!(local_id),
 				timestamp,
@@ -168,16 +171,19 @@ fn convert_network(
 	Ok(())
 }
 
-/// Converts a DocumentNode to a Registry Node
-fn convert_node(
+/// Converts a DocumentNode to a Registry Node.
+///
+/// `runtime_node_id` is the runtime-side local ID used to query `ctx.metadata`; `metadata_path`
+/// is the chain of runtime IDs from the root network down to (but not including) this node.
+fn convert_node<M: NodeMetadataSource + ?Sized>(
 	doc_node: &DocumentNode,
 	local_id: NodeId,
 	network_id: NetworkId,
 	parent_path: Option<&NodePath>,
+	metadata_path: &[RuntimeNodeId],
+	runtime_node_id: RuntimeNodeId,
 	registry: &mut Registry,
-	next_network_id: &mut NetworkId,
-	next_decl_id: &mut DeclarationId,
-	proto_node_map: &mut HashMap<String, DeclarationId>,
+	ctx: &mut ConversionContext<'_, M>,
 ) -> Result<Node, ConversionError> {
 	// Construct this node's full path
 	let node_path = match parent_path {
@@ -198,8 +204,18 @@ fn convert_node(
 		inputs_attributes.push(convert_input_attributes(input)?);
 	}
 
+	// For nested networks, extend the metadata path with this node before recursing.
+	let mut child_metadata_path = Vec::new();
+	let child_metadata_path = if matches!(doc_node.implementation, DocumentNodeImplementation::Network(_)) {
+		child_metadata_path.extend_from_slice(metadata_path);
+		child_metadata_path.push(runtime_node_id);
+		child_metadata_path.as_slice()
+	} else {
+		metadata_path
+	};
+
 	// Convert implementation (pass this node's path for nested networks)
-	let implementation = convert_implementation(&doc_node.implementation, &node_path, registry, next_network_id, next_decl_id, proto_node_map)?;
+	let implementation = convert_implementation(&doc_node.implementation, &node_path, child_metadata_path, registry, ctx)?;
 
 	// Store DocumentNode metadata in attributes for lossless conversion.
 	// Initial conversion uses the origin timestamp; the CRDT system manages timestamps for subsequent deltas.
@@ -208,7 +224,7 @@ fn convert_node(
 
 	let serialized_call_arg = serde_json::to_value(&doc_node.call_argument).map_err(|e| ConversionError::SerializationError(format!("call_argument: {:?}", e)))?;
 	attributes.insert(
-		ATTR_CALL_ARGUMENT.to_string(),
+		CALL_ARGUMENT.to_string(),
 		Value {
 			value: serialized_call_arg,
 			timestamp,
@@ -216,19 +232,24 @@ fn convert_node(
 	);
 
 	let serialized_context = serde_json::to_value(&doc_node.context_features).map_err(|e| ConversionError::SerializationError(format!("context_features: {:?}", e)))?;
-	attributes.insert(ATTR_CONTEXT_FEATURES.to_string(), Value { value: serialized_context, timestamp });
+	attributes.insert(CONTEXT_FEATURES.to_string(), Value { value: serialized_context, timestamp });
 
 	let serialized_visible = serde_json::to_value(&doc_node.visible).map_err(|e| ConversionError::SerializationError(format!("visible: {:?}", e)))?;
-	attributes.insert(ATTR_VISIBLE.to_string(), Value { value: serialized_visible, timestamp });
+	attributes.insert(VISIBLE.to_string(), Value { value: serialized_visible, timestamp });
 
 	let serialized_skip_dedup = serde_json::to_value(&doc_node.skip_deduplication).map_err(|e| ConversionError::SerializationError(format!("skip_deduplication: {:?}", e)))?;
 	attributes.insert(
-		ATTR_SKIP_DEDUPLICATION.to_string(),
+		SKIP_DEDUPLICATION.to_string(),
 		Value {
 			value: serialized_skip_dedup,
 			timestamp,
 		},
 	);
+
+	// Editor metadata. Only emitted when the source supplies a value, so converting a network
+	// without editor metadata (e.g., synthetic tests via `NoMetadata`) leaves the `ui::*` keys
+	// absent rather than writing defaults that would round-trip as if explicitly set.
+	write_ui_attributes(&mut attributes, ctx.metadata, metadata_path, runtime_node_id, timestamp)?;
 
 	Ok(Node {
 		implementation,
@@ -237,6 +258,66 @@ fn convert_node(
 		attributes,
 		network: network_id,
 	})
+}
+
+/// Pulls `ui::*` values from the metadata source and inserts them into `attributes`.
+fn write_ui_attributes<M: NodeMetadataSource + ?Sized>(
+	attributes: &mut crate::Attributes,
+	metadata: &M,
+	metadata_path: &[RuntimeNodeId],
+	runtime_node_id: RuntimeNodeId,
+	timestamp: TimeStamp,
+) -> Result<(), ConversionError> {
+	if let Some(position) = metadata.position(metadata_path, runtime_node_id) {
+		let value = serde_json::to_value(position).map_err(|e| ConversionError::SerializationError(format!("ui::position: {:?}", e)))?;
+		attributes.insert(UI_POSITION.to_string(), Value { value, timestamp });
+	}
+
+	// `is_layer` is the layer-vs-node toggle. Default is `false`, so only emit when true to keep
+	// the attribute set lean — the absence of the key is read as `false` on round-trip.
+	if metadata.is_layer(metadata_path, runtime_node_id) {
+		attributes.insert(
+			UI_IS_LAYER.to_string(),
+			Value {
+				value: serde_json::Value::Bool(true),
+				timestamp,
+			},
+		);
+	}
+
+	if let Some(name) = metadata.display_name(metadata_path, runtime_node_id) {
+		if !name.is_empty() {
+			attributes.insert(
+				UI_DISPLAY_NAME.to_string(),
+				Value {
+					value: serde_json::Value::String(name.to_string()),
+					timestamp,
+				},
+			);
+		}
+	}
+
+	if metadata.locked(metadata_path, runtime_node_id) {
+		attributes.insert(
+			UI_LOCKED.to_string(),
+			Value {
+				value: serde_json::Value::Bool(true),
+				timestamp,
+			},
+		);
+	}
+
+	if metadata.pinned(metadata_path, runtime_node_id) {
+		attributes.insert(
+			UI_PINNED.to_string(),
+			Value {
+				value: serde_json::Value::Bool(true),
+				timestamp,
+			},
+		);
+	}
+
+	Ok(())
 }
 
 /// Converts a graph-craft NodeInput to a Registry NodeInput, remapping node IDs to global IDs
@@ -285,13 +366,13 @@ fn convert_input_attributes(input: &GraphCraftNodeInput) -> Result<crate::Attrib
 
 	if let GraphCraftNodeInput::Import { import_type, .. } = input {
 		let serialized_type = serde_json::to_value(import_type).map_err(|e| ConversionError::SerializationError(format!("import_type: {:?}", e)))?;
-		attributes.insert(ATTR_IMPORT_TYPE.to_string(), Value { value: serialized_type, timestamp });
+		attributes.insert(IMPORT_TYPE.to_string(), Value { value: serialized_type, timestamp });
 	}
 
 	if let GraphCraftNodeInput::Reflection(metadata) = input {
 		let serialized_metadata = serde_json::to_value(metadata).map_err(|e| ConversionError::SerializationError(format!("reflection_metadata: {:?}", e)))?;
 		attributes.insert(
-			ATTR_REFLECTION_METADATA.to_string(),
+			REFLECTION_METADATA.to_string(),
 			Value {
 				value: serialized_metadata,
 				timestamp,
@@ -303,21 +384,20 @@ fn convert_input_attributes(input: &GraphCraftNodeInput) -> Result<crate::Attrib
 }
 
 /// Converts a DocumentNodeImplementation to a Registry Implementation
-fn convert_implementation(
+fn convert_implementation<M: NodeMetadataSource + ?Sized>(
 	implementation: &DocumentNodeImplementation,
 	current_node_path: &NodePath,
+	child_metadata_path: &[RuntimeNodeId],
 	registry: &mut Registry,
-	next_network_id: &mut NetworkId,
-	next_decl_id: &mut DeclarationId,
-	proto_node_map: &mut HashMap<String, DeclarationId>,
+	ctx: &mut ConversionContext<'_, M>,
 ) -> Result<Implementation, ConversionError> {
 	Ok(match implementation {
 		DocumentNodeImplementation::ProtoNode(identifier) => {
 			// Get or create a declaration for this proto node
 			let identifier_str = identifier.as_str().to_string();
-			let decl_id = proto_node_map.entry(identifier_str.clone()).or_insert_with(|| {
-				let decl_id = *next_decl_id;
-				*next_decl_id += 1;
+			let decl_id = ctx.proto_node_map.entry(identifier_str.clone()).or_insert_with(|| {
+				let decl_id = ctx.next_decl_id;
+				ctx.next_decl_id += 1;
 				registry.node_declarations.insert(
 					decl_id,
 					ProtoNode {
@@ -334,10 +414,10 @@ fn convert_implementation(
 		DocumentNodeImplementation::Network(nested_network) => {
 			// Recursively convert the nested network
 			// The current node becomes the parent for nodes in the nested network
-			let nested_network_id = *next_network_id;
-			*next_network_id += 1;
+			let nested_network_id = ctx.next_network_id;
+			ctx.next_network_id += 1;
 
-			convert_network(nested_network, nested_network_id, Some(current_node_path), registry, next_network_id, next_decl_id, proto_node_map)?;
+			convert_network(nested_network, nested_network_id, Some(current_node_path), child_metadata_path, registry, ctx)?;
 
 			Implementation::Network(nested_network_id)
 		}

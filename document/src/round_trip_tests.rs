@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use core_types::context::{ContextDependencies, ContextFeature};
 use core_types::uuid::NodeId;
@@ -6,7 +7,7 @@ use graph_craft::document::{DocumentNode, DocumentNodeImplementation, NodeInput,
 use graph_craft::graphene_compiler::Compiler;
 use graph_craft::{ProtoNodeIdentifier, Type, concrete};
 
-use crate::Registry;
+use crate::{NodeMetadataSource, Position, Registry};
 
 /// Helper function to verify a NodeNetwork can be compiled successfully.
 /// Note: This only works for complete networks with all inputs resolved.
@@ -350,4 +351,125 @@ fn test_demo_artwork_round_trip() {
 
 		println!("✓ {} passed", artwork_name);
 	}
+}
+
+/// Per-node UI state used by the in-test metadata source. Keyed by `(network_path, local_id)`.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct UiState {
+	position: Option<Position>,
+	is_layer: bool,
+	display_name: Option<String>,
+	locked: bool,
+	pinned: bool,
+}
+
+/// In-test `NodeMetadataSource` backed by a `HashMap` keyed on the full `(network_path, local_id)`
+/// addressing the editor would use.
+struct TestMetadata {
+	entries: HashMap<(Vec<NodeId>, NodeId), UiState>,
+}
+
+impl TestMetadata {
+	fn new() -> Self {
+		Self { entries: HashMap::new() }
+	}
+
+	fn insert(&mut self, network_path: &[NodeId], local_id: NodeId, state: UiState) {
+		self.entries.insert((network_path.to_vec(), local_id), state);
+	}
+
+	fn get(&self, network_path: &[NodeId], local_id: NodeId) -> Option<&UiState> {
+		self.entries.get(&(network_path.to_vec(), local_id))
+	}
+}
+
+impl NodeMetadataSource for TestMetadata {
+	fn position(&self, network_path: &[NodeId], local_id: NodeId) -> Option<Position> {
+		self.get(network_path, local_id).and_then(|s| s.position)
+	}
+	fn is_layer(&self, network_path: &[NodeId], local_id: NodeId) -> bool {
+		self.get(network_path, local_id).is_some_and(|s| s.is_layer)
+	}
+	fn display_name(&self, network_path: &[NodeId], local_id: NodeId) -> Option<&str> {
+		self.get(network_path, local_id).and_then(|s| s.display_name.as_deref())
+	}
+	fn locked(&self, network_path: &[NodeId], local_id: NodeId) -> bool {
+		self.get(network_path, local_id).is_some_and(|s| s.locked)
+	}
+	fn pinned(&self, network_path: &[NodeId], local_id: NodeId) -> bool {
+		self.get(network_path, local_id).is_some_and(|s| s.pinned)
+	}
+}
+
+/// Round-trips a nested network with editor metadata: layer + absolute position on one node,
+/// node-in-chain on another, layer-in-stack inside a nested network. Asserts every entry comes
+/// back unchanged and addressed by the correct `(network_path, local_id)`.
+#[test]
+fn test_ui_metadata_round_trip() {
+	let network = create_nested_network();
+
+	let mut metadata = TestMetadata::new();
+
+	// Root-network node 0 (the one with a nested network): a layer at an absolute position with
+	// a display name. Editor `network_path` for root-network nodes is empty.
+	metadata.insert(
+		&[],
+		NodeId(0),
+		UiState {
+			position: Some(Position::Absolute([3, 5])),
+			is_layer: true,
+			display_name: Some("Outer layer".into()),
+			locked: true,
+			pinned: false,
+		},
+	);
+
+	// Root-network node 1: a plain node in a chain.
+	metadata.insert(
+		&[],
+		NodeId(1),
+		UiState {
+			position: Some(Position::Chain),
+			..Default::default()
+		},
+	);
+
+	// Nested-network node 10 (lives under node 0): a layer in a stack.
+	metadata.insert(
+		&[NodeId(0)],
+		NodeId(10),
+		UiState {
+			position: Some(Position::Stack(7)),
+			is_layer: true,
+			..Default::default()
+		},
+	);
+
+	let registry = Registry::from_runtime_with_metadata(&network, &metadata).expect("Failed to convert to Registry with metadata");
+
+	let (converted, entries) = registry.to_runtime_with_metadata().expect("Failed to convert Registry back with metadata");
+
+	// Graph structure still round-trips.
+	assert_eq!(converted.nodes.len(), network.nodes.len());
+
+	// Three entries — one per node we attached metadata to.
+	assert_eq!(entries.len(), 3, "expected 3 metadata entries, got {}: {entries:#?}", entries.len());
+
+	// Look entries back up by their address so we don't rely on emission order.
+	let lookup: HashMap<(Vec<NodeId>, NodeId), &crate::NodeMetadataEntry> = entries.iter().map(|e| ((e.network_path.clone(), e.local_id), e)).collect();
+
+	let root_layer = lookup.get(&(vec![], NodeId(0))).expect("entry for root-network layer node missing");
+	assert_eq!(root_layer.position, Some(Position::Absolute([3, 5])));
+	assert!(root_layer.is_layer);
+	assert_eq!(root_layer.display_name.as_deref(), Some("Outer layer"));
+	assert!(root_layer.locked);
+	assert!(!root_layer.pinned);
+
+	let root_node = lookup.get(&(vec![], NodeId(1))).expect("entry for root-network chain node missing");
+	assert_eq!(root_node.position, Some(Position::Chain));
+	assert!(!root_node.is_layer);
+
+	let nested_layer = lookup.get(&(vec![NodeId(0)], NodeId(10))).expect("entry for nested layer-in-stack missing");
+	assert_eq!(nested_layer.position, Some(Position::Stack(7)));
+	assert!(nested_layer.is_layer);
 }

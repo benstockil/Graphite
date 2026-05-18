@@ -6,20 +6,46 @@ use serde::{Deserialize, Serialize};
 // Public modules for conversions
 pub mod delta;
 pub mod from_runtime;
+pub mod metadata_source;
 pub mod to_runtime;
+
+pub use metadata_source::{NoMetadata, NodeMetadataEntry, NodeMetadataSource};
 
 #[cfg(test)]
 mod round_trip_tests;
 
-// Attribute keys for storing DocumentNode metadata in the Registry format
-const ATTR_CALL_ARGUMENT: &str = "call_argument";
-const ATTR_CONTEXT_FEATURES: &str = "context_features";
-const ATTR_IMPORT_TYPE: &str = "import_type";
-const ATTR_VISIBLE: &str = "visible";
-const ATTR_SKIP_DEDUPLICATION: &str = "skip_deduplication";
-const ATTR_REFLECTION_METADATA: &str = "reflection_metadata";
-const ATTR_ORIGINAL_NODE_ID: &str = "original_node_id";
-const ATTR_EXPORTED_NODES_TS: &str = "library::exported_nodes_ts";
+/// Attribute key constants for `Node.attributes`, `Node.inputs_attributes`, and
+/// `Registry.attributes`. Glob-import (`use crate::attr::*`) at conversion sites to avoid
+/// maintaining an explicit name list that grows with every new attribute.
+pub mod attr {
+	// Compute-relevant keys round-tripped from runtime `DocumentNode` fields.
+	pub const CALL_ARGUMENT: &str = "call_argument";
+	pub const CONTEXT_FEATURES: &str = "context_features";
+	pub const IMPORT_TYPE: &str = "import_type";
+	pub const VISIBLE: &str = "visible";
+	pub const SKIP_DEDUPLICATION: &str = "skip_deduplication";
+	pub const REFLECTION_METADATA: &str = "reflection_metadata";
+	pub const ORIGINAL_NODE_ID: &str = "original_node_id";
+	pub const EXPORTED_NODES_TS: &str = "library::exported_nodes_ts";
+
+	// Editor-side metadata keys. Per the CmRDT design, all UI state is key-namespaced under
+	// `ui::*` so each value can be edited under its own LWW timestamp.
+	pub const UI_POSITION: &str = "ui::position";
+	pub const UI_IS_LAYER: &str = "ui::is_layer";
+	pub const UI_DISPLAY_NAME: &str = "ui::display_name";
+	pub const UI_LOCKED: &str = "ui::locked";
+	pub const UI_PINNED: &str = "ui::pinned";
+}
+
+/// Storage-side position for a node. The shape unifies what the runtime splits across
+/// `NodePosition` (Absolute | Chain) and `LayerPosition` (Absolute | Stack); which variants
+/// are valid for a given node is decided by `attr::UI_IS_LAYER`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Position {
+	Absolute([i32; 2]),
+	Chain,
+	Stack(u32),
+}
 
 /// The root network ID by convention. The document's renderable graph lives in `networks[&ROOT_NETWORK]`.
 pub const ROOT_NETWORK: NetworkId = 0;
@@ -375,11 +401,11 @@ impl Document {
 			}
 			RegistryDelta::SetExportedNodes { nodes, timestamp } => {
 				// LWW via a sidecar timestamp stored in the document attributes.
-				let current_ts = self.registry.attributes.get(ATTR_EXPORTED_NODES_TS).map(|v| v.timestamp).unwrap_or(TimeStamp::ORIGIN);
+				let current_ts = self.registry.attributes.get(attr::EXPORTED_NODES_TS).map(|v| v.timestamp).unwrap_or(TimeStamp::ORIGIN);
 				if timestamp > current_ts {
 					self.registry.exported_nodes = nodes;
 					self.registry.attributes.insert(
-						ATTR_EXPORTED_NODES_TS.to_string(),
+						attr::EXPORTED_NODES_TS.to_string(),
 						Value {
 							value: serde_json::Value::Null,
 							timestamp,
@@ -448,7 +474,7 @@ impl Document {
 			},
 			&RegistryDelta::RemoveNetwork { network, ref snapshot } => RegistryDelta::AddNetwork { network, contents: snapshot.clone() },
 			&RegistryDelta::SetExportedNodes { .. } => {
-				let current_ts = self.registry.attributes.get(ATTR_EXPORTED_NODES_TS).map(|v| v.timestamp).unwrap_or(TimeStamp::ORIGIN);
+				let current_ts = self.registry.attributes.get(attr::EXPORTED_NODES_TS).map(|v| v.timestamp).unwrap_or(TimeStamp::ORIGIN);
 				RegistryDelta::SetExportedNodes {
 					nodes: self.registry.exported_nodes.clone(),
 					timestamp: current_ts,
