@@ -23,10 +23,14 @@ impl Editor {
 		let _ = ENVIRONMENT.set(*Editor::environment());
 		graphene_std::uuid::set_uuid_seed(0);
 
-		let (runtime, executor) = crate::node_graph_executor::NodeGraphExecutor::new_with_local_runtime();
+		let (mut runtime, executor) = crate::node_graph_executor::NodeGraphExecutor::new_with_local_runtime();
 		let editor = Self {
 			dispatcher: Dispatcher::with_executor(executor),
 		};
+
+		let mut application_io = PlatformApplicationIo::default();
+		application_io.inject_resources(editor.dispatcher.message_handlers.resource_message_handler.resources());
+		runtime.replace_application_io(application_io);
 
 		(editor, runtime)
 	}

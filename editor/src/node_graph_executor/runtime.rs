@@ -569,11 +569,17 @@ pub async fn replace_node_runtime(runtime: NodeRuntime) -> Option<NodeRuntime> {
 pub(crate) async fn replace_application_io(application_io: PlatformApplicationIo) {
 	let mut node_runtime = NODE_RUNTIME.lock();
 	if let Some(node_runtime) = &mut *node_runtime {
-		node_runtime.editor_api = PlatformEditorApi {
-			font_cache: node_runtime.editor_api.font_cache.clone(),
+		node_runtime.replace_application_io(application_io);
+	}
+}
+
+impl NodeRuntime {
+	pub(crate) fn replace_application_io(&mut self, application_io: PlatformApplicationIo) {
+		self.editor_api = PlatformEditorApi {
+			font_cache: self.editor_api.font_cache.clone(),
 			application_io: Some(application_io.into()),
-			node_graph_message_sender: Box::new(node_runtime.sender.clone()),
-			editor_preferences: Box::new(node_runtime.editor_preferences.clone()),
+			node_graph_message_sender: Box::new(self.sender.clone()),
+			editor_preferences: Box::new(self.editor_preferences.clone()),
 		}
 		.into();
 	}
