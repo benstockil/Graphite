@@ -134,7 +134,11 @@ impl NodeRuntime {
 				editor_preferences: Box::new(EditorPreferences::default()),
 				node_graph_message_sender: Box::new(InternalNodeGraphUpdateSender(sender)),
 
+				#[cfg(not(test))]
 				application_io: None,
+
+				#[cfg(test)]
+				application_io: Some(PlatformApplicationIo::default().into()),
 			}
 			.into(),
 

@@ -14,7 +14,7 @@ impl Resources for ResourcesHandle {
 	}
 }
 
-#[derive(Default, ExtractField)]
+#[derive(ExtractField)]
 pub struct ResourceMessageHandler {
 	storage: Option<Arc<RwLock<Box<dyn ResourceStorage>>>>,
 }
@@ -45,6 +45,20 @@ impl ResourceMessageHandler {
 impl std::fmt::Debug for ResourceMessageHandler {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("ResourceMessageHandler").finish_non_exhaustive()
+	}
+}
+
+impl Default for ResourceMessageHandler {
+	#[cfg(not(test))]
+	fn default() -> Self {
+		Self { storage: None }
+	}
+
+	#[cfg(test)]
+	fn default() -> Self {
+		Self {
+			storage: Some(Arc::new(RwLock::new(Box::new(graph_craft::application_io::HashMapResourceStorage::new())))),
+		}
 	}
 }
 
