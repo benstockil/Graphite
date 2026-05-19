@@ -82,12 +82,7 @@ impl Registry {
 /// `metadata_path` is the chain of runtime local IDs from the root network down to (but not
 /// including) this network's owning node. `metadata_collector`, when present, is populated with
 /// `NodeMetadataEntry` values for every node carrying `ui::*` attributes.
-fn convert_network(
-	registry: &Registry,
-	network_id: NetworkId,
-	metadata_path: &[RuntimeNodeId],
-	metadata_collector: &mut Option<Vec<NodeMetadataEntry>>,
-) -> Result<NodeNetwork, ConversionError> {
+fn convert_network(registry: &Registry, network_id: NetworkId, metadata_path: &[RuntimeNodeId], metadata_collector: &mut Option<Vec<NodeMetadataEntry>>) -> Result<NodeNetwork, ConversionError> {
 	let network = registry.networks.get(&network_id).ok_or(ConversionError::NetworkNotFound(network_id))?;
 
 	// Nodes belonging to this network level only. Nested networks are recursively converted
@@ -176,11 +171,7 @@ fn convert_node(
 		.unwrap_or_else(|| concrete!(())); // Default to unit type if not found
 
 	// Extract context_features from attributes
-	let context_features = node
-		.attributes
-		.get(CONTEXT_FEATURES)
-		.and_then(|v| serde_json::from_value(v.value.clone()).ok())
-		.unwrap_or_default(); // Default to empty context features if not found
+	let context_features = node.attributes.get(CONTEXT_FEATURES).and_then(|v| serde_json::from_value(v.value.clone()).ok()).unwrap_or_default(); // Default to empty context features if not found
 
 	// Extract visible from attributes
 	let visible = node.attributes.get(VISIBLE).and_then(|v| serde_json::from_value(v.value.clone()).ok()).unwrap_or(true); // Default to true if not found

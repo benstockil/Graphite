@@ -1,15 +1,36 @@
 //! Bridge between the editor's `NodeNetworkInterface` and `graph-storage`'s `NodeMetadataSource`
 //! trait, plus an integration round-trip test against a real demo `.graphite` document.
+//!
+//! The `NodeMetadataSource` impl lives on a thin wrapper [`StorageMetadataView`] rather than on
+//! `NodeNetworkInterface` itself. Several trait method names (`position`, `is_layer`,
+//! `display_name`) collide with existing inherent methods on `NodeNetworkInterface`, and Rust
+//! silently resolves bare calls to the inherent ones. The wrapper isolates the trait surface so
+//! callers can't accidentally invoke the wrong method.
+
+use std::collections::HashMap;
 
 use glam::IVec2;
-use graph_craft::document::NodeId;
-use graph_storage::{NodeMetadataSource, Position};
+use graph_craft::document::{DocumentNodeImplementation, NodeId, NodeNetwork};
+use graph_storage::{NodeMetadataEntry, NodeMetadataSource, Position};
 
-use super::{LayerPosition, NodeNetworkInterface, NodePersistentMetadata, NodePosition, NodeTypePersistentMetadata};
+use super::memo_network::MemoNetwork;
+use super::{DocumentNodeTransientMetadata, LayerPosition, NodeNetworkInterface, NodeNetworkMetadata, NodePersistentMetadata, NodePosition, NodeTypePersistentMetadata};
 
-impl NodeMetadataSource for NodeNetworkInterface {
+/// Adapts a `&NodeNetworkInterface` to `graph-storage`'s `NodeMetadataSource`. Construct with
+/// [`StorageMetadataView::new`] and pass to `Registry::from_runtime_with_metadata`.
+pub struct StorageMetadataView<'a> {
+	interface: &'a NodeNetworkInterface,
+}
+
+impl<'a> StorageMetadataView<'a> {
+	pub fn new(interface: &'a NodeNetworkInterface) -> Self {
+		Self { interface }
+	}
+}
+
+impl NodeMetadataSource for StorageMetadataView<'_> {
 	fn position(&self, network_path: &[NodeId], local_id: NodeId) -> Option<Position> {
-		let metadata = self.node_metadata(&local_id, network_path)?;
+		let metadata = self.interface.node_metadata(&local_id, network_path)?;
 		match &metadata.persistent_metadata.node_type_metadata {
 			NodeTypePersistentMetadata::Layer(layer) => match layer.position {
 				LayerPosition::Absolute(v) => Some(Position::Absolute([v.x, v.y])),
@@ -23,22 +44,23 @@ impl NodeMetadataSource for NodeNetworkInterface {
 	}
 
 	fn is_layer(&self, network_path: &[NodeId], local_id: NodeId) -> bool {
-		self.node_metadata(&local_id, network_path)
+		self.interface
+			.node_metadata(&local_id, network_path)
 			.map(|m| matches!(m.persistent_metadata.node_type_metadata, NodeTypePersistentMetadata::Layer(_)))
 			.unwrap_or(false)
 	}
 
 	fn display_name(&self, network_path: &[NodeId], local_id: NodeId) -> Option<&str> {
-		let metadata = self.node_metadata(&local_id, network_path)?;
+		let metadata = self.interface.node_metadata(&local_id, network_path)?;
 		Some(metadata.persistent_metadata.display_name.as_str())
 	}
 
 	fn locked(&self, network_path: &[NodeId], local_id: NodeId) -> bool {
-		self.node_metadata(&local_id, network_path).map(|m| m.persistent_metadata.locked).unwrap_or(false)
+		self.interface.node_metadata(&local_id, network_path).map(|m| m.persistent_metadata.locked).unwrap_or(false)
 	}
 
 	fn pinned(&self, network_path: &[NodeId], local_id: NodeId) -> bool {
-		self.node_metadata(&local_id, network_path).map(|m| m.persistent_metadata.pinned).unwrap_or(false)
+		self.interface.node_metadata(&local_id, network_path).map(|m| m.persistent_metadata.pinned).unwrap_or(false)
 	}
 }
 
@@ -46,7 +68,6 @@ impl NodeMetadataSource for NodeNetworkInterface {
 /// the editor expects. `is_layer` decides which variant to construct; `Chain` collapses to
 /// `IVec2::ZERO` for layers and `Stack(n)` collapses to a node default for non-layers, since those
 /// combinations shouldn't arise from a faithful round-trip.
-#[allow(dead_code)] // Wired in by the round-trip test below; production reverse-mapping lands when the editor consumes Vec<NodeMetadataEntry> directly.
 pub fn position_to_runtime(position: Position, is_layer: bool) -> NodeTypePersistentMetadata {
 	match (position, is_layer) {
 		(Position::Absolute([x, y]), true) => NodeTypePersistentMetadata::layer(IVec2::new(x, y)),
@@ -62,6 +83,80 @@ pub fn position_to_runtime(position: Position, is_layer: bool) -> NodeTypePersis
 		(Position::Chain, _) => {
 			// Chain only makes sense for non-layer nodes.
 			NodeTypePersistentMetadata::Node(NodePersistentMetadata::new(NodePosition::Chain))
+		}
+	}
+}
+
+/// Build a `NodeNetworkInterface` from a storage-converted `NodeNetwork` and a flat list of
+/// `NodeMetadataEntry` values. Seeds a default `DocumentNodeMetadata` for every node in every
+/// nested network, then patches in the per-node fields the entries carried.
+///
+/// Reaches into the private `network` / `network_metadata` fields directly (rather than going
+/// through public setters) because the public setters carry transient-cache invalidation logic
+/// that's irrelevant when constructing a fresh interface from a self-consistent storage snapshot.
+pub fn build_interface_from_storage(network: NodeNetwork, entries: Vec<NodeMetadataEntry>) -> NodeNetworkInterface {
+	let mut network_metadata = NodeNetworkMetadata::default();
+	seed_metadata_tree(&network, &mut network_metadata);
+	apply_entries_into_tree(&mut network_metadata, entries);
+
+	let mut interface = NodeNetworkInterface::default();
+	interface.network = MemoNetwork::new(network);
+	interface.network_metadata = network_metadata;
+	interface
+}
+
+/// Walk `network` recursively and ensure `metadata` has a default `DocumentNodeMetadata` slot for
+/// every node at every nesting level. Mirrors the editor's invariant that
+/// `NodeNetworkPersistentMetadata::node_metadata` contains every document-node key.
+fn seed_metadata_tree(network: &NodeNetwork, metadata: &mut NodeNetworkMetadata) {
+	for (&local_id, node) in &network.nodes {
+		let node_metadata = metadata.persistent_metadata.node_metadata.entry(local_id).or_default();
+
+		if let DocumentNodeImplementation::Network(nested) = &node.implementation {
+			let child = node_metadata.persistent_metadata.network_metadata.get_or_insert_with(NodeNetworkMetadata::default);
+			seed_metadata_tree(nested, child);
+		}
+	}
+}
+
+/// Patches each entry onto the metadata tree previously seeded by [`seed_metadata_tree`]. Entries
+/// whose `(network_path, local_id)` doesn't resolve (e.g., stale data) are silently skipped — the
+/// caller is responsible for ensuring entries match the network.
+fn apply_entries_into_tree(metadata: &mut NodeNetworkMetadata, entries: Vec<NodeMetadataEntry>) {
+	// Group entries by network_path so we do one nested_metadata_mut lookup per network.
+	let mut by_path: HashMap<Vec<NodeId>, Vec<NodeMetadataEntry>> = HashMap::new();
+	for entry in entries {
+		by_path.entry(entry.network_path.clone()).or_default().push(entry);
+	}
+
+	for (path, entries) in by_path {
+		let Some(network_metadata) = metadata.nested_metadata_mut(&path) else {
+			log::warn!("apply_entries_into_tree: nested network at {path:?} not found, skipping {} entries", entries.len());
+			continue;
+		};
+
+		for entry in entries {
+			let Some(document_node_metadata) = network_metadata.persistent_metadata.node_metadata.get_mut(&entry.local_id) else {
+				log::warn!("apply_entries_into_tree: node {:?} not seeded under network {path:?}, skipping", entry.local_id);
+				continue;
+			};
+
+			let persistent = &mut document_node_metadata.persistent_metadata;
+
+			if let Some(position) = entry.position {
+				persistent.node_type_metadata = position_to_runtime(position, entry.is_layer);
+			} else if entry.is_layer {
+				// Layer flag without a position: keep the default IVec2::ZERO that `Default` set up.
+				persistent.node_type_metadata = NodeTypePersistentMetadata::layer(IVec2::ZERO);
+			}
+
+			if let Some(name) = entry.display_name {
+				persistent.display_name = name;
+			}
+			persistent.locked = entry.locked;
+			persistent.pinned = entry.pinned;
+
+			document_node_metadata.transient_metadata = DocumentNodeTransientMetadata::default();
 		}
 	}
 }
@@ -111,10 +206,11 @@ mod tests {
 	fn editor_metadata_round_trip_against_demo() {
 		let document = load_demo("changing-seasons.graphite");
 		let interface = &document.network_interface;
+		let source = StorageMetadataView::new(interface);
 
 		let network = interface.document_network().clone();
 
-		let registry = Registry::from_runtime_with_metadata(&network, interface).expect("from_runtime_with_metadata failed");
+		let registry = Registry::from_runtime_with_metadata(&network, &source).expect("from_runtime_with_metadata failed");
 
 		let (_converted_network, entries) = registry.to_runtime_with_metadata().expect("to_runtime_with_metadata failed");
 
@@ -123,11 +219,6 @@ mod tests {
 
 		let mut checked_any_position = false;
 		let mut checked_any_layer = false;
-
-		// `NodeNetworkInterface` already exposes several methods (`is_layer`, `display_name`, ...)
-		// whose names collide with the trait. Rust resolves bare calls to the inherent ones, so we
-		// go through `&dyn NodeMetadataSource` to invoke the trait impl unambiguously.
-		let source: &dyn NodeMetadataSource = interface;
 
 		for (network_path, local_id) in collect_all_node_paths(interface) {
 			let expected_position = source.position(&network_path, local_id);
@@ -155,7 +246,10 @@ mod tests {
 			// The trait round-trip drops empty display names (treats them as "unset") so the entry's
 			// `display_name` is `None` when the runtime carries `""`. Normalize before comparing.
 			let normalized_expected_display = expected_display.as_deref().filter(|s| !s.is_empty()).map(str::to_owned);
-			assert_eq!(entry.display_name, normalized_expected_display, "display_name mismatch for node {local_id:?} in network {network_path:?}");
+			assert_eq!(
+				entry.display_name, normalized_expected_display,
+				"display_name mismatch for node {local_id:?} in network {network_path:?}"
+			);
 			assert_eq!(entry.locked, expected_locked, "locked mismatch for node {local_id:?} in network {network_path:?}");
 			assert_eq!(entry.pinned, expected_pinned, "pinned mismatch for node {local_id:?} in network {network_path:?}");
 
@@ -171,5 +265,64 @@ mod tests {
 		// just iterating empty metadata and proving nothing.
 		assert!(checked_any_position, "demo artwork produced no positioned nodes — fixture is wrong or extraction is broken");
 		assert!(checked_any_layer, "demo artwork produced no layer nodes — fixture is wrong or extraction is broken");
+	}
+
+	/// Full editor-side round-trip: original interface → Registry → (NodeNetwork, Vec<entry>) →
+	/// freshly-built interface. Asserts the rebuilt interface presents the same `ui::*` state as
+	/// the original when read through `StorageMetadataView`.
+	#[test]
+	fn editor_interface_rebuild_round_trip() {
+		let document = load_demo("changing-seasons.graphite");
+		let original = &document.network_interface;
+		let original_view = StorageMetadataView::new(original);
+
+		let network = original.document_network().clone();
+		let registry = Registry::from_runtime_with_metadata(&network, &original_view).expect("from_runtime_with_metadata failed");
+		let (rebuilt_network, entries) = registry.to_runtime_with_metadata().expect("to_runtime_with_metadata failed");
+
+		let rebuilt = build_interface_from_storage(rebuilt_network, entries);
+		let rebuilt_view = StorageMetadataView::new(&rebuilt);
+
+		// Every node the original carried must also resolve identically through the rebuilt view.
+		// Iterating over the *rebuilt* interface verifies that the rebuild covered every node, not
+		// just the ones the entries vec mentioned.
+		for (network_path, local_id) in collect_all_node_paths(&rebuilt) {
+			assert_eq!(
+				rebuilt_view.position(&network_path, local_id),
+				original_view.position(&network_path, local_id),
+				"position mismatch for node {local_id:?} in network {network_path:?}"
+			);
+			assert_eq!(
+				rebuilt_view.is_layer(&network_path, local_id),
+				original_view.is_layer(&network_path, local_id),
+				"is_layer mismatch for node {local_id:?} in network {network_path:?}"
+			);
+			// Original display names are returned by the source as-is (including `""`). After
+			// round-trip the rebuilt interface also stores `""` for nodes that had no name set,
+			// so this comparison is exact.
+			assert_eq!(
+				rebuilt_view.display_name(&network_path, local_id),
+				original_view.display_name(&network_path, local_id),
+				"display_name mismatch for node {local_id:?} in network {network_path:?}"
+			);
+			assert_eq!(
+				rebuilt_view.locked(&network_path, local_id),
+				original_view.locked(&network_path, local_id),
+				"locked mismatch for node {local_id:?} in network {network_path:?}"
+			);
+			assert_eq!(
+				rebuilt_view.pinned(&network_path, local_id),
+				original_view.pinned(&network_path, local_id),
+				"pinned mismatch for node {local_id:?} in network {network_path:?}"
+			);
+		}
+
+		// Symmetric: every node in the original must also exist in the rebuilt interface.
+		for (network_path, local_id) in collect_all_node_paths(original) {
+			assert!(
+				rebuilt.nested_network(&network_path).and_then(|n| n.nodes.get(&local_id)).is_some(),
+				"original node {local_id:?} in network {network_path:?} missing after rebuild"
+			);
+		}
 	}
 }
