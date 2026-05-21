@@ -1,9 +1,8 @@
-#![allow(unused)]
+#![expect(unused, reason = "WIP: the Document API surface is still being wired in")]
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
-// Public modules for conversions
 pub mod delta;
 pub mod from_runtime;
 pub mod metadata_source;
@@ -14,11 +13,11 @@ pub use metadata_source::{InputMetadataEntry, NetworkMetadataEntry, NoMetadata, 
 #[cfg(test)]
 mod round_trip_tests;
 
-/// Attribute key constants for `Node.attributes`, `Node.inputs_attributes`, and
-/// `Registry.attributes`. Glob-import (`use crate::attr::*`) at conversion sites to avoid
-/// maintaining an explicit name list that grows with every new attribute.
+/// Attribute keys. Glob-import (`use crate::attr::*`) at conversion sites.
+///
+/// `ui::*` keys are namespaced per CRDT design so each value gets its own LWW timestamp. Per-input
+/// keys live on `Node.inputs_attributes[i]`; per-network keys live on `Network.attributes`.
 pub mod attr {
-	// Compute-relevant keys round-tripped from runtime `DocumentNode` fields.
 	pub const CALL_ARGUMENT: &str = "call_argument";
 	pub const CONTEXT_FEATURES: &str = "context_features";
 	pub const IMPORT_TYPE: &str = "import_type";
@@ -28,41 +27,30 @@ pub mod attr {
 	pub const ORIGINAL_NODE_ID: &str = "original_node_id";
 	pub const EXPORTED_NODES_TS: &str = "library::exported_nodes_ts";
 
-	// Editor-side metadata keys. Per the CmRDT design, all UI state is key-namespaced under
-	// `ui::*` so each value can be edited under its own LWW timestamp.
 	pub const UI_POSITION: &str = "ui::position";
 	pub const UI_IS_LAYER: &str = "ui::is_layer";
 	pub const UI_DISPLAY_NAME: &str = "ui::display_name";
 	pub const UI_LOCKED: &str = "ui::locked";
 	pub const UI_PINNED: &str = "ui::pinned";
 
-	// Per-input editor metadata. Stored in `Node.inputs_attributes[i]` (not `Node.attributes`),
-	// so each input slot's metadata gets its own LWW timestamps independent of sibling slots.
 	pub const UI_INPUT_NAME: &str = "ui::input_name";
 	pub const UI_INPUT_DESCRIPTION: &str = "ui::input_description";
 	pub const UI_WIDGET_OVERRIDE: &str = "ui::widget_override";
-	/// Prefix for entries in `InputPersistentMetadata::input_data`. The full attribute key is
-	/// `ui::input_data::<sub_key>` so each sub-entry edits independently under its own timestamp.
-	/// Round-trip scans an input's attributes for this prefix and reassembles the `input_data` map.
+	/// Prefix for `InputPersistentMetadata::input_data` entries. Full key: `ui::input_data::<sub_key>`.
 	pub const UI_INPUT_DATA_PREFIX: &str = "ui::input_data::";
 
-	// Additional per-node editor metadata (stored on `Node.attributes`).
 	pub const UI_OUTPUT_NAMES: &str = "ui::output_names";
-	/// Reference to the `DocumentNodeDefinition` this network-node was instantiated from. Lives on
-	/// the *owning* node (the one with `Implementation::Network`), not on the nested network itself.
+	/// Lives on the *owning* node (the one with `Implementation::Network`), not on the nested network.
 	pub const UI_REFERENCE: &str = "ui::reference";
 
-	// Per-network editor metadata. Stored on `Network.attributes`. Each navigation sub-field gets
-	// its own key so concurrent pan/zoom/transform edits each have their own LWW timestamp.
 	pub const UI_NAV_PTZ: &str = "ui::nav::ptz";
 	pub const UI_NAV_TRANSFORM: &str = "ui::nav::transform";
 	pub const UI_NAV_WIDTH: &str = "ui::nav::width";
 	pub const UI_PREVIEWING: &str = "ui::previewing";
 }
 
-/// Storage-side position for a node. The shape unifies what the runtime splits across
-/// `NodePosition` (Absolute | Chain) and `LayerPosition` (Absolute | Stack); which variants
-/// are valid for a given node is decided by `attr::UI_IS_LAYER`.
+/// Unified storage-side position. The valid variants depend on `attr::UI_IS_LAYER`:
+/// layers use `Absolute` or `Stack`; non-layer nodes use `Absolute` or `Chain`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Position {
 	Absolute([i32; 2]),
@@ -70,7 +58,7 @@ pub enum Position {
 	Stack(u32),
 }
 
-/// The root network ID by convention. The document's renderable graph lives in `networks[&ROOT_NETWORK]`.
+/// Root network ID. The renderable graph lives in `networks[&ROOT_NETWORK]`.
 pub const ROOT_NETWORK: NetworkId = 0;
 
 #[derive(Clone, Debug, Default)]
@@ -78,11 +66,9 @@ pub struct Registry {
 	node_declarations: HashMap<DeclarationId, ProtoNode>,
 	pub node_instances: HashMap<NodeId, Node>,
 	pub networks: HashMap<NetworkId, Network>,
-	/// Public library API surface: nodes an importing document can reference.
-	/// A node exposed here may itself be a proto node or a network (via `Implementation::Network`).
-	/// Display name, category, docs etc. live as `library::*` attributes on the referenced node.
+	/// Public library API: nodes an importing document can reference.
+	/// `library::*` attributes on each referenced node carry its display name, category, docs.
 	pub exported_nodes: Vec<NodeId>,
-	/// Document-level attributes (format version, title, library exported-nodes timestamp, ...).
 	pub attributes: Attributes,
 }
 #[derive(Clone, Debug)]
@@ -93,19 +79,18 @@ struct Document {
 	clock: LamportClock,
 }
 
-pub type DeclarationId = u64; // content based hash
+pub type DeclarationId = u64; // Content-based hash
 pub type NodeId = u64;
 pub type NetworkId = u64;
 type ProtoNodeId = String;
-type Rev = u64; // Use merkle tree hash?
+// TODO: Use a merkle tree hash
+type Rev = u64;
 
-/// Identifies one editor session for the purposes of CRDT timestamp tiebreaking.
-/// Two peers can mint colliding Lamport counters; the peer ID disambiguates.
+/// One editor session, used as a CRDT tiebreaker when two peers mint colliding Lamport counters.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
 pub struct PeerId(pub u64);
 
-/// Lamport-style logical timestamp with a peer-ID tiebreak. Comparison is lexicographic:
-/// higher counter wins; equal counters are decided by peer ID.
+/// Lamport timestamp with a peer-ID tiebreak. Higher counter wins; ties broken by peer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
 pub struct TimeStamp {
 	pub counter: u64,
@@ -113,13 +98,10 @@ pub struct TimeStamp {
 }
 
 impl TimeStamp {
-	/// Pre-edit origin timestamp. Used for the initial `from_runtime` conversion of a legacy
-	/// document where no edits have happened yet.
+	/// Pre-edit origin. Used by initial `from_runtime` conversion before any edits have happened.
 	pub const ORIGIN: Self = TimeStamp { counter: 0, peer: PeerId(0) };
 }
 
-/// A Lamport clock owned by a `Document`. `tick()` mints a fresh local timestamp; `observe()`
-/// advances the counter past an incoming op's timestamp so future local ticks are causally later.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct LamportClock {
 	counter: u64,
@@ -131,6 +113,7 @@ impl LamportClock {
 		Self { counter: 0, peer }
 	}
 
+	/// Mints a fresh local timestamp.
 	pub fn tick(&mut self) -> TimeStamp {
 		self.counter += 1;
 		TimeStamp {
@@ -139,6 +122,7 @@ impl LamportClock {
 		}
 	}
 
+	/// Advances past an incoming op so future local ticks are causally later.
 	pub fn observe(&mut self, incoming: TimeStamp) {
 		self.counter = self.counter.max(incoming.counter);
 	}
@@ -159,17 +143,15 @@ impl Value {
 
 pub type Attributes = HashMap<String, Value>;
 
-/// Extension methods for writing into an `Attributes` bucket. Reduces the noise of constructing
-/// `Value { value, timestamp }` and calling `.to_string()` on string-slice keys at every callsite.
+/// Write helpers for `Attributes`.
 pub trait AttributesExt {
-	/// Inserts a JSON value under the given key.
+	/// Inserts a JSON value under `key`.
 	fn set(&mut self, key: &str, value: serde_json::Value, timestamp: TimeStamp);
 
-	/// Serializes `value` and inserts the result. Returns the serialization error if any.
+	/// Serializes `value` and inserts it under `key`.
 	fn set_serialized<T: serde::Serialize>(&mut self, key: &str, value: &T, timestamp: TimeStamp) -> Result<(), serde_json::Error>;
 
-	/// Serializes `value` and inserts only if it differs from `default`. Lets writers express the
-	/// "skip the runtime default" rule once instead of guarding every insert with an `if`.
+	/// Inserts only when `value != default`, so the read side falls back to the same default.
 	fn set_if_not_default<T: serde::Serialize + PartialEq>(&mut self, key: &str, value: &T, default: &T, timestamp: TimeStamp) -> Result<(), serde_json::Error>;
 }
 
@@ -179,8 +161,7 @@ impl AttributesExt for Attributes {
 	}
 
 	fn set_serialized<T: serde::Serialize>(&mut self, key: &str, value: &T, timestamp: TimeStamp) -> Result<(), serde_json::Error> {
-		let value = serde_json::to_value(value)?;
-		self.set(key, value, timestamp);
+		self.set(key, serde_json::to_value(value)?, timestamp);
 		Ok(())
 	}
 
@@ -192,14 +173,12 @@ impl AttributesExt for Attributes {
 	}
 }
 
-/// Extension methods for reading typed values out of an `Attributes` bucket. Collapses the
-/// `.get(KEY).and_then(|v| serde_json::from_value(v.value.clone()).ok()).unwrap_or(...)` dance.
+/// Typed read helpers for `Attributes`.
 pub trait AttributesRead {
-	/// Deserializes the attribute under `key`, or returns `None` if the key is missing or the
-	/// stored JSON doesn't decode to `T`.
+	/// Deserializes the value under `key`, or `None` if missing or undecodable.
 	fn get_typed<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T>;
 
-	/// Same as `get_typed`, falling back to a caller-supplied default for missing or undecodable values.
+	/// Same as `get_typed`, falling back to `default`.
 	fn get_or<T: serde::de::DeserializeOwned>(&self, key: &str, default: T) -> T {
 		self.get_typed(key).unwrap_or(default)
 	}
@@ -225,16 +204,12 @@ pub struct Node {
 	network: NetworkId,
 }
 
-/// A positional input on a `Node`. The timestamp drives LWW on concurrent `ChangeNodeInput` ops
-/// targeting the same `(node_id, input_idx)`. Mirrors `ExportSlot`.
+/// One positional input. The timestamp drives LWW on concurrent `ChangeNodeInput` ops targeting
+/// the same `(node_id, input_idx)`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InputSlot {
 	pub input: NodeInput,
 	pub timestamp: TimeStamp,
-}
-
-struct NodeAttributes {
-	name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -251,7 +226,7 @@ pub enum NodeInput {
 	Import {
 		import_idx: usize,
 	},
-	/// Marker for Reflection input. The actual DocumentNodeMetadata is stored in input_attributes.
+	/// Marker; the `DocumentNodeMetadata` lives in `inputs_attributes`.
 	Reflection,
 }
 
@@ -264,14 +239,13 @@ pub enum Implementation {
 #[derive(Clone, Debug, Default)]
 pub struct Network {
 	pub exports: Vec<ExportSlot>,
-	/// Per-network metadata bucket. Today holds editor-only `ui::*` keys (navigation/PTZ state,
-	/// previewing); intentionally separate from `Node.attributes` so each network gets its own
-	/// LWW timestamps for view-state edits.
+	/// Per-network `ui::*` state (navigation, previewing). Separate from `Node.attributes` so
+	/// view-state edits LWW independently.
 	pub attributes: Attributes,
 }
 
-/// A positional export slot. `target == None` means the slot has been removed (or never existed past this length).
-/// The timestamp drives LWW on concurrent `SetExport` ops targeting the same slot.
+/// One positional export slot. `target == None` marks an empty/removed slot. Timestamp drives LWW
+/// on concurrent `SetExport` ops.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExportSlot {
 	pub target: Option<NodeInput>,
@@ -319,33 +293,27 @@ pub enum RegistryDelta {
 		input_idx: usize,
 		delta: AttributeDelta,
 	},
-	/// Set or clear a single export slot on a network. LWW per slot by `timestamp`.
-	/// `target == None` removes the slot.
+	/// LWW per slot. `target == None` removes the slot.
 	SetExport {
 		network: NetworkId,
 		slot: u32,
 		target: Option<NodeInput>,
 		timestamp: TimeStamp,
 	},
-	/// Insert a network. Parallels `AddNode`; used as the reverse of `RemoveNetwork` and emitted
-	/// by the diff path when a new network appears.
 	AddNetwork {
 		network: NetworkId,
 		contents: Network,
 	},
-	/// Tombstone-free network removal. `snapshot` captures the network's exports at the moment of
-	/// deletion so the reverse delta can reconstruct without re-walking history.
+	/// `snapshot` lets the reverse delta rebuild without re-walking history.
 	RemoveNetwork {
 		network: NetworkId,
 		snapshot: Network,
 	},
-	/// Whole-list LWW on the document's public library API surface.
-	/// The timestamp is tracked in the document attributes under `library::exported_nodes_ts`.
+	/// Whole-list LWW; timestamp lives under `attr::EXPORTED_NODES_TS` on the document.
 	SetExportedNodes {
 		nodes: Vec<NodeId>,
 		timestamp: TimeStamp,
 	},
-	/// Edit a document-level attribute (format version, title, ...).
 	ChangeDocumentAttribute {
 		delta: AttributeDelta,
 	},
@@ -359,45 +327,40 @@ pub enum AttributeDelta {
 
 impl AttributeDelta {
 	fn key(&self) -> &str {
-		match self {
-			AttributeDelta::Set { key, .. } => key,
-			AttributeDelta::Remove { key, .. } => key,
-		}
+		let (AttributeDelta::Set { key, .. } | AttributeDelta::Remove { key, .. }) = self;
+		key
 	}
 
 	fn timestamp(&self) -> TimeStamp {
-		match self {
-			AttributeDelta::Set { timestamp, .. } => *timestamp,
-			AttributeDelta::Remove { timestamp, .. } => *timestamp,
-		}
+		let (AttributeDelta::Set { timestamp, .. } | AttributeDelta::Remove { timestamp, .. }) = self;
+		*timestamp
 	}
 }
 
 impl Document {
 	pub fn restore_node_from_history(&mut self, old_node_id: NodeId) -> Result<(), CrdtError> {
-		for delta in self.history_iter() {
-			if let RegistryDelta::AddNode { node_id, .. } = delta.reverse
-				&& old_node_id == node_id
-			{
-				return self.revert_delta(delta.clone());
-			}
-		}
-		Err(CrdtError::NotFoundInHistory)
+		let delta = self
+			.history_iter()
+			.find(|d| matches!(d.reverse, RegistryDelta::AddNode { node_id, .. } if node_id == old_node_id))
+			.ok_or(CrdtError::NotFoundInHistory)?
+			.clone();
+		self.revert_delta(delta)
 	}
+
 	pub fn restore_network_from_history(&mut self, network_id: NetworkId) -> Result<(), CrdtError> {
-		for delta in self.history_iter() {
-			let reverse_targets_network = match &delta.reverse {
-				RegistryDelta::SetExport { network, .. } => *network == network_id,
-				RegistryDelta::AddNetwork { network, .. } => *network == network_id,
-				RegistryDelta::RemoveNetwork { network, .. } => *network == network_id,
-				_ => false,
-			};
-			if reverse_targets_network {
-				return self.revert_delta(delta.clone());
-			}
-		}
-		Err(CrdtError::NotFoundInHistory)
+		let delta = self
+			.history_iter()
+			.find(|d| {
+				matches!(&d.reverse,
+					RegistryDelta::SetExport { network, .. }
+					| RegistryDelta::AddNetwork { network, .. }
+					| RegistryDelta::RemoveNetwork { network, .. } if *network == network_id)
+			})
+			.ok_or(CrdtError::NotFoundInHistory)?
+			.clone();
+		self.revert_delta(delta)
 	}
+
 	pub fn revert_delta(&mut self, mut delta: Delta) -> Result<(), CrdtError> {
 		std::mem::swap(&mut delta.delta_type, &mut delta.reverse);
 		self.apply_delta(delta)
@@ -424,7 +387,7 @@ impl Document {
 				new_input,
 				timestamp,
 			} => {
-				// If the new input references another node, ad-hoc resurrect it if absent.
+				// Ad-hoc resurrect a referenced node if it was removed concurrently.
 				if let NodeInput::Node { node_id: referenced, .. } = &new_input {
 					self.ensure_node_exists(*referenced)?;
 				}
@@ -432,7 +395,6 @@ impl Document {
 
 				let node = self.registry.node_instances.get_mut(&node_id).ok_or(CrdtError::TargetNodeDoesNotExist)?;
 				let slot = node.inputs.get_mut(input_idx).ok_or(CrdtError::InputIndexOutOfBounds)?;
-				// LWW: only apply if this op is newer than the slot's current timestamp.
 				if timestamp > slot.timestamp {
 					slot.input = new_input;
 					slot.timestamp = timestamp;
@@ -440,7 +402,6 @@ impl Document {
 			}
 			RegistryDelta::ChangeNodeAttribute { node_id, delta } => {
 				self.ensure_node_exists(node_id)?;
-
 				let node = self.registry.node_instances.get_mut(&node_id).ok_or(CrdtError::TargetNodeDoesNotExist)?;
 				apply_attribute_delta(delta, &mut node.attributes);
 			}
@@ -454,7 +415,6 @@ impl Document {
 				let net = self.registry.networks.get_mut(&network).ok_or(CrdtError::NetworkDoesNotExist)?;
 				let slot_idx = slot as usize;
 
-				// Extend with empty slots if needed.
 				if slot_idx >= net.exports.len() {
 					net.exports.resize(
 						slot_idx + 1,
@@ -466,7 +426,6 @@ impl Document {
 				}
 
 				let existing = &mut net.exports[slot_idx];
-				// LWW: only apply if this op is newer than what's already there.
 				if timestamp > existing.timestamp {
 					existing.target = target;
 					existing.timestamp = timestamp;
@@ -479,12 +438,9 @@ impl Document {
 				self.registry.networks.insert(network, contents);
 			}
 			RegistryDelta::RemoveNetwork { network, .. } => {
-				// Physical removal. The snapshot lives on the delta itself so the reverse can rebuild
-				// without re-walking history; we don't need it on the forward path.
 				self.registry.networks.remove(&network);
 			}
 			RegistryDelta::SetExportedNodes { nodes, timestamp } => {
-				// LWW via a sidecar timestamp stored in the document attributes.
 				let current_ts = self.registry.attributes.get(attr::EXPORTED_NODES_TS).map(|v| v.timestamp).unwrap_or(TimeStamp::ORIGIN);
 				if timestamp > current_ts {
 					self.registry.exported_nodes = nodes;
@@ -512,7 +468,7 @@ impl Document {
 	}
 
 	fn compute_reverse_delta(&self, delta: &RegistryDelta) -> Result<RegistryDelta, CrdtError> {
-		let reverse_delta = match delta {
+		Ok(match delta {
 			&RegistryDelta::AddNode { node_id, .. } => RegistryDelta::RemoveNode { node_id },
 			&RegistryDelta::RemoveNode { node_id } => {
 				let node = self.registry.node_instances.get(&node_id).ok_or(CrdtError::TargetNodeDoesNotExist)?.clone();
@@ -521,7 +477,6 @@ impl Document {
 			&RegistryDelta::ChangeNodeInput { node_id, input_idx, .. } => {
 				let node = self.registry.node_instances.get(&node_id).ok_or(CrdtError::TargetNodeDoesNotExist)?;
 				let slot = node.inputs.get(input_idx).ok_or(CrdtError::InputIndexOutOfBounds)?;
-
 				RegistryDelta::ChangeNodeInput {
 					node_id,
 					input_idx,
@@ -531,7 +486,6 @@ impl Document {
 			}
 			&RegistryDelta::ChangeNodeAttribute { node_id, ref delta } => {
 				let node = self.registry.node_instances.get(&node_id).ok_or(CrdtError::TargetNodeDoesNotExist)?;
-
 				RegistryDelta::ChangeNodeAttribute {
 					node_id,
 					delta: reverse_attribute_delta(delta, &node.attributes),
@@ -542,14 +496,13 @@ impl Document {
 				let input_attributes = node.inputs_attributes.get(input_idx).ok_or(CrdtError::InputIndexOutOfBounds)?;
 				RegistryDelta::ChangeNodeInputAttribute {
 					node_id,
-					delta: reverse_attribute_delta(delta, input_attributes),
 					input_idx,
+					delta: reverse_attribute_delta(delta, input_attributes),
 				}
 			}
 			&RegistryDelta::SetExport { network, slot, .. } => {
 				let net = self.registry.networks.get(&network).ok_or(CrdtError::NetworkDoesNotExist)?;
 				let (target, timestamp) = net.exports.get(slot as usize).map(|s| (s.target.clone(), s.timestamp)).unwrap_or((None, TimeStamp::ORIGIN));
-
 				RegistryDelta::SetExport { network, slot, target, timestamp }
 			}
 			RegistryDelta::AddNetwork { network, contents } => RegistryDelta::RemoveNetwork {
@@ -557,7 +510,7 @@ impl Document {
 				snapshot: contents.clone(),
 			},
 			&RegistryDelta::RemoveNetwork { network, ref snapshot } => RegistryDelta::AddNetwork { network, contents: snapshot.clone() },
-			&RegistryDelta::SetExportedNodes { .. } => {
+			RegistryDelta::SetExportedNodes { .. } => {
 				let current_ts = self.registry.attributes.get(attr::EXPORTED_NODES_TS).map(|v| v.timestamp).unwrap_or(TimeStamp::ORIGIN);
 				RegistryDelta::SetExportedNodes {
 					nodes: self.registry.exported_nodes.clone(),
@@ -567,8 +520,7 @@ impl Document {
 			RegistryDelta::ChangeDocumentAttribute { delta } => RegistryDelta::ChangeDocumentAttribute {
 				delta: reverse_attribute_delta(delta, &self.registry.attributes),
 			},
-		};
-		Ok(reverse_delta)
+		})
 	}
 
 	fn history_iter(&self) -> HistoryIter<'_> {
@@ -578,13 +530,8 @@ impl Document {
 		}
 	}
 
-	fn find_delta(&mut self, check_fn: impl Fn(&Delta) -> bool) -> Result<&Delta, CrdtError> {
-		for delta in self.history_iter() {
-			if check_fn(delta) {
-				return Ok(delta);
-			}
-		}
-		Err(CrdtError::NotFoundInHistory)
+	fn find_delta(&self, check_fn: impl Fn(&Delta) -> bool) -> Result<&Delta, CrdtError> {
+		self.history_iter().find(|d| check_fn(d)).ok_or(CrdtError::NotFoundInHistory)
 	}
 }
 

@@ -1,11 +1,11 @@
-//! Bridge between the editor's `NodeNetworkInterface` and `graph-storage`'s `NodeMetadataSource`
-//! trait, plus an integration round-trip test against a real demo `.graphite` document.
+//! Bridge between `NodeNetworkInterface` and `graph-storage`'s `NodeMetadataSource` trait, plus
+//! an integration round-trip test against a demo `.graphite` document.
 //!
-//! The `NodeMetadataSource` impl lives on a thin wrapper [`StorageMetadataView`] rather than on
-//! `NodeNetworkInterface` itself. Several trait method names (`position`, `is_layer`,
-//! `display_name`) collide with existing inherent methods on `NodeNetworkInterface`, and Rust
-//! silently resolves bare calls to the inherent ones. The wrapper isolates the trait surface so
-//! callers can't accidentally invoke the wrong method.
+//! The trait impl lives on the [`StorageMetadataView`] wrapper (not on `NodeNetworkInterface`
+//! directly) because several trait method names collide with inherent methods, and Rust silently
+//! resolves bare calls to the inherent ones.
+
+#![expect(dead_code, reason = "WIP: storage round-trip not yet wired into the editor's save/load path")]
 
 use std::collections::HashMap;
 
@@ -15,21 +15,18 @@ use graph_storage::{InputMetadataEntry, NetworkMetadataEntry, NodeMetadataEntry,
 
 use super::memo_network::MemoNetwork;
 use super::{
-	DocumentNodeTransientMetadata, InputMetadata, InputPersistentMetadata, LayerPosition, NodeNetworkInterface, NodeNetworkMetadata, NodePersistentMetadata, NodePosition, NodeTypePersistentMetadata,
-	PTZ, Previewing,
+	DocumentNodePersistentMetadata, DocumentNodeTransientMetadata, InputMetadata, InputPersistentMetadata, LayerPosition, NodeNetworkInterface, NodeNetworkMetadata, NodePersistentMetadata,
+	NodePosition, NodeTypePersistentMetadata, PTZ, Previewing,
 };
 
-/// Failure modes for [`build_interface_from_storage`]. Only fires when the storage-side entry list
-/// is inconsistent with the converted `NodeNetwork` — e.g. a node's `input_metadata` vec doesn't
-/// match its `inputs` vec in length.
+/// Fired when the storage entry list disagrees with the converted `NodeNetwork`.
 #[derive(Debug, thiserror::Error)]
 pub enum InterfaceRebuildError {
 	#[error("input_metadata length {got} does not match inputs length {expected} for node {node:?} in network {network_path:?}")]
 	InputMetadataLengthMismatch { node: NodeId, network_path: Vec<NodeId>, expected: usize, got: usize },
 }
 
-/// Adapts a `&NodeNetworkInterface` to `graph-storage`'s `NodeMetadataSource`. Construct with
-/// [`StorageMetadataView::new`] and pass to `Registry::from_runtime_with_metadata`.
+/// Adapts a `&NodeNetworkInterface` to `graph-storage`'s `NodeMetadataSource`.
 pub struct StorageMetadataView<'a> {
 	interface: &'a NodeNetworkInterface,
 }
@@ -40,10 +37,19 @@ impl<'a> StorageMetadataView<'a> {
 	}
 }
 
+impl StorageMetadataView<'_> {
+	fn persistent(&self, network_path: &[NodeId], local_id: NodeId) -> Option<&DocumentNodePersistentMetadata> {
+		Some(&self.interface.node_metadata(&local_id, network_path)?.persistent_metadata)
+	}
+
+	fn input_persistent(&self, network_path: &[NodeId], local_id: NodeId, input_index: usize) -> Option<&InputPersistentMetadata> {
+		Some(&self.persistent(network_path, local_id)?.input_metadata.get(input_index)?.persistent_metadata)
+	}
+}
+
 impl NodeMetadataSource for StorageMetadataView<'_> {
 	fn position(&self, network_path: &[NodeId], local_id: NodeId) -> Option<Position> {
-		let metadata = self.interface.node_metadata(&local_id, network_path)?;
-		match &metadata.persistent_metadata.node_type_metadata {
+		match &self.persistent(network_path, local_id)?.node_type_metadata {
 			NodeTypePersistentMetadata::Layer(layer) => match layer.position {
 				LayerPosition::Absolute(v) => Some(Position::Absolute([v.x, v.y])),
 				LayerPosition::Stack(offset) => Some(Position::Stack(offset)),
@@ -56,55 +62,40 @@ impl NodeMetadataSource for StorageMetadataView<'_> {
 	}
 
 	fn is_layer(&self, network_path: &[NodeId], local_id: NodeId) -> bool {
-		self.interface
-			.node_metadata(&local_id, network_path)
-			.map(|m| matches!(m.persistent_metadata.node_type_metadata, NodeTypePersistentMetadata::Layer(_)))
-			.unwrap_or(false)
+		self.persistent(network_path, local_id)
+			.is_some_and(|p| matches!(p.node_type_metadata, NodeTypePersistentMetadata::Layer(_)))
 	}
 
 	fn display_name(&self, network_path: &[NodeId], local_id: NodeId) -> Option<&str> {
-		let metadata = self.interface.node_metadata(&local_id, network_path)?;
-		Some(metadata.persistent_metadata.display_name.as_str())
+		Some(self.persistent(network_path, local_id)?.display_name.as_str())
 	}
 
 	fn locked(&self, network_path: &[NodeId], local_id: NodeId) -> bool {
-		self.interface.node_metadata(&local_id, network_path).map(|m| m.persistent_metadata.locked).unwrap_or(false)
+		self.persistent(network_path, local_id).is_some_and(|p| p.locked)
 	}
 
 	fn pinned(&self, network_path: &[NodeId], local_id: NodeId) -> bool {
-		self.interface.node_metadata(&local_id, network_path).map(|m| m.persistent_metadata.pinned).unwrap_or(false)
+		self.persistent(network_path, local_id).is_some_and(|p| p.pinned)
 	}
 
 	fn input_name(&self, network_path: &[NodeId], local_id: NodeId, input_index: usize) -> Option<&str> {
-		let input = self.interface.node_metadata(&local_id, network_path)?.persistent_metadata.input_metadata.get(input_index)?;
-		Some(input.persistent_metadata.input_name.as_str())
+		Some(self.input_persistent(network_path, local_id, input_index)?.input_name.as_str())
 	}
 
 	fn input_description(&self, network_path: &[NodeId], local_id: NodeId, input_index: usize) -> Option<&str> {
-		let input = self.interface.node_metadata(&local_id, network_path)?.persistent_metadata.input_metadata.get(input_index)?;
-		Some(input.persistent_metadata.input_description.as_str())
+		Some(self.input_persistent(network_path, local_id, input_index)?.input_description.as_str())
 	}
 
 	fn widget_override(&self, network_path: &[NodeId], local_id: NodeId, input_index: usize) -> Option<&str> {
-		let input = self.interface.node_metadata(&local_id, network_path)?.persistent_metadata.input_metadata.get(input_index)?;
-		input.persistent_metadata.widget_override.as_deref()
+		self.input_persistent(network_path, local_id, input_index)?.widget_override.as_deref()
 	}
 
 	fn input_data(&self, network_path: &[NodeId], local_id: NodeId, input_index: usize) -> HashMap<String, serde_json::Value> {
-		let Some(metadata) = self.interface.node_metadata(&local_id, network_path) else {
-			return HashMap::new();
-		};
-		let Some(input) = metadata.persistent_metadata.input_metadata.get(input_index) else {
-			return HashMap::new();
-		};
-		input.persistent_metadata.input_data.clone()
+		self.input_persistent(network_path, local_id, input_index).map(|p| p.input_data.clone()).unwrap_or_default()
 	}
 
 	fn output_names(&self, network_path: &[NodeId], local_id: NodeId) -> Vec<String> {
-		self.interface
-			.node_metadata(&local_id, network_path)
-			.map(|metadata| metadata.persistent_metadata.output_names.clone())
-			.unwrap_or_default()
+		self.persistent(network_path, local_id).map(|p| p.output_names.clone()).unwrap_or_default()
 	}
 
 	fn navigation_ptz(&self, network_path: &[NodeId]) -> Option<serde_json::Value> {
@@ -125,8 +116,8 @@ impl NodeMetadataSource for StorageMetadataView<'_> {
 
 	fn previewing(&self, network_path: &[NodeId]) -> Option<serde_json::Value> {
 		let previewing = self.interface.previewing(network_path);
-		// Skip the runtime default so legacy documents don't grow a `ui::previewing: No` attribute
-		// on every network. Pattern-match rather than equality so we don't need PartialEq on RootNode.
+		// Skip the runtime default so converted networks don't gain a `ui::previewing: No` attribute.
+		// Pattern-match rather than equality so we don't need PartialEq on RootNode.
 		if matches!(previewing, super::Previewing::No) {
 			return None;
 		}
@@ -139,40 +130,27 @@ impl NodeMetadataSource for StorageMetadataView<'_> {
 	}
 }
 
-/// Maps a storage-side `Position` back to the runtime's `(NodeTypePersistentMetadata, IVec2)` shape
-/// the editor expects. `is_layer` decides which variant to construct; `Chain` collapses to
-/// `IVec2::ZERO` for layers and `Stack(n)` collapses to a node default for non-layers, since those
-/// combinations shouldn't arise from a faithful round-trip.
+/// Inverse of the position extraction in `NodeMetadataSource::position`.
+/// `(Stack, !is_layer)` and `(Chain, is_layer)` shouldn't arise from a faithful round-trip; they fall back to a default of the matching variant.
 pub fn position_to_runtime(position: Position, is_layer: bool) -> NodeTypePersistentMetadata {
 	match (position, is_layer) {
 		(Position::Absolute([x, y]), true) => NodeTypePersistentMetadata::layer(IVec2::new(x, y)),
 		(Position::Absolute([x, y]), false) => NodeTypePersistentMetadata::node(IVec2::new(x, y)),
 		(Position::Stack(offset), _) => {
-			// Stack only makes sense for layers.
 			let mut metadata = NodeTypePersistentMetadata::layer(IVec2::ZERO);
 			if let NodeTypePersistentMetadata::Layer(layer) = &mut metadata {
 				layer.position = LayerPosition::Stack(offset);
 			}
 			metadata
 		}
-		(Position::Chain, _) => {
-			// Chain only makes sense for non-layer nodes.
-			NodeTypePersistentMetadata::Node(NodePersistentMetadata::new(NodePosition::Chain))
-		}
+		(Position::Chain, _) => NodeTypePersistentMetadata::Node(NodePersistentMetadata::new(NodePosition::Chain)),
 	}
 }
 
-/// Build a `NodeNetworkInterface` from a storage-converted `NodeNetwork` plus the per-node and
-/// per-network metadata vecs emitted by `Registry::to_runtime_with_full_metadata`. Seeds a default
-/// `DocumentNodeMetadata` for every node in every nested network, then patches in the per-node
-/// and per-network fields the entries carried.
+/// Builds a `NodeNetworkInterface` from a `NodeNetwork` plus the metadata vecs `Registry::to_runtime_with_full_metadata` emits.
 ///
-/// Reaches into the private `network` / `network_metadata` fields directly (rather than going
-/// through public setters) because the public setters carry transient-cache invalidation logic
-/// that's irrelevant when constructing a fresh interface from a self-consistent storage snapshot.
-///
-/// Errors when a node entry's `input_metadata` length disagrees with the converted node's `inputs`
-/// length — a sign of corrupt storage rather than a recoverable condition.
+/// Sets private fields directly (rather than via public setters) because we're constructing a fresh self-consistent snapshot;
+/// the setters' transient-cache invalidation isn't needed.
 pub fn build_interface_from_storage(network: NodeNetwork, node_entries: Vec<NodeMetadataEntry>, network_entries: Vec<NetworkMetadataEntry>) -> Result<NodeNetworkInterface, InterfaceRebuildError> {
 	let mut network_metadata = NodeNetworkMetadata::default();
 	seed_metadata_tree(&network, &mut network_metadata);
@@ -185,9 +163,7 @@ pub fn build_interface_from_storage(network: NodeNetwork, node_entries: Vec<Node
 	Ok(interface)
 }
 
-/// Patches per-network `ui::*` state (navigation, previewing, reference) onto the metadata tree.
-/// Entries whose `network_path` doesn't resolve are skipped with a warning — the per-node phase
-/// is the strict one; per-network drift is more often a stale path than a corrupt document.
+/// Entries whose `network_path` doesn't resolve are skipped with a warning (per-network drift is more often a stale path than corruption).
 fn apply_network_entries_into_tree(metadata: &mut NodeNetworkMetadata, entries: Vec<NetworkMetadataEntry>) {
 	for entry in entries {
 		let Some(network_metadata) = metadata.nested_metadata_mut(&entry.network_path) else {
@@ -225,9 +201,8 @@ fn apply_network_entries_into_tree(metadata: &mut NodeNetworkMetadata, entries: 
 	}
 }
 
-/// Walk `network` recursively and ensure `metadata` has a default `DocumentNodeMetadata` slot for
-/// every node at every nesting level. Mirrors the editor's invariant that
-/// `NodeNetworkPersistentMetadata::node_metadata` contains every document-node key.
+/// Walks `network` recursively, ensuring `metadata` has a default `DocumentNodeMetadata` slot for every node at every nesting level.
+/// Mirrors the editor invariant that `NodeNetworkPersistentMetadata::node_metadata` contains every document-node key.
 fn seed_metadata_tree(network: &NodeNetwork, metadata: &mut NodeNetworkMetadata) {
 	for (&local_id, node) in &network.nodes {
 		let node_metadata = metadata.persistent_metadata.node_metadata.entry(local_id).or_default();
@@ -239,11 +214,8 @@ fn seed_metadata_tree(network: &NodeNetwork, metadata: &mut NodeNetworkMetadata)
 	}
 }
 
-/// Patches each entry onto the metadata tree previously seeded by [`seed_metadata_tree`]. Entries
-/// whose `(network_path, local_id)` doesn't resolve (e.g., stale data) are silently skipped — the
-/// caller is responsible for ensuring entries match the network. Length mismatches on
-/// `input_metadata` are *not* skipped — they surface as `InterfaceRebuildError`, since they
-/// indicate corrupt storage rather than recoverable drift.
+/// Patches entries onto the metadata tree previously seeded by [`seed_metadata_tree`].
+/// Entries with stale `(network_path, local_id)` are skipped with a warning; `input_metadata` length mismatches escalate to `InterfaceRebuildError`.
 fn apply_entries_into_tree(network: &NodeNetwork, metadata: &mut NodeNetworkMetadata, entries: Vec<NodeMetadataEntry>) -> Result<(), InterfaceRebuildError> {
 	// Group entries by network_path so we do one nested_metadata_mut lookup per network.
 	let mut by_path: HashMap<Vec<NodeId>, Vec<NodeMetadataEntry>> = HashMap::new();
@@ -270,7 +242,6 @@ fn apply_entries_into_tree(network: &NodeNetwork, metadata: &mut NodeNetworkMeta
 			if let Some(position) = entry.position {
 				persistent.node_type_metadata = position_to_runtime(position, entry.is_layer);
 			} else if entry.is_layer {
-				// Layer flag without a position: keep the default IVec2::ZERO that `Default` set up.
 				persistent.node_type_metadata = NodeTypePersistentMetadata::layer(IVec2::ZERO);
 			}
 
@@ -280,9 +251,7 @@ fn apply_entries_into_tree(network: &NodeNetwork, metadata: &mut NodeNetworkMeta
 			persistent.locked = entry.locked;
 			persistent.pinned = entry.pinned;
 
-			// Strict length check: the converted network is the source of truth for input count;
-			// the storage entry must agree slot-by-slot. A mismatch means the storage layer and the
-			// converted runtime drifted, which is a bug worth surfacing.
+			// The converted runtime is the source of truth for input count; drift indicates a bug worth surfacing.
 			let expected_inputs = nested_network.and_then(|net| net.nodes.get(&entry.local_id)).map(|doc_node| doc_node.inputs.len());
 			if let Some(expected) = expected_inputs
 				&& expected != entry.input_metadata.len()
@@ -308,9 +277,7 @@ fn apply_entries_into_tree(network: &NodeNetwork, metadata: &mut NodeNetworkMeta
 	Ok(())
 }
 
-/// Resolves the nested `NodeNetwork` at the given path. Returns `None` when the path is invalid
-/// (e.g. references a non-network node) — callers treat that as "skip silently" since the
-/// surrounding `nested_metadata_mut` lookup already warns and bails.
+/// `None` when the path is invalid; callers treat that as "skip silently" since the surrounding `nested_metadata_mut` already warns.
 fn nested_network_at<'a>(root: &'a NodeNetwork, path: &[NodeId]) -> Option<&'a NodeNetwork> {
 	let mut current = root;
 	for segment in path {
@@ -321,9 +288,7 @@ fn nested_network_at<'a>(root: &'a NodeNetwork, path: &[NodeId]) -> Option<&'a N
 	Some(current)
 }
 
-/// Maps one storage-side `InputMetadataEntry` back to the runtime's `InputMetadata`. Empty strings
-/// are the runtime's "no value set" sentinel for `input_name` / `input_description`, so a `None`
-/// on the storage side restores as `""`.
+/// Storage-side `None` restores as `""` (the runtime's "unset" sentinel for `input_name` / `input_description`).
 fn input_metadata_entry_to_runtime(entry: InputMetadataEntry) -> InputMetadata {
 	InputMetadata {
 		persistent_metadata: InputPersistentMetadata {

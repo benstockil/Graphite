@@ -2,41 +2,40 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{AttributeDelta, ExportSlot, NetworkId, Node, NodeId, NodeInput, Registry, RegistryDelta, TimeStamp};
 
-/// Computes the minimal set of deltas to transform `from` into `to`
+/// Minimal set of deltas to transform `from` into `to`.
+///
+/// Carries forward the `to` side's existing timestamps; callers needing fresh clock ticks must
+/// mint timestamps themselves. Removals stamp `TimeStamp::ORIGIN`.
 pub fn compute_deltas(from: &Registry, to: &Registry) -> Vec<RegistryDelta> {
 	let mut deltas = Vec::new();
 
-	// Find all node IDs in both registries
 	let from_node_ids: HashSet<NodeId> = from.node_instances.keys().copied().collect();
 	let to_node_ids: HashSet<NodeId> = to.node_instances.keys().copied().collect();
 
-	// 1. Find removed nodes
 	for &node_id in from_node_ids.difference(&to_node_ids) {
 		deltas.push(RegistryDelta::RemoveNode { node_id });
 	}
 
-	// 2. Find added nodes
 	for &node_id in to_node_ids.difference(&from_node_ids) {
-		let node = to.node_instances[&node_id].clone();
-		deltas.push(RegistryDelta::AddNode { node_id, node });
+		deltas.push(RegistryDelta::AddNode {
+			node_id,
+			node: to.node_instances[&node_id].clone(),
+		});
 	}
 
-	// 3. Find modified nodes (nodes that exist in both)
 	for &node_id in from_node_ids.intersection(&to_node_ids) {
 		let from_node = &from.node_instances[&node_id];
 		let to_node = &to.node_instances[&node_id];
 
-		// If implementation changed, we need to remove and re-add the node
-		// (since we don't have a ChangeImplementation delta variant)
-		if !nodes_have_same_implementation(from_node, to_node) {
+		// No `ChangeImplementation` op; the only path is remove + re-add. Same for input-count changes.
+		let structural_change = !nodes_have_same_implementation(from_node, to_node) || from_node.inputs.len() != to_node.inputs.len();
+		if structural_change {
 			deltas.push(RegistryDelta::RemoveNode { node_id });
 			deltas.push(RegistryDelta::AddNode { node_id, node: to_node.clone() });
 			continue;
 		}
 
-		// Check for input changes. The diff path carries forward the slot's existing timestamp;
-		// callers that need a fresh clock-tick must mint timestamps themselves.
-		for (input_idx, (from_slot, to_slot)) in from_node.inputs.iter().zip(to_node.inputs.iter()).enumerate() {
+		for (input_idx, (from_slot, to_slot)) in from_node.inputs.iter().zip(&to_node.inputs).enumerate() {
 			if from_slot != to_slot {
 				deltas.push(RegistryDelta::ChangeNodeInput {
 					node_id,
@@ -47,47 +46,34 @@ pub fn compute_deltas(from: &Registry, to: &Registry) -> Vec<RegistryDelta> {
 			}
 		}
 
-		// Handle input count changes
-		if from_node.inputs.len() != to_node.inputs.len() {
-			// If input count changed, we need to remove and re-add the node
-			deltas.push(RegistryDelta::RemoveNode { node_id });
-			deltas.push(RegistryDelta::AddNode { node_id, node: to_node.clone() });
-			continue;
-		}
-
-		// Check for attribute changes
-		let attribute_deltas = compute_attribute_deltas(&from_node.attributes, &to_node.attributes);
-		for delta in attribute_deltas {
+		for delta in compute_attribute_deltas(&from_node.attributes, &to_node.attributes) {
 			deltas.push(RegistryDelta::ChangeNodeAttribute { node_id, delta });
 		}
 
-		// Check for input attribute changes
-		for (input_idx, (from_attrs, to_attrs)) in from_node.inputs_attributes.iter().zip(to_node.inputs_attributes.iter()).enumerate() {
-			let input_attr_deltas = compute_attribute_deltas(from_attrs, to_attrs);
-			for delta in input_attr_deltas {
+		for (input_idx, (from_attrs, to_attrs)) in from_node.inputs_attributes.iter().zip(&to_node.inputs_attributes).enumerate() {
+			for delta in compute_attribute_deltas(from_attrs, to_attrs) {
 				deltas.push(RegistryDelta::ChangeNodeInputAttribute { node_id, input_idx, delta });
 			}
 		}
 	}
 
-	// 4. Handle network changes.
 	let from_network_ids: HashSet<NetworkId> = from.networks.keys().copied().collect();
 	let to_network_ids: HashSet<NetworkId> = to.networks.keys().copied().collect();
 
-	// Disappeared networks: snapshot the `from` state so the reverse can rebuild.
 	for &network_id in from_network_ids.difference(&to_network_ids) {
-		let snapshot = from.networks[&network_id].clone();
-		deltas.push(RegistryDelta::RemoveNetwork { network: network_id, snapshot });
+		deltas.push(RegistryDelta::RemoveNetwork {
+			network: network_id,
+			snapshot: from.networks[&network_id].clone(),
+		});
 	}
 
-	// New networks: emit `AddNetwork` carrying the full contents. Per-slot diffs only run for
-	// networks present in both sides; new ones are added wholesale.
 	for &network_id in to_network_ids.difference(&from_network_ids) {
-		let contents = to.networks[&network_id].clone();
-		deltas.push(RegistryDelta::AddNetwork { network: network_id, contents });
+		deltas.push(RegistryDelta::AddNetwork {
+			network: network_id,
+			contents: to.networks[&network_id].clone(),
+		});
 	}
 
-	// Per-slot diff for networks present in both.
 	for &network_id in from_network_ids.intersection(&to_network_ids) {
 		let from_network = &from.networks[&network_id];
 		let to_network = &to.networks[&network_id];
@@ -112,39 +98,31 @@ pub fn compute_deltas(from: &Registry, to: &Registry) -> Vec<RegistryDelta> {
 	deltas
 }
 
-/// Check if two nodes have the same implementation
 fn nodes_have_same_implementation(a: &Node, b: &Node) -> bool {
+	use crate::Implementation::*;
 	match (&a.implementation, &b.implementation) {
-		(crate::Implementation::ProtoNode(a_id), crate::Implementation::ProtoNode(b_id)) => a_id == b_id,
-		(crate::Implementation::Network(a_id), crate::Implementation::Network(b_id)) => a_id == b_id,
+		(ProtoNode(a_id), ProtoNode(b_id)) => a_id == b_id,
+		(Network(a_id), Network(b_id)) => a_id == b_id,
 		_ => false,
 	}
 }
 
-/// Compute attribute deltas between two attribute maps.
-///
-/// The diff carries forward the timestamps already present on the `to` side. Removals are
-/// stamped with `TimeStamp::ORIGIN` since the diff path has no clock; callers that need
-/// causally-ordered removes must mint the timestamp themselves.
 fn compute_attribute_deltas(from: &crate::Attributes, to: &crate::Attributes) -> Vec<AttributeDelta> {
 	let mut deltas = Vec::new();
 
-	let from_keys: HashSet<&String> = from.keys().collect();
-	let to_keys: HashSet<&String> = to.keys().collect();
-
-	for key in from_keys.difference(&to_keys) {
-		deltas.push(AttributeDelta::Remove {
-			key: (*key).clone(),
-			timestamp: TimeStamp::ORIGIN,
-		});
+	for key in from.keys() {
+		if !to.contains_key(key) {
+			deltas.push(AttributeDelta::Remove {
+				key: key.clone(),
+				timestamp: TimeStamp::ORIGIN,
+			});
+		}
 	}
 
-	for key in &to_keys {
-		let to_value = &to[*key];
-		let changed = from.get(*key).is_none_or(|from_value| from_value != to_value);
-		if changed {
+	for (key, to_value) in to {
+		if from.get(key).is_none_or(|from_value| from_value != to_value) {
 			deltas.push(AttributeDelta::Set {
-				key: (*key).clone(),
+				key: key.clone(),
 				value: to_value.value.clone(),
 				timestamp: to_value.timestamp,
 			});
