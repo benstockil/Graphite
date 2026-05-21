@@ -9,7 +9,7 @@ pub mod from_runtime;
 pub mod metadata_source;
 pub mod to_runtime;
 
-pub use metadata_source::{NoMetadata, NodeMetadataEntry, NodeMetadataSource};
+pub use metadata_source::{InputMetadataEntry, NetworkMetadataEntry, NoMetadata, NodeMetadataEntry, NodeMetadataSource};
 
 #[cfg(test)]
 mod round_trip_tests;
@@ -35,6 +35,29 @@ pub mod attr {
 	pub const UI_DISPLAY_NAME: &str = "ui::display_name";
 	pub const UI_LOCKED: &str = "ui::locked";
 	pub const UI_PINNED: &str = "ui::pinned";
+
+	// Per-input editor metadata. Stored in `Node.inputs_attributes[i]` (not `Node.attributes`),
+	// so each input slot's metadata gets its own LWW timestamps independent of sibling slots.
+	pub const UI_INPUT_NAME: &str = "ui::input_name";
+	pub const UI_INPUT_DESCRIPTION: &str = "ui::input_description";
+	pub const UI_WIDGET_OVERRIDE: &str = "ui::widget_override";
+	/// Prefix for entries in `InputPersistentMetadata::input_data`. The full attribute key is
+	/// `ui::input_data::<sub_key>` so each sub-entry edits independently under its own timestamp.
+	/// Round-trip scans an input's attributes for this prefix and reassembles the `input_data` map.
+	pub const UI_INPUT_DATA_PREFIX: &str = "ui::input_data::";
+
+	// Additional per-node editor metadata (stored on `Node.attributes`).
+	pub const UI_OUTPUT_NAMES: &str = "ui::output_names";
+	/// Reference to the `DocumentNodeDefinition` this network-node was instantiated from. Lives on
+	/// the *owning* node (the one with `Implementation::Network`), not on the nested network itself.
+	pub const UI_REFERENCE: &str = "ui::reference";
+
+	// Per-network editor metadata. Stored on `Network.attributes`. Each navigation sub-field gets
+	// its own key so concurrent pan/zoom/transform edits each have their own LWW timestamp.
+	pub const UI_NAV_PTZ: &str = "ui::nav::ptz";
+	pub const UI_NAV_TRANSFORM: &str = "ui::nav::transform";
+	pub const UI_NAV_WIDTH: &str = "ui::nav::width";
+	pub const UI_PREVIEWING: &str = "ui::previewing";
 }
 
 /// Storage-side position for a node. The shape unifies what the runtime splits across
@@ -136,6 +159,63 @@ impl Value {
 
 pub type Attributes = HashMap<String, Value>;
 
+/// Extension methods for writing into an `Attributes` bucket. Reduces the noise of constructing
+/// `Value { value, timestamp }` and calling `.to_string()` on string-slice keys at every callsite.
+pub trait AttributesExt {
+	/// Inserts a JSON value under the given key.
+	fn set(&mut self, key: &str, value: serde_json::Value, timestamp: TimeStamp);
+
+	/// Serializes `value` and inserts the result. Returns the serialization error if any.
+	fn set_serialized<T: serde::Serialize>(&mut self, key: &str, value: &T, timestamp: TimeStamp) -> Result<(), serde_json::Error>;
+
+	/// Serializes `value` and inserts only if it differs from `default`. Lets writers express the
+	/// "skip the runtime default" rule once instead of guarding every insert with an `if`.
+	fn set_if_not_default<T: serde::Serialize + PartialEq>(&mut self, key: &str, value: &T, default: &T, timestamp: TimeStamp) -> Result<(), serde_json::Error>;
+}
+
+impl AttributesExt for Attributes {
+	fn set(&mut self, key: &str, value: serde_json::Value, timestamp: TimeStamp) {
+		self.insert(key.to_string(), Value { value, timestamp });
+	}
+
+	fn set_serialized<T: serde::Serialize>(&mut self, key: &str, value: &T, timestamp: TimeStamp) -> Result<(), serde_json::Error> {
+		let value = serde_json::to_value(value)?;
+		self.set(key, value, timestamp);
+		Ok(())
+	}
+
+	fn set_if_not_default<T: serde::Serialize + PartialEq>(&mut self, key: &str, value: &T, default: &T, timestamp: TimeStamp) -> Result<(), serde_json::Error> {
+		if value != default {
+			self.set_serialized(key, value, timestamp)?;
+		}
+		Ok(())
+	}
+}
+
+/// Extension methods for reading typed values out of an `Attributes` bucket. Collapses the
+/// `.get(KEY).and_then(|v| serde_json::from_value(v.value.clone()).ok()).unwrap_or(...)` dance.
+pub trait AttributesRead {
+	/// Deserializes the attribute under `key`, or returns `None` if the key is missing or the
+	/// stored JSON doesn't decode to `T`.
+	fn get_typed<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T>;
+
+	/// Same as `get_typed`, falling back to a caller-supplied default for missing or undecodable values.
+	fn get_or<T: serde::de::DeserializeOwned>(&self, key: &str, default: T) -> T {
+		self.get_typed(key).unwrap_or(default)
+	}
+
+	/// Same as `get_typed`, falling back to `T::default()`.
+	fn get_or_default<T: serde::de::DeserializeOwned + Default>(&self, key: &str) -> T {
+		self.get_typed(key).unwrap_or_default()
+	}
+}
+
+impl AttributesRead for Attributes {
+	fn get_typed<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
+		self.get(key).and_then(|v| serde_json::from_value(v.value.clone()).ok())
+	}
+}
+
 #[derive(Clone, Debug)]
 pub struct Node {
 	implementation: Implementation,
@@ -181,9 +261,13 @@ pub enum Implementation {
 	Network(NetworkId),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Network {
 	pub exports: Vec<ExportSlot>,
+	/// Per-network metadata bucket. Today holds editor-only `ui::*` keys (navigation/PTZ state,
+	/// previewing); intentionally separate from `Node.attributes` so each network gets its own
+	/// LWW timestamps for view-state edits.
+	pub attributes: Attributes,
 }
 
 /// A positional export slot. `target == None` means the slot has been removed (or never existed past this length).

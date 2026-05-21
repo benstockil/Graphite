@@ -256,6 +256,7 @@ mod tests {
 			0,
 			Network {
 				exports: vec![make_slot(1), make_slot(2)],
+				..Default::default()
 			},
 		);
 

@@ -9,8 +9,8 @@ use graph_craft::{ProtoNodeIdentifier, Type, concrete};
 use rustc_hash::FxHashMap;
 
 use crate::attr::*;
-use crate::metadata_source::NodeMetadataEntry;
-use crate::{DeclarationId, Implementation, NetworkId, NodeId, NodeInput, Position, ROOT_NETWORK, Registry};
+use crate::metadata_source::{InputMetadataEntry, NetworkMetadataEntry, NodeMetadataEntry};
+use crate::{AttributesRead, DeclarationId, Implementation, NetworkId, NodeId, NodeInput, Position, ROOT_NETWORK, Registry};
 
 /// Errors that can occur during conversion from Registry to NodeNetwork
 #[derive(Debug, thiserror::Error)]
@@ -25,41 +25,34 @@ pub enum ConversionError {
 	DeserializationError(String),
 }
 
-/// Converts a Registry to a NodeNetwork.
-///
-/// ## Identity Node Pattern
-///
-/// The Registry uses dummy identity nodes for network exports to reuse CRDT logic.
-/// `Network.exports: Vec<NodeId>` contains IDs of identity nodes (not the actual nodes to export).
-/// These identity nodes have a single input pointing to the actual node to export.
-///
-/// During conversion:
-/// 1. Identity nodes are resolved by following their first input
-/// 2. Identity nodes are excluded from the converted network's nodes map
-/// 3. The resolved inputs become the network's exports
-///
-/// ## Nested Structure Preservation
-///
-/// The conversion maintains full nesting:
-/// - Each `NodeNetwork.nodes` contains only the nodes at that specific network level
-/// - Nested networks are recursively converted and embedded in `DocumentNodeImplementation::Network`
-/// - Registry uses indirection (NetworkId references), NodeNetwork uses direct embedding
+/// Graph-only conversion (no editor metadata). Use [`Registry::to_runtime_with_metadata`] or
+/// [`Registry::to_runtime_with_full_metadata`] when round-tripping editor state.
 impl TryFrom<&Registry> for NodeNetwork {
 	type Error = ConversionError;
 
 	fn try_from(registry: &Registry) -> Result<Self, Self::Error> {
-		convert_network(registry, ROOT_NETWORK, &[], &mut None)
+		convert_network(registry, ROOT_NETWORK, &[], &mut None, &mut None)
 	}
 }
 
 impl Registry {
-	/// Convert a `Registry` to a `NodeNetwork` and a flat list of editor-side `ui::*` metadata
-	/// entries (one per node that carried any `ui::*` attribute). The editor reassembles its
-	/// `NodeNetworkMetadata` from the returned vec.
+	/// Convert a `Registry` to a `NodeNetwork` plus two flat metadata vecs (per-node and per-network).
+	/// Per-node entries cover every node carrying any `ui::*` attribute; per-network entries cover
+	/// every network whose attributes carry navigation/previewing state. The editor reassembles its
+	/// `NodeNetworkMetadata` from both.
 	pub fn to_runtime_with_metadata(&self) -> Result<(NodeNetwork, Vec<NodeMetadataEntry>), ConversionError> {
-		let mut metadata = Some(Vec::new());
-		let network = convert_network(self, ROOT_NETWORK, &[], &mut metadata)?;
-		Ok((network, metadata.expect("collector seeded above")))
+		let (network, node_entries, _) = self.to_runtime_with_full_metadata()?;
+		Ok((network, node_entries))
+	}
+
+	/// Same as `to_runtime_with_metadata` but also returns the per-network metadata vec. Used by the
+	/// editor's rebuild path; tests and callers that only care about node metadata can use the
+	/// short form above.
+	pub fn to_runtime_with_full_metadata(&self) -> Result<(NodeNetwork, Vec<NodeMetadataEntry>, Vec<NetworkMetadataEntry>), ConversionError> {
+		let mut node_metadata = Some(Vec::new());
+		let mut network_metadata = Some(Vec::new());
+		let network = convert_network(self, ROOT_NETWORK, &[], &mut node_metadata, &mut network_metadata)?;
+		Ok((network, node_metadata.expect("node collector seeded above"), network_metadata.expect("network collector seeded above")))
 	}
 }
 
@@ -79,11 +72,28 @@ impl Registry {
 /// during conversion. The slot index stability that matters for CRDT convergence is a storage
 /// concern only.
 ///
-/// `metadata_path` is the chain of runtime local IDs from the root network down to (but not
-/// including) this network's owning node. `metadata_collector`, when present, is populated with
-/// `NodeMetadataEntry` values for every node carrying `ui::*` attributes.
-fn convert_network(registry: &Registry, network_id: NetworkId, metadata_path: &[RuntimeNodeId], metadata_collector: &mut Option<Vec<NodeMetadataEntry>>) -> Result<NodeNetwork, ConversionError> {
+/// `metadata_path` for `convert_network` is the chain of runtime local IDs naming *this* network
+/// (the owning-node chain from root, with this network's owning node as the last entry — empty for
+/// the root network). `node_collector` and `network_collector`, when present, are populated with
+/// `NodeMetadataEntry` / `NetworkMetadataEntry` values for every node / network carrying any
+/// `ui::*` attribute.
+fn convert_network(
+	registry: &Registry,
+	network_id: NetworkId,
+	metadata_path: &[RuntimeNodeId],
+	node_collector: &mut Option<Vec<NodeMetadataEntry>>,
+	network_collector: &mut Option<Vec<NetworkMetadataEntry>>,
+) -> Result<NodeNetwork, ConversionError> {
 	let network = registry.networks.get(&network_id).ok_or(ConversionError::NetworkNotFound(network_id))?;
+
+	// Per-network metadata. Emitted only when the network actually carries any `ui::*` attribute,
+	// so legacy documents (no per-network state set) don't get a swarm of empty entries.
+	if let Some(collector) = network_collector.as_mut() {
+		let entry = extract_network_metadata(&network.attributes, metadata_path);
+		if !entry.is_empty() {
+			collector.push(entry);
+		}
+	}
 
 	// Nodes belonging to this network level only. Nested networks are recursively converted
 	// when their owning node is materialized via `Implementation::Network`.
@@ -95,13 +105,13 @@ fn convert_network(registry: &Registry, network_id: NetworkId, metadata_path: &[
 			let local_id = node.attributes.get(ORIGINAL_NODE_ID).and_then(|v| v.value.as_u64()).unwrap_or(global_id);
 			let runtime_id = RuntimeNodeId(local_id);
 
-			if let Some(collector) = metadata_collector.as_mut()
+			if let Some(collector) = node_collector.as_mut()
 				&& let Some(entry) = extract_ui_metadata(node, metadata_path, runtime_id)
 			{
 				collector.push(entry);
 			}
 
-			convert_node(registry, node, metadata_path, runtime_id, metadata_collector).map(|doc_node| (runtime_id, doc_node))
+			convert_node(registry, node, metadata_path, runtime_id, node_collector, network_collector).map(|doc_node| (runtime_id, doc_node))
 		})
 		.collect::<Result<FxHashMap<_, _>, _>>()?;
 
@@ -128,15 +138,21 @@ fn convert_network(registry: &Registry, network_id: NetworkId, metadata_path: &[
 /// Pulls a node's `ui::*` attribute values into a `NodeMetadataEntry`. Returns `None` when the
 /// node carries no editor metadata at all (so the editor doesn't end up with empty entries for
 /// every node in legacy documents).
+///
+/// `input_metadata` is always sized to match `node.inputs.len()` so the editor side can do a
+/// strict slot-by-slot rebuild without sparse-index bookkeeping. Empty slots round-trip as
+/// `InputMetadataEntry::default()`.
 fn extract_ui_metadata(node: &crate::Node, network_path: &[RuntimeNodeId], local_id: RuntimeNodeId) -> Option<NodeMetadataEntry> {
-	let position = node.attributes.get(UI_POSITION).and_then(|v| serde_json::from_value::<Position>(v.value.clone()).ok());
-	let is_layer = node.attributes.get(UI_IS_LAYER).and_then(|v| v.value.as_bool()).unwrap_or(false);
-	let display_name = node.attributes.get(UI_DISPLAY_NAME).and_then(|v| v.value.as_str()).map(str::to_owned);
-	let locked = node.attributes.get(UI_LOCKED).and_then(|v| v.value.as_bool()).unwrap_or(false);
-	let pinned = node.attributes.get(UI_PINNED).and_then(|v| v.value.as_bool()).unwrap_or(false);
+	let position: Option<Position> = node.attributes.get_typed(UI_POSITION);
+	let is_layer = node.attributes.get_or(UI_IS_LAYER, false);
+	let display_name: Option<String> = node.attributes.get_typed(UI_DISPLAY_NAME);
+	let locked = node.attributes.get_or(UI_LOCKED, false);
+	let pinned = node.attributes.get_or(UI_PINNED, false);
+	let output_names: Vec<String> = node.attributes.get_or_default(UI_OUTPUT_NAMES);
 
-	let any_set = position.is_some() || is_layer || display_name.is_some() || locked || pinned;
-	any_set.then(|| NodeMetadataEntry {
+	let input_metadata: Vec<InputMetadataEntry> = node.inputs_attributes.iter().map(extract_input_metadata).collect();
+
+	let entry = NodeMetadataEntry {
 		network_path: network_path.to_vec(),
 		local_id,
 		position,
@@ -144,7 +160,41 @@ fn extract_ui_metadata(node: &crate::Node, network_path: &[RuntimeNodeId], local
 		display_name,
 		locked,
 		pinned,
-	})
+		input_metadata,
+		output_names,
+	};
+	(!entry.is_empty()).then_some(entry)
+}
+
+/// Reads a network's `ui::*` attributes back into a `NetworkMetadataEntry`. The four sub-fields are
+/// kept as raw `serde_json::Value` (or `f64` for width) so storage stays free of the editor's
+/// `PTZ` / `DAffine2` / `Previewing` types.
+fn extract_network_metadata(attributes: &crate::Attributes, network_path: &[RuntimeNodeId]) -> NetworkMetadataEntry {
+	NetworkMetadataEntry {
+		network_path: network_path.to_vec(),
+		navigation_ptz: attributes.get(UI_NAV_PTZ).map(|v| v.value.clone()),
+		navigation_transform: attributes.get(UI_NAV_TRANSFORM).map(|v| v.value.clone()),
+		navigation_width: attributes.get_typed(UI_NAV_WIDTH),
+		previewing: attributes.get(UI_PREVIEWING).map(|v| v.value.clone()),
+		reference: attributes.get_typed(UI_REFERENCE),
+	}
+}
+
+/// Reads one input slot's `ui::*` attributes back into the editor-facing `InputMetadataEntry`.
+/// The `input_data` map is reassembled by scanning every attribute key under the
+/// `ui::input_data::` prefix; the stripped remainder becomes the runtime sub-key.
+fn extract_input_metadata(attributes: &crate::Attributes) -> InputMetadataEntry {
+	let input_data: HashMap<String, serde_json::Value> = attributes
+		.iter()
+		.filter_map(|(key, value)| key.strip_prefix(UI_INPUT_DATA_PREFIX).map(|sub_key| (sub_key.to_owned(), value.value.clone())))
+		.collect();
+
+	InputMetadataEntry {
+		input_name: attributes.get_typed(UI_INPUT_NAME),
+		input_description: attributes.get_typed(UI_INPUT_DESCRIPTION),
+		widget_override: attributes.get_typed(UI_WIDGET_OVERRIDE),
+		input_data,
+	}
 }
 
 /// Converts a Registry Node to a DocumentNode, remapping global IDs to local IDs
@@ -153,7 +203,8 @@ fn convert_node(
 	node: &crate::Node,
 	metadata_path: &[RuntimeNodeId],
 	runtime_node_id: RuntimeNodeId,
-	metadata_collector: &mut Option<Vec<NodeMetadataEntry>>,
+	node_collector: &mut Option<Vec<NodeMetadataEntry>>,
+	network_collector: &mut Option<Vec<NetworkMetadataEntry>>,
 ) -> Result<DocumentNode, ConversionError> {
 	// Convert inputs with their associated attributes, remapping node references
 	let inputs = node
@@ -163,26 +214,17 @@ fn convert_node(
 		.map(|(slot, input_attrs)| convert_input(registry, &slot.input, input_attrs))
 		.collect::<Result<Vec<_>, _>>()?;
 
-	// Extract call_argument from attributes
-	let call_argument = node
-		.attributes
-		.get(CALL_ARGUMENT)
-		.and_then(|v| serde_json::from_value(v.value.clone()).ok())
-		.unwrap_or_else(|| concrete!(())); // Default to unit type if not found
-
-	// Extract context_features from attributes
-	let context_features = node.attributes.get(CONTEXT_FEATURES).and_then(|v| serde_json::from_value(v.value.clone()).ok()).unwrap_or_default(); // Default to empty context features if not found
-
-	// Extract visible from attributes
-	let visible = node.attributes.get(VISIBLE).and_then(|v| serde_json::from_value(v.value.clone()).ok()).unwrap_or(true); // Default to true if not found
-
-	// Extract skip_deduplication from attributes
-	let skip_deduplication = node.attributes.get(SKIP_DEDUPLICATION).and_then(|v| serde_json::from_value(v.value.clone()).ok()).unwrap_or(false); // Default to false if not found
+	// Defaults match `DocumentNode::default()` so the write side can omit attributes for the common
+	// case. Keep these in sync with the `set_if_not_default` calls in `from_runtime`.
+	let call_argument = node.attributes.get_or(CALL_ARGUMENT, concrete!(core_types::Context));
+	let context_features = node.attributes.get_or_default(CONTEXT_FEATURES);
+	let visible = node.attributes.get_or(VISIBLE, true);
+	let skip_deduplication = node.attributes.get_or(SKIP_DEDUPLICATION, false);
 
 	Ok(DocumentNode {
 		inputs,
 		call_argument,
-		implementation: convert_implementation(registry, &node.implementation, metadata_path, runtime_node_id, metadata_collector)?,
+		implementation: convert_implementation(registry, &node.implementation, metadata_path, runtime_node_id, node_collector, network_collector)?,
 		visible,
 		skip_deduplication,
 		context_features,
@@ -214,24 +256,16 @@ fn convert_input(registry: &Registry, input: &NodeInput, input_attributes: &crat
 		}
 		NodeInput::Scope(s) => GraphCraftNodeInput::Scope(s.clone()),
 		NodeInput::Import { import_idx } => {
-			// Extract import_type from input_attributes if available
-			let import_type = input_attributes
-				.get(IMPORT_TYPE)
-				.and_then(|v| serde_json::from_value(v.value.clone()).ok())
-				.unwrap_or_else(|| Type::Generic(Cow::Borrowed("T"))); // Default to generic if not found
-
+			let import_type = input_attributes.get_or(IMPORT_TYPE, Type::Generic(Cow::Borrowed("T")));
 			GraphCraftNodeInput::Import {
 				import_type,
 				import_index: *import_idx,
 			}
 		}
 		NodeInput::Reflection => {
-			// Extract reflection_metadata from input_attributes
 			let metadata = input_attributes
-				.get(REFLECTION_METADATA)
-				.and_then(|v| serde_json::from_value(v.value.clone()).ok())
+				.get_typed(REFLECTION_METADATA)
 				.ok_or_else(|| ConversionError::DeserializationError("Missing reflection_metadata in input_attributes".to_string()))?;
-
 			GraphCraftNodeInput::Reflection(metadata)
 		}
 	})
@@ -245,7 +279,8 @@ fn convert_implementation(
 	implementation: &Implementation,
 	parent_metadata_path: &[RuntimeNodeId],
 	owning_runtime_id: RuntimeNodeId,
-	metadata_collector: &mut Option<Vec<NodeMetadataEntry>>,
+	node_collector: &mut Option<Vec<NodeMetadataEntry>>,
+	network_collector: &mut Option<Vec<NetworkMetadataEntry>>,
 ) -> Result<DocumentNodeImplementation, ConversionError> {
 	Ok(match implementation {
 		Implementation::ProtoNode(decl_id) => {
@@ -261,7 +296,7 @@ fn convert_implementation(
 			child_path.extend_from_slice(parent_metadata_path);
 			child_path.push(owning_runtime_id);
 
-			DocumentNodeImplementation::Network(convert_network(registry, *net_id, &child_path, metadata_collector)?)
+			DocumentNodeImplementation::Network(convert_network(registry, *net_id, &child_path, node_collector, network_collector)?)
 		}
 	})
 }

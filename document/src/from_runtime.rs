@@ -2,14 +2,23 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use core_types::Context;
+use core_types::context::ContextDependencies;
 use core_types::uuid::NodeId as RuntimeNodeId;
+use graph_craft::concrete;
 use graph_craft::document::value::TaggedValue;
 use graph_craft::document::{DocumentNode, DocumentNodeImplementation, NodeInput as GraphCraftNodeInput, NodeNetwork};
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::attr::*;
 use crate::metadata_source::{NoMetadata, NodeMetadataSource};
-use crate::{DeclarationId, ExportSlot, Implementation, InputSlot, Network, NetworkId, Node, NodeId, NodeInput, Position, ProtoNode, ROOT_NETWORK, Registry, TimeStamp, Value};
+use crate::{AttributesExt, DeclarationId, ExportSlot, Implementation, InputSlot, Network, NetworkId, Node, NodeId, NodeInput, Position, ProtoNode, ROOT_NETWORK, Registry, TimeStamp};
+
+/// Adapts `serde_json::Error` into a `ConversionError::SerializationError` tagged with the key
+/// being written. Lets the write-side helpers stay a single line each.
+fn map_serialization_error(key: &str) -> impl FnOnce(serde_json::Error) -> ConversionError + '_ {
+	move |e| ConversionError::SerializationError(format!("{key}: {e:?}"))
+}
 
 /// Represents a path to a node in the document structure for generating stable IDs
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -62,24 +71,8 @@ pub enum ConversionError {
 	InvalidNetwork(String),
 }
 
-/// Converts a NodeNetwork back to a Registry.
-///
-/// ## Identity Node Creation
-///
-/// Since Registry uses identity nodes for network exports, this conversion:
-/// 1. Creates identity nodes for each export in the network
-/// 2. Adds these identity nodes to the network's nodes
-/// 3. Updates the network exports to reference these identity nodes
-///
-/// ## Nested Structure Flattening
-///
-/// The conversion flattens nested networks:
-/// - Each nested NodeNetwork is assigned a unique NetworkId
-/// - All nodes (including from nested networks) are added to the flat registry.node_instances map
-/// - Each node records which network it belongs to via the `network` field
-///
-/// This entry point provides no editor-side metadata. Use [`Registry::from_runtime_with_metadata`]
-/// to thread positions, display names, etc.
+/// Graph-only conversion (no editor metadata). Use [`Registry::from_runtime_with_metadata`] when
+/// round-tripping editor state.
 impl TryFrom<&NodeNetwork> for Registry {
 	type Error = ConversionError;
 
@@ -143,14 +136,7 @@ fn convert_network<M: NodeMetadataSource + ?Sized>(
 
 		let mut node = convert_node(doc_node, local_id, network_id, parent_path, metadata_path, *runtime_node_id, registry, ctx)?;
 
-		let timestamp = TimeStamp::ORIGIN;
-		node.attributes.insert(
-			ORIGINAL_NODE_ID.to_string(),
-			Value {
-				value: serde_json::json!(local_id),
-				timestamp,
-			},
-		);
+		node.attributes.set(ORIGINAL_NODE_ID, serde_json::json!(local_id), TimeStamp::ORIGIN);
 
 		registry.node_instances.insert(global_id, node);
 	}
@@ -166,7 +152,10 @@ fn convert_network<M: NodeMetadataSource + ?Sized>(
 		})
 		.collect::<Result<Vec<_>, ConversionError>>()?;
 
-	registry.networks.insert(network_id, Network { exports });
+	let mut attributes = HashMap::new();
+	write_ui_network_attributes(&mut attributes, ctx.metadata, metadata_path, TimeStamp::ORIGIN)?;
+
+	registry.networks.insert(network_id, Network { exports, attributes });
 
 	Ok(())
 }
@@ -195,13 +184,17 @@ fn convert_node<M: NodeMetadataSource + ?Sized>(
 	// the CRDT system manages timestamps for subsequent ChangeNodeInput ops.
 	let mut inputs = Vec::new();
 	let mut inputs_attributes = Vec::new();
+	let timestamp = TimeStamp::ORIGIN;
 
-	for input in &doc_node.inputs {
+	for (input_index, input) in doc_node.inputs.iter().enumerate() {
 		inputs.push(InputSlot {
 			input: convert_input(input, parent_path, network_id)?,
-			timestamp: TimeStamp::ORIGIN,
+			timestamp,
 		});
-		inputs_attributes.push(convert_input_attributes(input)?);
+
+		let mut input_attrs = convert_input_attributes(input)?;
+		write_ui_input_attributes(&mut input_attrs, ctx.metadata, metadata_path, runtime_node_id, input_index, timestamp)?;
+		inputs_attributes.push(input_attrs);
 	}
 
 	// For nested networks, extend the metadata path with this node before recursing.
@@ -217,34 +210,23 @@ fn convert_node<M: NodeMetadataSource + ?Sized>(
 	// Convert implementation (pass this node's path for nested networks)
 	let implementation = convert_implementation(&doc_node.implementation, &node_path, child_metadata_path, registry, ctx)?;
 
-	// Store DocumentNode metadata in attributes for lossless conversion.
-	// Initial conversion uses the origin timestamp; the CRDT system manages timestamps for subsequent deltas.
+	// Store DocumentNode metadata in attributes for lossless conversion. Each field is only emitted
+	// when it diverges from the runtime default; absence on the read side rehydrates as the same
+	// default. `to_runtime` mirrors these defaults — keep them in sync.
 	let mut attributes = HashMap::new();
-	let timestamp = TimeStamp::ORIGIN;
 
-	let serialized_call_arg = serde_json::to_value(&doc_node.call_argument).map_err(|e| ConversionError::SerializationError(format!("call_argument: {:?}", e)))?;
-	attributes.insert(
-		CALL_ARGUMENT.to_string(),
-		Value {
-			value: serialized_call_arg,
-			timestamp,
-		},
-	);
-
-	let serialized_context = serde_json::to_value(&doc_node.context_features).map_err(|e| ConversionError::SerializationError(format!("context_features: {:?}", e)))?;
-	attributes.insert(CONTEXT_FEATURES.to_string(), Value { value: serialized_context, timestamp });
-
-	let serialized_visible = serde_json::to_value(&doc_node.visible).map_err(|e| ConversionError::SerializationError(format!("visible: {:?}", e)))?;
-	attributes.insert(VISIBLE.to_string(), Value { value: serialized_visible, timestamp });
-
-	let serialized_skip_dedup = serde_json::to_value(&doc_node.skip_deduplication).map_err(|e| ConversionError::SerializationError(format!("skip_deduplication: {:?}", e)))?;
-	attributes.insert(
-		SKIP_DEDUPLICATION.to_string(),
-		Value {
-			value: serialized_skip_dedup,
-			timestamp,
-		},
-	);
+	attributes
+		.set_if_not_default(CALL_ARGUMENT, &doc_node.call_argument, &concrete!(Context), timestamp)
+		.map_err(map_serialization_error("call_argument"))?;
+	attributes
+		.set_if_not_default(CONTEXT_FEATURES, &doc_node.context_features, &ContextDependencies::default(), timestamp)
+		.map_err(map_serialization_error("context_features"))?;
+	attributes
+		.set_if_not_default(VISIBLE, &doc_node.visible, &true, timestamp)
+		.map_err(map_serialization_error("visible"))?;
+	attributes
+		.set_if_not_default(SKIP_DEDUPLICATION, &doc_node.skip_deduplication, &false, timestamp)
+		.map_err(map_serialization_error("skip_deduplication"))?;
 
 	// Editor metadata. Only emitted when the source supplies a value, so converting a network
 	// without editor metadata (e.g., synthetic tests via `NoMetadata`) leaves the `ui::*` keys
@@ -269,52 +251,89 @@ fn write_ui_attributes<M: NodeMetadataSource + ?Sized>(
 	timestamp: TimeStamp,
 ) -> Result<(), ConversionError> {
 	if let Some(position) = metadata.position(metadata_path, runtime_node_id) {
-		let value = serde_json::to_value(position).map_err(|e| ConversionError::SerializationError(format!("ui::position: {:?}", e)))?;
-		attributes.insert(UI_POSITION.to_string(), Value { value, timestamp });
+		attributes.set_serialized(UI_POSITION, &position, timestamp).map_err(map_serialization_error("ui::position"))?;
 	}
 
-	// `is_layer` is the layer-vs-node toggle. Default is `false`, so only emit when true to keep
-	// the attribute set lean — the absence of the key is read as `false` on round-trip.
+	// `is_layer`, `locked`, `pinned` only emitted when true; absence reads as false on round-trip.
 	if metadata.is_layer(metadata_path, runtime_node_id) {
-		attributes.insert(
-			UI_IS_LAYER.to_string(),
-			Value {
-				value: serde_json::Value::Bool(true),
-				timestamp,
-			},
-		);
+		attributes.set(UI_IS_LAYER, serde_json::Value::Bool(true), timestamp);
 	}
-
-	if let Some(name) = metadata.display_name(metadata_path, runtime_node_id) {
-		if !name.is_empty() {
-			attributes.insert(
-				UI_DISPLAY_NAME.to_string(),
-				Value {
-					value: serde_json::Value::String(name.to_string()),
-					timestamp,
-				},
-			);
-		}
-	}
-
 	if metadata.locked(metadata_path, runtime_node_id) {
-		attributes.insert(
-			UI_LOCKED.to_string(),
-			Value {
-				value: serde_json::Value::Bool(true),
-				timestamp,
-			},
-		);
+		attributes.set(UI_LOCKED, serde_json::Value::Bool(true), timestamp);
+	}
+	if metadata.pinned(metadata_path, runtime_node_id) {
+		attributes.set(UI_PINNED, serde_json::Value::Bool(true), timestamp);
 	}
 
-	if metadata.pinned(metadata_path, runtime_node_id) {
-		attributes.insert(
-			UI_PINNED.to_string(),
-			Value {
-				value: serde_json::Value::Bool(true),
-				timestamp,
-			},
-		);
+	if let Some(name) = metadata.display_name(metadata_path, runtime_node_id)
+		&& !name.is_empty()
+	{
+		attributes.set(UI_DISPLAY_NAME, serde_json::Value::String(name.to_string()), timestamp);
+	}
+
+	// `output_names`: one whole-vec attribute (per-slot LWW would be overkill for rename-on-output).
+	let output_names = metadata.output_names(metadata_path, runtime_node_id);
+	if !output_names.is_empty() {
+		attributes
+			.set_serialized(UI_OUTPUT_NAMES, &output_names, timestamp)
+			.map_err(map_serialization_error("ui::output_names"))?;
+	}
+
+	Ok(())
+}
+
+/// Pulls per-network `ui::*` values (navigation state, previewing flag) into a `Network.attributes`
+/// bucket. Each navigation sub-field gets its own key so concurrent pan/zoom/transform edits each
+/// LWW independently.
+fn write_ui_network_attributes<M: NodeMetadataSource + ?Sized>(attributes: &mut crate::Attributes, metadata: &M, network_path: &[RuntimeNodeId], timestamp: TimeStamp) -> Result<(), ConversionError> {
+	if let Some(value) = metadata.navigation_ptz(network_path) {
+		attributes.set(UI_NAV_PTZ, value, timestamp);
+	}
+	if let Some(value) = metadata.navigation_transform(network_path) {
+		attributes.set(UI_NAV_TRANSFORM, value, timestamp);
+	}
+	if let Some(width) = metadata.navigation_width(network_path) {
+		attributes.set_serialized(UI_NAV_WIDTH, &width, timestamp).map_err(map_serialization_error("ui::nav::width"))?;
+	}
+	if let Some(value) = metadata.previewing(network_path) {
+		attributes.set(UI_PREVIEWING, value, timestamp);
+	}
+	if let Some(reference) = metadata.reference(network_path) {
+		attributes.set(UI_REFERENCE, serde_json::Value::String(reference.to_string()), timestamp);
+	}
+
+	Ok(())
+}
+
+/// Pulls per-input `ui::*` values from the metadata source and writes them into one input slot's
+/// attribute bucket. Empty strings on the runtime side (the "no value set" sentinel for
+/// `input_name` / `input_description`) are omitted; `input_data` entries are exploded into one
+/// `ui::input_data::<sub_key>` attribute apiece so each sub-value gets its own LWW timestamp.
+fn write_ui_input_attributes<M: NodeMetadataSource + ?Sized>(
+	attributes: &mut crate::Attributes,
+	metadata: &M,
+	metadata_path: &[RuntimeNodeId],
+	runtime_node_id: RuntimeNodeId,
+	input_index: usize,
+	timestamp: TimeStamp,
+) -> Result<(), ConversionError> {
+	if let Some(name) = metadata.input_name(metadata_path, runtime_node_id, input_index)
+		&& !name.is_empty()
+	{
+		attributes.set(UI_INPUT_NAME, serde_json::Value::String(name.to_string()), timestamp);
+	}
+	if let Some(description) = metadata.input_description(metadata_path, runtime_node_id, input_index)
+		&& !description.is_empty()
+	{
+		attributes.set(UI_INPUT_DESCRIPTION, serde_json::Value::String(description.to_string()), timestamp);
+	}
+	if let Some(widget) = metadata.widget_override(metadata_path, runtime_node_id, input_index) {
+		attributes.set(UI_WIDGET_OVERRIDE, serde_json::Value::String(widget.to_string()), timestamp);
+	}
+
+	for (sub_key, value) in metadata.input_data(metadata_path, runtime_node_id, input_index) {
+		let attr_key = format!("{UI_INPUT_DATA_PREFIX}{sub_key}");
+		attributes.set(&attr_key, value, timestamp);
 	}
 
 	Ok(())
@@ -365,19 +384,12 @@ fn convert_input_attributes(input: &GraphCraftNodeInput) -> Result<crate::Attrib
 	let timestamp = TimeStamp::ORIGIN;
 
 	if let GraphCraftNodeInput::Import { import_type, .. } = input {
-		let serialized_type = serde_json::to_value(import_type).map_err(|e| ConversionError::SerializationError(format!("import_type: {:?}", e)))?;
-		attributes.insert(IMPORT_TYPE.to_string(), Value { value: serialized_type, timestamp });
+		attributes.set_serialized(IMPORT_TYPE, import_type, timestamp).map_err(map_serialization_error("import_type"))?;
 	}
-
 	if let GraphCraftNodeInput::Reflection(metadata) = input {
-		let serialized_metadata = serde_json::to_value(metadata).map_err(|e| ConversionError::SerializationError(format!("reflection_metadata: {:?}", e)))?;
-		attributes.insert(
-			REFLECTION_METADATA.to_string(),
-			Value {
-				value: serialized_metadata,
-				timestamp,
-			},
-		);
+		attributes
+			.set_serialized(REFLECTION_METADATA, metadata, timestamp)
+			.map_err(map_serialization_error("reflection_metadata"))?;
 	}
 
 	Ok(attributes)
