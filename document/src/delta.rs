@@ -4,8 +4,8 @@ use crate::{AttributeDelta, ExportSlot, NetworkId, Node, NodeId, NodeInput, Regi
 
 /// Minimal set of deltas to transform `from` into `to`.
 ///
-/// Carries forward the `to` side's existing timestamps; callers needing fresh clock ticks must
-/// mint timestamps themselves. Removals stamp `TimeStamp::ORIGIN`.
+/// Emits timestamp-less op shapes; the caller (`Document::commit_local` or equivalent) wraps each
+/// in a `Delta` with a fresh clock tick.
 pub fn compute_deltas(from: &Registry, to: &Registry) -> Vec<RegistryDelta> {
 	let mut deltas = Vec::new();
 
@@ -41,7 +41,6 @@ pub fn compute_deltas(from: &Registry, to: &Registry) -> Vec<RegistryDelta> {
 					node_id,
 					input_idx,
 					new_input: to_slot.input.clone(),
-					timestamp: to_slot.timestamp,
 				});
 			}
 		}
@@ -84,12 +83,11 @@ pub fn compute_deltas(from: &Registry, to: &Registry) -> Vec<RegistryDelta> {
 			let to_slot = to_network.exports.get(slot_idx);
 
 			if from_slot != to_slot {
-				let (target, timestamp) = to_slot.map(|s| (s.target.clone(), s.timestamp)).unwrap_or((None, TimeStamp::ORIGIN));
+				let target = to_slot.and_then(|s| s.target.clone());
 				deltas.push(RegistryDelta::SetExport {
 					network: network_id,
 					slot: slot_idx as u32,
 					target,
-					timestamp,
 				});
 			}
 		}
@@ -112,19 +110,15 @@ fn compute_attribute_deltas(from: &crate::Attributes, to: &crate::Attributes) ->
 
 	for key in from.keys() {
 		if !to.contains_key(key) {
-			deltas.push(AttributeDelta::Remove {
-				key: key.clone(),
-				timestamp: TimeStamp::ORIGIN,
-			});
+			deltas.push(AttributeDelta { key: key.clone(), value: None });
 		}
 	}
 
 	for (key, to_value) in to {
 		if from.get(key).is_none_or(|from_value| from_value != to_value) {
-			deltas.push(AttributeDelta::Set {
+			deltas.push(AttributeDelta {
 				key: key.clone(),
-				value: to_value.value.clone(),
-				timestamp: to_value.timestamp,
+				value: Some(to_value.value.clone()),
 			});
 		}
 	}
@@ -218,7 +212,7 @@ mod tests {
 		assert_eq!(deltas.len(), 1);
 		assert!(matches!(
 			&deltas[0],
-			RegistryDelta::ChangeNodeAttribute { node_id: 42, delta: AttributeDelta::Set { key, .. } } if key == "test"
+			RegistryDelta::ChangeNodeAttribute { node_id: 42, delta: AttributeDelta { key, value: Some(_) } } if key == "test"
 		));
 	}
 

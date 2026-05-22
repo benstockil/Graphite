@@ -269,6 +269,8 @@ struct Delta {
 	reverse: RegistryDelta,
 }
 
+/// Op payload. Timestamps live on the wrapping `Delta` — one per delta, applied to all LWW-eligible
+/// writes within. See `notes/document-format-collaboration.md`.
 #[derive(Clone, Debug)]
 pub enum RegistryDelta {
 	AddNode {
@@ -282,7 +284,6 @@ pub enum RegistryDelta {
 		node_id: NodeId,
 		input_idx: usize,
 		new_input: NodeInput,
-		timestamp: TimeStamp,
 	},
 	ChangeNodeAttribute {
 		node_id: NodeId,
@@ -298,7 +299,6 @@ pub enum RegistryDelta {
 		network: NetworkId,
 		slot: u32,
 		target: Option<NodeInput>,
-		timestamp: TimeStamp,
 	},
 	AddNetwork {
 		network: NetworkId,
@@ -312,29 +312,17 @@ pub enum RegistryDelta {
 	/// Whole-list LWW; timestamp lives under `attr::EXPORTED_NODES_TS` on the document.
 	SetExportedNodes {
 		nodes: Vec<NodeId>,
-		timestamp: TimeStamp,
 	},
 	ChangeDocumentAttribute {
 		delta: AttributeDelta,
 	},
 }
 
+/// `value: None` means remove. The timestamp comes from the wrapping `Delta`.
 #[derive(Clone, Debug)]
-pub enum AttributeDelta {
-	Set { key: String, value: serde_json::Value, timestamp: TimeStamp },
-	Remove { key: String, timestamp: TimeStamp },
-}
-
-impl AttributeDelta {
-	fn key(&self) -> &str {
-		let (AttributeDelta::Set { key, .. } | AttributeDelta::Remove { key, .. }) = self;
-		key
-	}
-
-	fn timestamp(&self) -> TimeStamp {
-		let (AttributeDelta::Set { timestamp, .. } | AttributeDelta::Remove { timestamp, .. }) = self;
-		*timestamp
-	}
+pub struct AttributeDelta {
+	pub key: String,
+	pub value: Option<serde_json::Value>,
 }
 
 impl Document {
@@ -371,6 +359,7 @@ impl Document {
 			assert!(self.history.contains_key(&pred));
 		}
 
+		let timestamp = delta.timestamp;
 		match delta.delta_type {
 			RegistryDelta::AddNode { node_id, node } => {
 				if self.registry.node_instances.contains_key(&node_id) {
@@ -381,12 +370,7 @@ impl Document {
 			RegistryDelta::RemoveNode { node_id } => {
 				self.registry.node_instances.remove(&node_id);
 			}
-			RegistryDelta::ChangeNodeInput {
-				node_id,
-				input_idx,
-				new_input,
-				timestamp,
-			} => {
+			RegistryDelta::ChangeNodeInput { node_id, input_idx, new_input } => {
 				// Ad-hoc resurrect a referenced node if it was removed concurrently.
 				if let NodeInput::Node { node_id: referenced, .. } = &new_input {
 					self.ensure_node_exists(*referenced)?;
@@ -403,15 +387,15 @@ impl Document {
 			RegistryDelta::ChangeNodeAttribute { node_id, delta } => {
 				self.ensure_node_exists(node_id)?;
 				let node = self.registry.node_instances.get_mut(&node_id).ok_or(CrdtError::TargetNodeDoesNotExist)?;
-				apply_attribute_delta(delta, &mut node.attributes);
+				apply_attribute_delta(delta, timestamp, &mut node.attributes);
 			}
 			RegistryDelta::ChangeNodeInputAttribute { node_id, input_idx, delta } => {
 				self.ensure_node_exists(node_id)?;
 				let node = self.registry.node_instances.get_mut(&node_id).ok_or(CrdtError::TargetNodeDoesNotExist)?;
 				let input_attributes = node.inputs_attributes.get_mut(input_idx).ok_or(CrdtError::InputIndexOutOfBounds)?;
-				apply_attribute_delta(delta, input_attributes);
+				apply_attribute_delta(delta, timestamp, input_attributes);
 			}
-			RegistryDelta::SetExport { network, slot, target, timestamp } => {
+			RegistryDelta::SetExport { network, slot, target } => {
 				let net = self.registry.networks.get_mut(&network).ok_or(CrdtError::NetworkDoesNotExist)?;
 				let slot_idx = slot as usize;
 
@@ -440,7 +424,7 @@ impl Document {
 			RegistryDelta::RemoveNetwork { network, .. } => {
 				self.registry.networks.remove(&network);
 			}
-			RegistryDelta::SetExportedNodes { nodes, timestamp } => {
+			RegistryDelta::SetExportedNodes { nodes } => {
 				let current_ts = self.registry.attributes.get(attr::EXPORTED_NODES_TS).map(|v| v.timestamp).unwrap_or(TimeStamp::ORIGIN);
 				if timestamp > current_ts {
 					self.registry.exported_nodes = nodes;
@@ -454,7 +438,7 @@ impl Document {
 				}
 			}
 			RegistryDelta::ChangeDocumentAttribute { delta } => {
-				apply_attribute_delta(delta, &mut self.registry.attributes);
+				apply_attribute_delta(delta, timestamp, &mut self.registry.attributes);
 			}
 		}
 		Ok(())
@@ -481,7 +465,6 @@ impl Document {
 					node_id,
 					input_idx,
 					new_input: slot.input.clone(),
-					timestamp: slot.timestamp,
 				}
 			}
 			&RegistryDelta::ChangeNodeAttribute { node_id, ref delta } => {
@@ -502,21 +485,17 @@ impl Document {
 			}
 			&RegistryDelta::SetExport { network, slot, .. } => {
 				let net = self.registry.networks.get(&network).ok_or(CrdtError::NetworkDoesNotExist)?;
-				let (target, timestamp) = net.exports.get(slot as usize).map(|s| (s.target.clone(), s.timestamp)).unwrap_or((None, TimeStamp::ORIGIN));
-				RegistryDelta::SetExport { network, slot, target, timestamp }
+				let target = net.exports.get(slot as usize).and_then(|s| s.target.clone());
+				RegistryDelta::SetExport { network, slot, target }
 			}
 			RegistryDelta::AddNetwork { network, contents } => RegistryDelta::RemoveNetwork {
 				network: *network,
 				snapshot: contents.clone(),
 			},
 			&RegistryDelta::RemoveNetwork { network, ref snapshot } => RegistryDelta::AddNetwork { network, contents: snapshot.clone() },
-			RegistryDelta::SetExportedNodes { .. } => {
-				let current_ts = self.registry.attributes.get(attr::EXPORTED_NODES_TS).map(|v| v.timestamp).unwrap_or(TimeStamp::ORIGIN);
-				RegistryDelta::SetExportedNodes {
-					nodes: self.registry.exported_nodes.clone(),
-					timestamp: current_ts,
-				}
-			}
+			RegistryDelta::SetExportedNodes { .. } => RegistryDelta::SetExportedNodes {
+				nodes: self.registry.exported_nodes.clone(),
+			},
 			RegistryDelta::ChangeDocumentAttribute { delta } => RegistryDelta::ChangeDocumentAttribute {
 				delta: reverse_attribute_delta(delta, &self.registry.attributes),
 			},
@@ -536,22 +515,16 @@ impl Document {
 }
 
 fn reverse_attribute_delta(delta: &AttributeDelta, attributes: &Attributes) -> AttributeDelta {
-	let current_value = attributes.get(delta.key());
-	let key = delta.key().to_string();
-	let op_timestamp = delta.timestamp();
-	match current_value {
-		None => AttributeDelta::Remove { key, timestamp: op_timestamp },
-		Some(previous) => AttributeDelta::Set {
-			key,
-			value: previous.value.clone(),
-			timestamp: previous.timestamp,
-		},
+	AttributeDelta {
+		key: delta.key.clone(),
+		value: attributes.get(&delta.key).map(|previous| previous.value.clone()),
 	}
 }
 
-fn apply_attribute_delta(delta: AttributeDelta, attributes: &mut Attributes) {
-	match delta {
-		AttributeDelta::Set { key, value, timestamp } => match attributes.entry(key) {
+fn apply_attribute_delta(delta: AttributeDelta, timestamp: TimeStamp, attributes: &mut Attributes) {
+	let AttributeDelta { key, value } = delta;
+	match value {
+		Some(value) => match attributes.entry(key) {
 			std::collections::hash_map::Entry::Occupied(mut entry) => {
 				if timestamp > entry.get().timestamp {
 					entry.insert(Value { value, timestamp });
@@ -561,7 +534,7 @@ fn apply_attribute_delta(delta: AttributeDelta, attributes: &mut Attributes) {
 				entry.insert(Value { value, timestamp });
 			}
 		},
-		AttributeDelta::Remove { key, timestamp } => {
+		None => {
 			let should_remove = attributes.get(&key).is_none_or(|existing| timestamp > existing.timestamp);
 			if should_remove {
 				attributes.remove(&key);
