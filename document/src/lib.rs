@@ -69,6 +69,9 @@ pub struct Registry {
 	/// Public library API: nodes an importing document can reference.
 	/// `library::*` attributes on each referenced node carry its display name, category, docs.
 	pub exported_nodes: Vec<NodeId>,
+	/// Append-only mapping from per-device `PeerId` to per-human `UserId`.
+	/// Registered by each device's first contribution via `RegistryDelta::RegisterPeer`.
+	pub peer_users: HashMap<PeerId, UserId>,
 	pub attributes: Attributes,
 }
 #[derive(Clone, Debug)]
@@ -88,9 +91,15 @@ type ProtoNodeId = String;
 /// without being adversarial-grade. Same delta content always produces the same `Rev`.
 pub type Rev = u128;
 
-/// One editor session, used as a CRDT tiebreaker when two peers mint colliding Lamport counters.
+/// Per-device identity. Stable per `(device, document)`. Used for CRDT tiebreaking and `NodeId`
+/// scoping. Globally unique across all peers ever in a document.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
 pub struct PeerId(pub u64);
+
+/// Per-human identity. Stable across devices (one user, many devices). Used for identity display
+/// and undo-chain walking. Derived from `PeerId` via `Registry.peer_users`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+pub struct UserId(pub u64);
 
 /// Lamport timestamp with a peer-ID tiebreak. Higher counter wins; ties broken by peer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
@@ -350,6 +359,13 @@ pub enum RegistryDelta {
 	ChangeDocumentAttribute {
 		delta: AttributeDelta,
 	},
+	/// Append-only registration of a device's `PeerId` against its owning `UserId`.
+	/// First write wins; conflicting re-registration errors. Duplicate identical registration
+	/// is a no-op. Not LWW — the mapping is forever.
+	RegisterPeer {
+		peer: PeerId,
+		user: UserId,
+	},
 }
 
 /// `value: None` means remove. The timestamp comes from the wrapping `Delta`.
@@ -474,6 +490,13 @@ impl Document {
 			RegistryDelta::ChangeDocumentAttribute { delta } => {
 				apply_attribute_delta(delta, timestamp, &mut self.registry.attributes);
 			}
+			RegistryDelta::RegisterPeer { peer, user } => match self.registry.peer_users.get(&peer) {
+				Some(existing) if *existing != user => return Err(CrdtError::PeerRegistrationConflict),
+				Some(_) => {}
+				None => {
+					self.registry.peer_users.insert(peer, user);
+				}
+			},
 		}
 		Ok(())
 	}
@@ -533,6 +556,9 @@ impl Document {
 			RegistryDelta::ChangeDocumentAttribute { delta } => RegistryDelta::ChangeDocumentAttribute {
 				delta: reverse_attribute_delta(delta, &self.registry.attributes),
 			},
+			// Registrations are append-only and not user-undoable; reverse is the same op,
+			// which applies as a no-op on the already-registered PeerId.
+			&RegistryDelta::RegisterPeer { peer, user } => RegistryDelta::RegisterPeer { peer, user },
 		})
 	}
 
@@ -600,4 +626,6 @@ enum CrdtError {
 	NotFoundInHistory,
 	NodeAlreadyExists,
 	NetworkAlreadyExists,
+	/// PeerId is already registered to a different UserId.
+	PeerRegistrationConflict,
 }
