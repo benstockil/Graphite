@@ -420,21 +420,37 @@ impl Document {
 		for parent in &delta.parents {
 			assert!(self.history.contains_key(parent));
 		}
-		self.apply_op(delta.delta_type, delta.timestamp)
+		self.apply_op(delta.delta_type, delta.timestamp, false)
 	}
 
 	/// Apply a live broadcast op. Updates the registry via LWW and appends to the hot log.
 	/// Doesn't touch history or `head` — hot ops are transient.
 	pub fn apply_hot_op(&mut self, hot_op: HotOp) -> Result<(), CrdtError> {
-		self.apply_op(hot_op.op.clone(), hot_op.timestamp)?;
+		self.apply_op(hot_op.op.clone(), hot_op.timestamp, false)?;
 		self.hot_log.push(hot_op);
 		Ok(())
 	}
 
-	fn apply_op(&mut self, op: RegistryDelta, timestamp: TimeStamp) -> Result<(), CrdtError> {
+	/// Apply a retired commit. Idempotent on structural ops (AddNode/AddNetwork on existing
+	/// targets, Remove on missing ones) since hot ops already produced the structural state.
+	/// The point is to bump field timestamps to T_retire via the LWW arms.
+	pub fn apply_retired_delta(&mut self, delta: Delta) -> Result<(), CrdtError> {
+		for parent in &delta.parents {
+			assert!(self.history.contains_key(parent));
+		}
+		self.apply_op(delta.delta_type.clone(), delta.timestamp, true)?;
+		self.history.insert(delta.id, delta);
+		Ok(())
+	}
+
+	fn apply_op(&mut self, op: RegistryDelta, timestamp: TimeStamp, idempotent: bool) -> Result<(), CrdtError> {
 		match op {
 			RegistryDelta::AddNode { node_id, node } => {
 				if self.registry.node_instances.contains_key(&node_id) {
+					if idempotent {
+						// Hot ops already created this node; skip rather than error.
+						return Ok(());
+					}
 					return Err(CrdtError::NodeAlreadyExists);
 				}
 				self.registry.node_instances.insert(node_id, node);
@@ -489,6 +505,9 @@ impl Document {
 			}
 			RegistryDelta::AddNetwork { network, contents } => {
 				if self.registry.networks.contains_key(&network) {
+					if idempotent {
+						return Ok(());
+					}
 					return Err(CrdtError::NetworkAlreadyExists);
 				}
 				self.registry.networks.insert(network, contents);
