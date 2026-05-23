@@ -1942,6 +1942,7 @@ dependencies = [
 name = "graph-storage"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "core-types",
  "graph-craft",
  "postcard",

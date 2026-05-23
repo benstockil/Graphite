@@ -83,8 +83,10 @@ pub type DeclarationId = u64; // Content-based hash
 pub type NodeId = u64;
 pub type NetworkId = u64;
 type ProtoNodeId = String;
-// TODO: Use a merkle tree hash
-type Rev = u64;
+/// Content-addressed identity for a `Delta`.
+/// 128-bit blake3 truncation: comfortable collision headroom for any plausible document lifetime
+/// without being adversarial-grade. Same delta content always produces the same `Rev`.
+pub type Rev = u128;
 
 /// One editor session, used as a CRDT tiebreaker when two peers mint colliding Lamport counters.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
