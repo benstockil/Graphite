@@ -78,8 +78,20 @@ pub struct Registry {
 struct Document {
 	registry: Registry,
 	history: HashMap<Rev, Delta>,
+	/// Live broadcast stream — applied to the registry on receive, GC'd at retirement.
+	/// Not part of canonical history; transient.
+	hot_log: Vec<HotOp>,
 	head: Rev,
 	clock: LamportClock,
+}
+
+/// One live op in the hot zone. Carries only enough to drive live LWW; no parents (transient),
+/// no Rev (not content-addressed in the durable DAG). GC'd at retirement.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HotOp {
+	pub op: RegistryDelta,
+	pub timestamp: TimeStamp,
+	pub author: PeerId,
 }
 
 pub type DeclarationId = u64; // Content-based hash
@@ -408,9 +420,19 @@ impl Document {
 		for parent in &delta.parents {
 			assert!(self.history.contains_key(parent));
 		}
+		self.apply_op(delta.delta_type, delta.timestamp)
+	}
 
-		let timestamp = delta.timestamp;
-		match delta.delta_type {
+	/// Apply a live broadcast op. Updates the registry via LWW and appends to the hot log.
+	/// Doesn't touch history or `head` — hot ops are transient.
+	pub fn apply_hot_op(&mut self, hot_op: HotOp) -> Result<(), CrdtError> {
+		self.apply_op(hot_op.op.clone(), hot_op.timestamp)?;
+		self.hot_log.push(hot_op);
+		Ok(())
+	}
+
+	fn apply_op(&mut self, op: RegistryDelta, timestamp: TimeStamp) -> Result<(), CrdtError> {
+		match op {
 			RegistryDelta::AddNode { node_id, node } => {
 				if self.registry.node_instances.contains_key(&node_id) {
 					return Err(CrdtError::NodeAlreadyExists);
