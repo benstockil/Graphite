@@ -15,7 +15,6 @@ blake3 = "1.5"
 postcard = { version = "1.0", features = ["use-std"] }
 rustc-hash = "2.0"
 thiserror = "2.0"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]
 graph-craft = { workspace = true, features = ["loading"] }

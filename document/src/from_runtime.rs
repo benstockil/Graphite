@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use core_types::Context;
@@ -8,7 +7,7 @@ use core_types::uuid::NodeId as RuntimeNodeId;
 use graph_craft::concrete;
 use graph_craft::document::value::TaggedValue;
 use graph_craft::document::{DocumentNode, DocumentNodeImplementation, NodeInput as GraphCraftNodeInput, NodeNetwork};
-use xxhash_rust::xxh3::Xxh3;
+use serde::Serialize;
 
 use crate::attr::*;
 use crate::metadata_source::{NoMetadata, NodeMetadataSource};
@@ -21,9 +20,9 @@ fn map_serialization_error(key: &str) -> impl FnOnce(serde_json::Error) -> Conve
 /// Path to a node, used to mint stable global IDs by hashing.
 ///
 /// Root-network entries are empty (`path == []`) and keep their original local ID. Hashing uses
-/// xxh3 for cross-run determinism. Used by the initial `from_runtime` conversion; once peer-scoped
-/// ID issuance lands, `AddNode` ops mint IDs directly without hashing.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// blake3 truncated to 64 bits for cross-run determinism. Used by the initial `from_runtime`
+/// conversion; once peer-scoped ID issuance lands, `AddNode` ops mint IDs directly without hashing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct NodePath {
 	path: Vec<(NodeId, NetworkId)>,
 	local_id: NodeId,
@@ -44,9 +43,11 @@ impl NodePath {
 		if self.path.is_empty() {
 			return self.local_id;
 		}
-		let mut hasher = Xxh3::new();
-		self.hash(&mut hasher);
-		hasher.finish()
+		let bytes = postcard::to_stdvec(self).expect("NodePath must serialize");
+		let digest = blake3::hash(&bytes);
+		let mut truncated = [0u8; 8];
+		truncated.copy_from_slice(&digest.as_bytes()[..8]);
+		NodeId::from_le_bytes(truncated)
 	}
 }
 
