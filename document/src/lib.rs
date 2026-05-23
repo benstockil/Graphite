@@ -61,7 +61,7 @@ pub enum Position {
 /// Root network ID. The renderable graph lives in `networks[&ROOT_NETWORK]`.
 pub const ROOT_NETWORK: NetworkId = 0;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Registry {
 	node_declarations: HashMap<DeclarationId, ProtoNode>,
 	pub node_instances: HashMap<NodeId, Node>,
@@ -74,15 +74,31 @@ pub struct Registry {
 	pub peer_users: HashMap<PeerId, UserId>,
 	pub attributes: Attributes,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Document {
 	registry: Registry,
 	history: HashMap<Rev, Delta>,
 	/// Live broadcast stream — applied to the registry on receive, GC'd at retirement.
-	/// Not part of canonical history; transient.
+	/// Persisted for crash recovery so in-flight unretired work survives editor restarts.
 	hot_log: Vec<HotOp>,
+	/// User's cursor in their local chain.
 	head: Rev,
 	clock: LamportClock,
+	peer: PeerId,
+	/// Latest retired commit on the local chain that has been broadcast to at least one peer.
+	/// Commits after this can be rewritten silently; commits at or before this are published
+	/// and require forward reverse-delta ops to undo. `None` means nothing broadcast yet.
+	last_broadcast_rev: Option<Rev>,
+}
+
+/// A live editing session over a `Document`. Owns the document plus runtime collaboration
+/// state that isn't persisted (currently just peer heartbeat tracking).
+#[derive(Clone, Debug)]
+struct Session {
+	document: Document,
+	/// Each peer's `retirement_tip` as reported by their most recent heartbeat. Drives
+	/// leader-eligibility computation (lowest PeerId among peers whose tip matches the session max).
+	remote_tips: HashMap<PeerId, Rev>,
 }
 
 /// One live op in the hot zone. Carries only enough to drive live LWW; no parents (transient),
@@ -125,7 +141,7 @@ impl TimeStamp {
 	pub const ORIGIN: Self = TimeStamp { counter: 0, peer: PeerId(0) };
 }
 
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LamportClock {
 	counter: u64,
 	peer: PeerId,
