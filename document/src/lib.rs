@@ -197,7 +197,7 @@ impl AttributesRead for Attributes {
 	}
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Node {
 	implementation: Implementation,
 	inputs: Vec<InputSlot>,
@@ -208,13 +208,13 @@ pub struct Node {
 
 /// One positional input. The timestamp drives LWW on concurrent `ChangeNodeInput` ops targeting
 /// the same `(node_id, input_idx)`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InputSlot {
 	pub input: NodeInput,
 	pub timestamp: TimeStamp,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum NodeInput {
 	Node {
 		node_id: NodeId,
@@ -232,13 +232,13 @@ pub enum NodeInput {
 	Reflection,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Implementation {
 	ProtoNode(DeclarationId),
 	Network(NetworkId),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Network {
 	pub exports: Vec<ExportSlot>,
 	/// Per-network `ui::*` state (navigation, previewing). Separate from `Node.attributes` so
@@ -248,13 +248,13 @@ pub struct Network {
 
 /// One positional export slot. `target == None` marks an empty/removed slot. Timestamp drives LWW
 /// on concurrent `SetExport` ops.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExportSlot {
 	pub target: Option<NodeInput>,
 	pub timestamp: TimeStamp,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ProtoNode {
 	identifier: ProtoNodeId,
 	code: Option<String>,
@@ -262,18 +262,50 @@ struct ProtoNode {
 	attributes: Attributes,
 }
 
-#[derive(Clone, Debug)]
+/// Content-addressed delta: `id` is `blake3_128(parents, author, timestamp, delta_type)`.
+///
+/// `reverse` is state-dependent undo bookkeeping (it captures pre-state at the moment the forward
+/// op was applied), so it's serialized for storage but excluded from the identity hash — two peers
+/// observing the same forward delta against different local states would otherwise compute
+/// different Revs for the same logical op.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Delta {
-	timestamp: TimeStamp,
-	predecessor: Option<Rev>,
 	id: Rev,
+	parents: Vec<Rev>,
+	author: PeerId,
+	timestamp: TimeStamp,
 	delta_type: RegistryDelta,
 	reverse: RegistryDelta,
 }
 
+impl Delta {
+	fn new(parents: Vec<Rev>, author: PeerId, timestamp: TimeStamp, delta_type: RegistryDelta, reverse: RegistryDelta) -> Self {
+		let id = compute_rev(&parents, author, timestamp, &delta_type);
+		Self {
+			id,
+			parents,
+			author,
+			timestamp,
+			delta_type,
+			reverse,
+		}
+	}
+}
+
+/// Hash the identity-bearing fields of a `Delta` with blake3 and truncate to 128 bits.
+fn compute_rev(parents: &[Rev], author: PeerId, timestamp: TimeStamp, delta_type: &RegistryDelta) -> Rev {
+	let mut hasher = blake3::Hasher::new();
+	let bytes = postcard::to_stdvec(&(parents, author, timestamp, delta_type)).expect("Delta identity fields must serialize");
+	hasher.update(&bytes);
+	let digest = hasher.finalize();
+	let mut truncated = [0u8; 16];
+	truncated.copy_from_slice(&digest.as_bytes()[..16]);
+	Rev::from_le_bytes(truncated)
+}
+
 /// Op payload. Timestamps live on the wrapping `Delta` — one per delta, applied to all LWW-eligible
 /// writes within. See `notes/document-format-collaboration.md`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RegistryDelta {
 	AddNode {
 		node_id: NodeId,
@@ -321,7 +353,7 @@ pub enum RegistryDelta {
 }
 
 /// `value: None` means remove. The timestamp comes from the wrapping `Delta`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttributeDelta {
 	pub key: String,
 	pub value: Option<serde_json::Value>,
@@ -357,8 +389,8 @@ impl Document {
 	}
 
 	pub fn apply_delta(&mut self, delta: Delta) -> Result<(), CrdtError> {
-		if let Some(pred) = delta.predecessor {
-			assert!(self.history.contains_key(&pred));
+		for parent in &delta.parents {
+			assert!(self.history.contains_key(parent));
 		}
 
 		let timestamp = delta.timestamp;
@@ -555,7 +587,8 @@ impl<'a> Iterator for HistoryIter<'a> {
 
 	fn next(&mut self) -> Option<Self::Item> {
 		let delta = self.document.history.get(&self.parent_rev)?;
-		self.parent_rev = delta.predecessor?;
+		// First parent only for now. Local-chain walking (filter by author) is a follow-up.
+		self.parent_rev = *delta.parents.first()?;
 		Some(delta)
 	}
 }
