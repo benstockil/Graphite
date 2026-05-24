@@ -5,8 +5,6 @@
 //! directly) because several trait method names collide with inherent methods, and Rust silently
 //! resolves bare calls to the inherent ones.
 
-#![expect(dead_code, reason = "WIP: storage round-trip not yet wired into the editor's save/load path")]
-
 use std::collections::HashMap;
 
 use glam::IVec2;
@@ -305,7 +303,7 @@ fn input_metadata_entry_to_runtime(entry: InputMetadataEntry) -> InputMetadata {
 mod tests {
 	use std::collections::HashMap;
 
-	use graph_storage::{NodeMetadataSource, Registry};
+	use graph_storage::{NodeMetadataSource, PeerId, Registry};
 
 	use super::*;
 	use crate::messages::portfolio::document::document_message_handler::DocumentMessageHandler;
@@ -350,7 +348,7 @@ mod tests {
 
 		let network = interface.document_network().clone();
 
-		let registry = Registry::from_runtime_with_metadata(&network, &source).expect("from_runtime_with_metadata failed");
+		let registry = Registry::from_runtime_with_metadata(&network, &source, PeerId(0)).expect("from_runtime_with_metadata failed");
 
 		let (_converted_network, entries) = registry.to_runtime_with_metadata().expect("to_runtime_with_metadata failed");
 
@@ -477,7 +475,7 @@ mod tests {
 		let original_view = StorageMetadataView::new(original);
 
 		let network = original.document_network().clone();
-		let registry = Registry::from_runtime_with_metadata(&network, &original_view).expect("from_runtime_with_metadata failed");
+		let registry = Registry::from_runtime_with_metadata(&network, &original_view, PeerId(0)).expect("from_runtime_with_metadata failed");
 		let (rebuilt_network, node_entries, network_entries) = registry.to_runtime_with_full_metadata().expect("to_runtime_with_full_metadata failed");
 
 		let rebuilt = build_interface_from_storage(rebuilt_network, node_entries, network_entries).expect("build_interface_from_storage failed");

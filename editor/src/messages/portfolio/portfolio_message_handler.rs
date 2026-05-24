@@ -203,7 +203,8 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 				responses.add(PortfolioMessage::GarbageCollectResources);
 			}
 			PortfolioMessage::AutoSaveDocument { document_id } => {
-				let Some(document) = self.document(document_id) else { return };
+				let Some(document) = self.document_mut(document_id) else { return };
+				document.commit_storage_snapshot();
 				responses.add(PersistentStateMessage::WriteDocument {
 					document_id,
 					document: document.serialize_document(),

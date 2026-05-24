@@ -11,6 +11,8 @@ pub mod to_runtime;
 pub use metadata_source::{InputMetadataEntry, NetworkMetadataEntry, NoMetadata, NodeMetadataEntry, NodeMetadataSource};
 
 #[cfg(test)]
+mod crdt_tests;
+#[cfg(test)]
 mod round_trip_tests;
 
 /// Attribute keys. Glob-import (`use crate::attr::*`) at conversion sites.
@@ -89,16 +91,99 @@ struct Document {
 	/// Commits after this can be rewritten silently; commits at or before this are published
 	/// and require forward reverse-delta ops to undo. `None` means nothing broadcast yet.
 	last_broadcast_rev: Option<Rev>,
+	/// Shared-monotonic counter feeding `next_node_id`. Bumped on every mint regardless of which
+	/// peer is calling; collision avoidance comes from hashing `(self.peer, counter)`, so two peers
+	/// reading the same counter still produce distinct IDs.
+	next_node_counter: u64,
 }
 
 /// A live editing session over a `Document`. Owns the document plus runtime collaboration
 /// state that isn't persisted (currently just peer heartbeat tracking).
 #[derive(Clone, Debug)]
-struct Session {
+pub struct Session {
 	document: Document,
 	/// Each peer's `retirement_tip` as reported by their most recent heartbeat. Drives
 	/// leader-eligibility computation (lowest PeerId among peers whose tip matches the session max).
 	remote_tips: HashMap<PeerId, Rev>,
+}
+
+impl Session {
+	/// Mints a fresh `PeerId` from the process-wide UUID generator and wraps an empty `Document`.
+	/// Two peers in the same process will collide (the generator is seeded once); use `with_peer`
+	/// in tests where determinism matters.
+	pub fn new() -> Self {
+		Self::with_peer(PeerId(core_types::uuid::generate_uuid()))
+	}
+
+	/// Construct a session bound to a specific `PeerId`. Used by tests; production code wants
+	/// `Session::new`.
+	pub fn with_peer(peer: PeerId) -> Self {
+		Self {
+			document: Document {
+				registry: Registry::default(),
+				history: HashMap::new(),
+				hot_log: Vec::new(),
+				head: 0,
+				clock: LamportClock::new(peer),
+				peer,
+				last_broadcast_rev: None,
+				next_node_counter: 0,
+			},
+			remote_tips: HashMap::new(),
+		}
+	}
+
+	pub fn peer(&self) -> PeerId {
+		self.document.peer
+	}
+
+	pub fn registry(&self) -> &Registry {
+		&self.document.registry
+	}
+
+	/// Diff the current registry against a fresh conversion of `network`, then commit each emitted
+	/// op as its own `Delta` on the local chain. One `clock.tick()` per op (strictly causal within
+	/// a commit). Returns the new `Rev`s in commit order, empty if nothing changed.
+	pub fn commit_from_runtime<M: NodeMetadataSource>(&mut self, network: &graph_craft::document::NodeNetwork, metadata: &M) -> Result<Vec<Rev>, CommitError> {
+		let target = Registry::from_runtime_with_metadata(network, metadata, self.document.peer)?;
+		let ops = crate::delta::compute_deltas(&self.document.registry, &target);
+
+		let mut produced = Vec::with_capacity(ops.len());
+		for op in ops {
+			let reverse = self.document.compute_reverse_delta(&op)?;
+			let timestamp = self.document.clock.tick();
+			let parents = if self.document.head == 0 { Vec::new() } else { vec![self.document.head] };
+			let author = self.document.peer;
+
+			let delta = Delta::new(parents, author, timestamp, op, reverse);
+			let rev = delta.id;
+
+			for parent in &delta.parents {
+				assert!(self.document.history.contains_key(parent), "commit parent must be in history");
+			}
+			self.document.apply_op(delta.delta_type.clone(), delta.timestamp, false)?;
+			self.document.history.insert(rev, delta);
+			self.document.head = rev;
+			produced.push(rev);
+		}
+
+		Ok(produced)
+	}
+}
+
+/// Errors from `Session::commit_from_runtime`.
+#[derive(Debug, thiserror::Error)]
+pub enum CommitError {
+	#[error("Failed to convert runtime network: {0}")]
+	Conversion(#[from] from_runtime::ConversionError),
+	#[error("Failed to apply commit: {0}")]
+	Crdt(#[from] CrdtError),
+}
+
+impl Default for Session {
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 /// One live op in the hot zone. Carries only enough to drive live LWW; no parents (transient),
@@ -329,6 +414,16 @@ impl Delta {
 	}
 }
 
+/// Hash `(peer, counter)` with blake3 and truncate to 64 bits to mint a peer-scoped `NodeId`.
+/// Two peers reading the same counter still produce distinct IDs because the peer is in the hash.
+fn mint_node_id(peer: PeerId, counter: u64) -> NodeId {
+	let bytes = postcard::to_stdvec(&(peer, counter)).expect("(PeerId, counter) must serialize");
+	let digest = blake3::hash(&bytes);
+	let mut truncated = [0u8; 8];
+	truncated.copy_from_slice(&digest.as_bytes()[..8]);
+	NodeId::from_le_bytes(truncated)
+}
+
 /// Hash the identity-bearing fields of a `Delta` with blake3 and truncate to 128 bits.
 fn compute_rev(parents: &[Rev], author: PeerId, timestamp: TimeStamp, delta_type: &RegistryDelta) -> Rev {
 	let mut hasher = blake3::Hasher::new();
@@ -404,6 +499,13 @@ pub struct AttributeDelta {
 }
 
 impl Document {
+	/// Mint a fresh `NodeId` scoped to this document's peer. The 64-bit ID is `blake3(peer, counter)`
+	/// truncated; the counter is shared across peers and persisted with the document.
+	pub fn next_node_id(&mut self) -> NodeId {
+		self.next_node_counter += 1;
+		mint_node_id(self.peer, self.next_node_counter)
+	}
+
 	pub fn restore_node_from_history(&mut self, old_node_id: NodeId) -> Result<(), CrdtError> {
 		let delta = self
 			.history_iter()
@@ -460,6 +562,10 @@ impl Document {
 	}
 
 	fn apply_op(&mut self, op: RegistryDelta, timestamp: TimeStamp, idempotent: bool) -> Result<(), CrdtError> {
+		// Advance the local clock past every observed op, including ones that subsequently no-op or
+		// error. Observation is about causality knowledge, not about whether the op took effect.
+		self.clock.observe(timestamp);
+
 		match op {
 			RegistryDelta::AddNode { node_id, node } => {
 				if self.registry.node_instances.contains_key(&node_id) {
@@ -676,13 +782,21 @@ impl<'a> Iterator for HistoryIter<'a> {
 	}
 }
 
-enum CrdtError {
+#[derive(Debug, thiserror::Error)]
+pub enum CrdtError {
+	#[error("Target node does not exist")]
 	TargetNodeDoesNotExist,
+	#[error("Network does not exist")]
 	NetworkDoesNotExist,
+	#[error("Input index out of bounds")]
 	InputIndexOutOfBounds,
+	#[error("Delta not found in history")]
 	NotFoundInHistory,
+	#[error("Node already exists")]
 	NodeAlreadyExists,
+	#[error("Network already exists")]
 	NetworkAlreadyExists,
 	/// PeerId is already registered to a different UserId.
+	#[error("Peer is already registered to a different user")]
 	PeerRegistrationConflict,
 }

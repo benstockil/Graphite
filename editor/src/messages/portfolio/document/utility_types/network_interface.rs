@@ -1,7 +1,7 @@
 mod deserialization;
 mod memo_network;
 mod resolved_types;
-mod storage_metadata;
+pub mod storage_metadata;
 
 use super::document_metadata::{DocumentMetadata, LayerNodeIdentifier, NodeRelations};
 use super::misc::PTZ;

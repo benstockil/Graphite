@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::attr::*;
 use crate::metadata_source::{NoMetadata, NodeMetadataSource};
-use crate::{AttributesExt, DeclarationId, ExportSlot, Implementation, InputSlot, Network, NetworkId, Node, NodeId, NodeInput, Position, ProtoNode, ROOT_NETWORK, Registry, TimeStamp};
+use crate::{AttributesExt, DeclarationId, ExportSlot, Implementation, InputSlot, Network, NetworkId, Node, NodeId, NodeInput, PeerId, Position, ProtoNode, ROOT_NETWORK, Registry, TimeStamp};
 
 fn map_serialization_error(key: &str) -> impl FnOnce(serde_json::Error) -> ConversionError + '_ {
 	move |e| ConversionError::SerializationError(format!("{key}: {e:?}"))
@@ -19,9 +19,10 @@ fn map_serialization_error(key: &str) -> impl FnOnce(serde_json::Error) -> Conve
 
 /// Path to a node, used to mint stable global IDs by hashing.
 ///
-/// Root-network entries are empty (`path == []`) and keep their original local ID. Hashing uses
-/// blake3 truncated to 64 bits for cross-run determinism. Used by the initial `from_runtime`
-/// conversion; once peer-scoped ID issuance lands, `AddNode` ops mint IDs directly without hashing.
+/// Hashing uses blake3 truncated to 64 bits with the document's `PeerId` mixed in, so two peers
+/// converting runtime states that happen to share local IDs (e.g. both editors seeded the same
+/// UUID RNG) still produce distinct global IDs. Determinism: same `(peer, path, local_id)` always
+/// yields the same global ID, so a peer re-converting its own runtime state preserves IDs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct NodePath {
 	path: Vec<(NodeId, NetworkId)>,
@@ -39,11 +40,8 @@ impl NodePath {
 		Self { path, local_id }
 	}
 
-	fn to_global_id(&self) -> NodeId {
-		if self.path.is_empty() {
-			return self.local_id;
-		}
-		let bytes = postcard::to_stdvec(self).expect("NodePath must serialize");
+	fn to_global_id(&self, peer: PeerId) -> NodeId {
+		let bytes = postcard::to_stdvec(&(peer, self)).expect("NodePath must serialize");
 		let digest = blake3::hash(&bytes);
 		let mut truncated = [0u8; 8];
 		truncated.copy_from_slice(&digest.as_bytes()[..8]);
@@ -66,19 +64,22 @@ pub enum ConversionError {
 impl TryFrom<&NodeNetwork> for Registry {
 	type Error = ConversionError;
 
+	/// Test/utility entry point: scopes IDs under `PeerId(0)`. Real editor conversions go through
+	/// `from_runtime_with_metadata` and pass the document's actual peer.
 	fn try_from(node_network: &NodeNetwork) -> Result<Self, Self::Error> {
-		Registry::from_runtime_with_metadata(node_network, &NoMetadata)
+		Registry::from_runtime_with_metadata(node_network, &NoMetadata, PeerId(0))
 	}
 }
 
 impl Registry {
-	pub fn from_runtime_with_metadata<M: NodeMetadataSource>(node_network: &NodeNetwork, metadata: &M) -> Result<Self, ConversionError> {
+	pub fn from_runtime_with_metadata<M: NodeMetadataSource>(node_network: &NodeNetwork, metadata: &M, peer: PeerId) -> Result<Self, ConversionError> {
 		let mut registry = Registry::default();
 		let mut ctx = ConversionContext {
 			next_network_id: ROOT_NETWORK + 1,
 			next_decl_id: 0,
 			proto_node_map: HashMap::new(),
 			metadata,
+			peer,
 		};
 
 		convert_network(node_network, ROOT_NETWORK, None, &[], &mut registry, &mut ctx)?;
@@ -92,6 +93,7 @@ struct ConversionContext<'m, M: NodeMetadataSource + ?Sized> {
 	next_decl_id: DeclarationId,
 	proto_node_map: HashMap<String, DeclarationId>,
 	metadata: &'m M,
+	peer: PeerId,
 }
 
 fn convert_network<M: NodeMetadataSource + ?Sized>(
@@ -105,7 +107,7 @@ fn convert_network<M: NodeMetadataSource + ?Sized>(
 	for (runtime_node_id, doc_node) in &node_network.nodes {
 		let local_id = runtime_node_id.0;
 		let node_path = child_path(parent_path, network_id, local_id);
-		let global_id = node_path.to_global_id();
+		let global_id = node_path.to_global_id(ctx.peer);
 
 		let mut node = convert_node(doc_node, local_id, network_id, parent_path, metadata_path, *runtime_node_id, registry, ctx)?;
 		node.attributes.set(ORIGINAL_NODE_ID, serde_json::json!(local_id), TimeStamp::ORIGIN);
@@ -117,7 +119,7 @@ fn convert_network<M: NodeMetadataSource + ?Sized>(
 		.iter()
 		.map(|export| {
 			Ok(ExportSlot {
-				target: Some(convert_input(export, parent_path, network_id)?),
+				target: Some(convert_input(export, parent_path, network_id, ctx.peer)?),
 				timestamp: TimeStamp::ORIGIN,
 			})
 		})
@@ -156,7 +158,7 @@ fn convert_node<M: NodeMetadataSource + ?Sized>(
 	let mut inputs_attributes = Vec::with_capacity(doc_node.inputs.len());
 	for (input_index, input) in doc_node.inputs.iter().enumerate() {
 		inputs.push(InputSlot {
-			input: convert_input(input, parent_path, network_id)?,
+			input: convert_input(input, parent_path, network_id, ctx.peer)?,
 			timestamp,
 		});
 
@@ -290,10 +292,10 @@ fn write_ui_input_attributes<M: NodeMetadataSource + ?Sized>(
 	Ok(())
 }
 
-fn convert_input(input: &GraphCraftNodeInput, parent_path: Option<&NodePath>, network_id: NetworkId) -> Result<NodeInput, ConversionError> {
+fn convert_input(input: &GraphCraftNodeInput, parent_path: Option<&NodePath>, network_id: NetworkId, peer: PeerId) -> Result<NodeInput, ConversionError> {
 	Ok(match input {
 		GraphCraftNodeInput::Node { node_id, output_index } => NodeInput::Node {
-			node_id: child_path(parent_path, network_id, node_id.0).to_global_id(),
+			node_id: child_path(parent_path, network_id, node_id.0).to_global_id(peer),
 			output_index: *output_index,
 		},
 		GraphCraftNodeInput::Value { tagged_value, exposed } => {

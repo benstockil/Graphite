@@ -7,7 +7,7 @@ use graph_craft::document::{DocumentNode, DocumentNodeImplementation, NodeInput,
 use graph_craft::graphene_compiler::Compiler;
 use graph_craft::{ProtoNodeIdentifier, Type, concrete};
 
-use crate::{NodeMetadataSource, Position, Registry};
+use crate::{NodeMetadataSource, PeerId, Position, Registry};
 
 /// Helper function to verify a NodeNetwork can be compiled successfully.
 /// Note: This only works for complete networks with all inputs resolved.
@@ -445,7 +445,7 @@ fn test_ui_metadata_round_trip() {
 		},
 	);
 
-	let registry = Registry::from_runtime_with_metadata(&network, &metadata).expect("Failed to convert to Registry with metadata");
+	let registry = Registry::from_runtime_with_metadata(&network, &metadata, PeerId(0)).expect("Failed to convert to Registry with metadata");
 
 	let (converted, entries) = registry.to_runtime_with_metadata().expect("Failed to convert Registry back with metadata");
 

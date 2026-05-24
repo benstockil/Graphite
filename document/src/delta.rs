@@ -35,8 +35,11 @@ pub fn compute_deltas(from: &Registry, to: &Registry) -> Vec<RegistryDelta> {
 			continue;
 		}
 
+		// Compare by value, ignoring the per-slot timestamp. Timestamps are derived from the diff
+		// (assigned by the caller via clock.tick), not part of the diff itself: a slot whose value
+		// is unchanged but whose timestamp differs should not emit a delta.
 		for (input_idx, (from_slot, to_slot)) in from_node.inputs.iter().zip(&to_node.inputs).enumerate() {
-			if from_slot != to_slot {
+			if from_slot.input != to_slot.input {
 				deltas.push(RegistryDelta::ChangeNodeInput {
 					node_id,
 					input_idx,
@@ -82,12 +85,13 @@ pub fn compute_deltas(from: &Registry, to: &Registry) -> Vec<RegistryDelta> {
 			let from_slot = from_network.exports.get(slot_idx);
 			let to_slot = to_network.exports.get(slot_idx);
 
-			if from_slot != to_slot {
-				let target = to_slot.and_then(|s| s.target.clone());
+			let from_target = from_slot.and_then(|s| s.target.as_ref());
+			let to_target = to_slot.and_then(|s| s.target.as_ref());
+			if from_target != to_target {
 				deltas.push(RegistryDelta::SetExport {
 					network: network_id,
 					slot: slot_idx as u32,
-					target,
+					target: to_target.cloned(),
 				});
 			}
 		}
@@ -114,8 +118,9 @@ fn compute_attribute_deltas(from: &crate::Attributes, to: &crate::Attributes) ->
 		}
 	}
 
+	// Compare by `value` only; the per-entry `timestamp` is derived from the diff, not part of it.
 	for (key, to_value) in to {
-		if from.get(key).is_none_or(|from_value| from_value != to_value) {
+		if from.get(key).is_none_or(|from_value| from_value.value != to_value.value) {
 			deltas.push(AttributeDelta {
 				key: key.clone(),
 				value: Some(to_value.value.clone()),

@@ -90,6 +90,12 @@ pub struct DocumentMessageHandler {
 	/// Resources embedded in the document.
 	#[serde(default, skip_serializing_if = "ResourceMessageHandler::is_empty")]
 	pub resources: ResourceMessageHandler,
+	/// Shadow CRDT representation of the document. Populated by `commit_from_runtime` at autosave
+	/// boundaries; not persisted yet (storage history is reconstructed by replaying the runtime
+	/// state into a fresh `Session` on load). The peer identity is therefore re-minted each
+	/// session, which is the wrong long-term behaviour — see WP3 PeerId-persistence in the TODO.
+	#[serde(skip, default = "graph_storage::Session::new")]
+	pub storage: graph_storage::Session,
 	/// Tracks which layer occurrences are collapsed in the Layers panel, keyed by tree path.
 	#[serde(deserialize_with = "deserialize_collapsed_layers", default)]
 	pub collapsed: CollapsedLayers,
@@ -166,6 +172,7 @@ impl Default for DocumentMessageHandler {
 			// ============================================
 			network_interface: default_document_network_interface(),
 			resources: ResourceMessageHandler::default(),
+			storage: graph_storage::Session::new(),
 			collapsed: CollapsedLayers::default(),
 			commit_hash: GRAPHITE_GIT_COMMIT_HASH.to_string(),
 			document_ptz: PTZ::default(),
@@ -1792,6 +1799,17 @@ impl DocumentMessageHandler {
 	/// Empty when the selection lives in the root document network.
 	pub fn selection_network_path(&self) -> &[NodeId] {
 		&self.selection_network_path
+	}
+
+	/// Diff the runtime network into the shadow `Session` at autosave boundaries.
+	pub fn commit_storage_snapshot(&mut self) {
+		use crate::messages::portfolio::document::utility_types::network_interface::storage_metadata::StorageMetadataView;
+
+		let network = self.network_interface.document_network().clone();
+		let view = StorageMetadataView::new(&self.network_interface);
+		if let Err(error) = self.storage.commit_from_runtime(&network, &view) {
+			log::error!("Storage snapshot commit failed: {error}");
+		}
 	}
 
 	pub fn serialize_document(&self) -> String {
