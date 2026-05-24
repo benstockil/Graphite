@@ -526,9 +526,14 @@ impl Document {
 		self.revert_delta(delta)
 	}
 
+	/// Apply a delta's `reverse` as the new forward op. Idempotent on structural ops: a revert
+	/// whose target state already holds is a no-op.
 	pub fn revert_delta(&mut self, mut delta: Delta) -> Result<(), CrdtError> {
 		std::mem::swap(&mut delta.delta_type, &mut delta.reverse);
-		self.apply_delta(delta)
+		for parent in &delta.parents {
+			assert!(self.history.contains_key(parent));
+		}
+		self.apply_op(delta.delta_type, delta.timestamp, true)
 	}
 
 	pub fn apply_delta(&mut self, delta: Delta) -> Result<(), CrdtError> {

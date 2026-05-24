@@ -191,6 +191,42 @@ fn add_node_resurrects_owning_network() {
 	assert!(document.registry.node_instances.contains_key(&node_id), "the node itself should also be present");
 }
 
+/// Reverting the same removal twice (the moral equivalent of two peers concurrently resurrecting
+/// the same node) must not error on the second apply. Today the second revert hits
+/// `apply_op(AddNode, false)` against a present node and returns `NodeAlreadyExists`.
+#[test]
+fn concurrent_resurrection_via_revert_is_idempotent() {
+	use crate::{Implementation, Node};
+
+	let mut document = fresh_document(PeerId(1));
+	let network_id = 7;
+	let node_id = 42;
+
+	commit_op(
+		&mut document,
+		RegistryDelta::AddNetwork {
+			network: network_id,
+			contents: Network::default(),
+		},
+	);
+	let node = Node {
+		implementation: Implementation::ProtoNode(1),
+		inputs: Vec::new(),
+		inputs_attributes: Vec::new(),
+		attributes: std::collections::HashMap::new(),
+		network: network_id,
+	};
+	commit_op(&mut document, RegistryDelta::AddNode { node_id, node });
+	commit_op(&mut document, RegistryDelta::RemoveNode { node_id });
+	assert!(!document.registry.node_instances.contains_key(&node_id), "node should be removed before the resurrection test");
+
+	document.restore_node_from_history(node_id).expect("first resurrection should succeed");
+	assert!(document.registry.node_instances.contains_key(&node_id), "first resurrection should bring the node back");
+
+	let second = document.restore_node_from_history(node_id);
+	assert!(second.is_ok(), "second resurrection of an already-present node should be a no-op, got {second:?}");
+}
+
 /// Erroring ops still bump the clock: we observed the timestamp on the wire, the fact that the
 /// op was rejected locally doesn't unobserve it.
 #[test]
