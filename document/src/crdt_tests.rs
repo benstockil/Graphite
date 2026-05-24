@@ -3,7 +3,7 @@ use graph_craft::concrete;
 use graph_craft::document::{DocumentNode, DocumentNodeImplementation, NodeInput, NodeNetwork};
 use graph_craft::{ProtoNodeIdentifier, Type};
 
-use crate::{Document, HotOp, NoMetadata, NodeId, PeerId, RegistryDelta, Session, TimeStamp};
+use crate::{Delta, Document, HotOp, Network, NoMetadata, NodeId, PeerId, RegistryDelta, Session, TimeStamp};
 
 fn fresh_document(peer: PeerId) -> Document {
 	Session::with_peer(peer).document
@@ -11,6 +11,18 @@ fn fresh_document(peer: PeerId) -> Document {
 
 fn remove_node_op(node_id: NodeId) -> RegistryDelta {
 	RegistryDelta::RemoveNode { node_id }
+}
+
+/// Commit a single op to a document as a retired delta. Mints a fresh timestamp, links to
+/// current head, applies, records in history, advances head.
+fn commit_op(document: &mut Document, op: RegistryDelta) {
+	let reverse = document.compute_reverse_delta(&op).expect("compute_reverse_delta failed");
+	let timestamp = document.clock.tick();
+	let parents = if document.head == 0 { Vec::new() } else { vec![document.head] };
+	let delta = Delta::new(parents, document.peer, timestamp, op, reverse);
+	let rev = delta.id;
+	document.apply_retired_delta(delta).expect("apply_retired_delta failed");
+	document.head = rev;
 }
 
 /// Every applied op must advance the local clock past the op's timestamp, so any subsequent
@@ -103,6 +115,80 @@ fn commit_from_runtime_is_idempotent_for_unchanged_network() {
 
 	let second = session.commit_from_runtime(&network, &NoMetadata).expect("second commit failed");
 	assert_eq!(second.len(), 0, "second commit of unchanged network produced {} spurious deltas: {:?}", second.len(), second);
+}
+
+/// A SetExport against a removed network must restore the network from history rather than error.
+#[test]
+fn set_export_resurrects_absent_network() {
+	let mut document = fresh_document(PeerId(1));
+	let network_id = 7;
+
+	commit_op(
+		&mut document,
+		RegistryDelta::AddNetwork {
+			network: network_id,
+			contents: Network::default(),
+		},
+	);
+	commit_op(
+		&mut document,
+		RegistryDelta::RemoveNetwork {
+			network: network_id,
+			snapshot: Network::default(),
+		},
+	);
+	assert!(!document.registry.networks.contains_key(&network_id), "network should be removed before the resurrection test");
+
+	commit_op(
+		&mut document,
+		RegistryDelta::SetExport {
+			network: network_id,
+			slot: 0,
+			target: None,
+		},
+	);
+
+	assert!(document.registry.networks.contains_key(&network_id), "SetExport should have resurrected the network");
+}
+
+/// Cascading resurrection: bringing a node back must also restore its owning network when absent.
+#[test]
+fn add_node_resurrects_owning_network() {
+	use crate::{Implementation, Node};
+
+	let mut document = fresh_document(PeerId(1));
+	let network_id = 7;
+	let node_id = 42;
+
+	commit_op(
+		&mut document,
+		RegistryDelta::AddNetwork {
+			network: network_id,
+			contents: Network::default(),
+		},
+	);
+	commit_op(
+		&mut document,
+		RegistryDelta::RemoveNetwork {
+			network: network_id,
+			snapshot: Network::default(),
+		},
+	);
+
+	let node = Node {
+		implementation: Implementation::ProtoNode(1),
+		inputs: Vec::new(),
+		inputs_attributes: Vec::new(),
+		attributes: std::collections::HashMap::new(),
+		network: network_id,
+	};
+	commit_op(&mut document, RegistryDelta::AddNode { node_id, node });
+
+	assert!(
+		document.registry.networks.contains_key(&network_id),
+		"AddNode should have cascaded a resurrection of the owning network"
+	);
+	assert!(document.registry.node_instances.contains_key(&node_id), "the node itself should also be present");
 }
 
 /// Erroring ops still bump the clock: we observed the timestamp on the wire, the fact that the

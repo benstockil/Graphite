@@ -516,14 +516,11 @@ impl Document {
 	}
 
 	pub fn restore_network_from_history(&mut self, network_id: NetworkId) -> Result<(), CrdtError> {
+		// Find the Delta whose forward op removed this network. Its `reverse` is `AddNetwork`,
+		// which is what we want to re-apply.
 		let delta = self
 			.history_iter()
-			.find(|d| {
-				matches!(&d.reverse,
-					RegistryDelta::SetExport { network, .. }
-					| RegistryDelta::AddNetwork { network, .. }
-					| RegistryDelta::RemoveNetwork { network, .. } if *network == network_id)
-			})
+			.find(|d| matches!(&d.reverse, RegistryDelta::AddNetwork { network, .. } if *network == network_id))
 			.ok_or(CrdtError::NotFoundInHistory)?
 			.clone();
 		self.revert_delta(delta)
@@ -575,6 +572,8 @@ impl Document {
 					}
 					return Err(CrdtError::NodeAlreadyExists);
 				}
+				// Cascading resurrection: if the node's owning network is gone, restore it first.
+				self.ensure_network_exists(node.network)?;
 				self.registry.node_instances.insert(node_id, node);
 			}
 			RegistryDelta::RemoveNode { node_id } => {
@@ -606,6 +605,11 @@ impl Document {
 				apply_attribute_delta(delta, timestamp, input_attributes);
 			}
 			RegistryDelta::SetExport { network, slot, target } => {
+				if let Some(NodeInput::Node { node_id: referenced, .. }) = &target {
+					self.ensure_node_exists(*referenced)?;
+				}
+				self.ensure_network_exists(network)?;
+
 				let net = self.registry.networks.get_mut(&network).ok_or(CrdtError::NetworkDoesNotExist)?;
 				let slot_idx = slot as usize;
 
@@ -671,6 +675,13 @@ impl Document {
 		Ok(())
 	}
 
+	fn ensure_network_exists(&mut self, network_id: NetworkId) -> Result<(), CrdtError> {
+		if !self.registry.networks.contains_key(&network_id) {
+			self.restore_network_from_history(network_id)?;
+		}
+		Ok(())
+	}
+
 	fn compute_reverse_delta(&self, delta: &RegistryDelta) -> Result<RegistryDelta, CrdtError> {
 		Ok(match delta {
 			&RegistryDelta::AddNode { node_id, .. } => RegistryDelta::RemoveNode { node_id },
@@ -704,8 +715,9 @@ impl Document {
 				}
 			}
 			&RegistryDelta::SetExport { network, slot, .. } => {
-				let net = self.registry.networks.get(&network).ok_or(CrdtError::NetworkDoesNotExist)?;
-				let target = net.exports.get(slot as usize).and_then(|s| s.target.clone());
+				// If the network is absent the forward op will resurrect it; the reverse is "set the export to None"
+				// since pre-forward there was no export to point at.
+				let target = self.registry.networks.get(&network).and_then(|net| net.exports.get(slot as usize)).and_then(|s| s.target.clone());
 				RegistryDelta::SetExport { network, slot, target }
 			}
 			RegistryDelta::AddNetwork { network, contents } => RegistryDelta::RemoveNetwork {
@@ -725,6 +737,7 @@ impl Document {
 		})
 	}
 
+	/// Retired-only walk from `head` along first parents. Hot ops are excluded by design.
 	fn history_iter(&self) -> HistoryIter<'_> {
 		HistoryIter {
 			document: self,

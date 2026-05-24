@@ -9,6 +9,17 @@ use crate::{AttributeDelta, ExportSlot, NetworkId, Node, NodeId, NodeInput, Regi
 pub fn compute_deltas(from: &Registry, to: &Registry) -> Vec<RegistryDelta> {
 	let mut deltas = Vec::new();
 
+	let from_network_ids: HashSet<NetworkId> = from.networks.keys().copied().collect();
+	let to_network_ids: HashSet<NetworkId> = to.networks.keys().copied().collect();
+
+	// AddNetwork before any AddNode that references it.
+	for &network_id in to_network_ids.difference(&from_network_ids) {
+		deltas.push(RegistryDelta::AddNetwork {
+			network: network_id,
+			contents: to.networks[&network_id].clone(),
+		});
+	}
+
 	let from_node_ids: HashSet<NodeId> = from.node_instances.keys().copied().collect();
 	let to_node_ids: HashSet<NodeId> = to.node_instances.keys().copied().collect();
 
@@ -59,20 +70,10 @@ pub fn compute_deltas(from: &Registry, to: &Registry) -> Vec<RegistryDelta> {
 		}
 	}
 
-	let from_network_ids: HashSet<NetworkId> = from.networks.keys().copied().collect();
-	let to_network_ids: HashSet<NetworkId> = to.networks.keys().copied().collect();
-
 	for &network_id in from_network_ids.difference(&to_network_ids) {
 		deltas.push(RegistryDelta::RemoveNetwork {
 			network: network_id,
 			snapshot: from.networks[&network_id].clone(),
-		});
-	}
-
-	for &network_id in to_network_ids.difference(&from_network_ids) {
-		deltas.push(RegistryDelta::AddNetwork {
-			network: network_id,
-			contents: to.networks[&network_id].clone(),
 		});
 	}
 
