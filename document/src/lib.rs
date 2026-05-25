@@ -63,7 +63,7 @@ pub enum Position {
 /// Root network ID. The renderable graph lives in `networks[&ROOT_NETWORK]`.
 pub const ROOT_NETWORK: NetworkId = 0;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Registry {
 	node_declarations: HashMap<DeclarationId, ProtoNode>,
 	pub node_instances: HashMap<NodeId, Node>,
@@ -76,6 +76,130 @@ pub struct Registry {
 	pub peer_users: HashMap<PeerId, UserId>,
 	pub attributes: Attributes,
 }
+
+impl Registry {
+	pub fn declaration_ids(&self) -> impl Iterator<Item = DeclarationId> + '_ {
+		self.node_declarations.keys().copied()
+	}
+
+	/// True if both registries agree on every value-bearing field, ignoring per-slot and
+	/// per-attribute timestamps. Mirrors `compute_deltas`'s value-only semantics, so unchanged
+	/// state at a stamped slot doesn't count as drift.
+	pub fn value_equal(&self, other: &Self) -> bool {
+		if self.node_declarations != other.node_declarations {
+			return false;
+		}
+		if self.exported_nodes != other.exported_nodes {
+			return false;
+		}
+		if self.peer_users != other.peer_users {
+			return false;
+		}
+		if !attributes_value_equal(&self.attributes, &other.attributes) {
+			return false;
+		}
+
+		if self.node_instances.len() != other.node_instances.len() {
+			return false;
+		}
+		for (id, node) in &self.node_instances {
+			let Some(other_node) = other.node_instances.get(id) else { return false };
+			if !node.value_equal(other_node) {
+				return false;
+			}
+		}
+
+		if self.networks.len() != other.networks.len() {
+			return false;
+		}
+		for (id, network) in &self.networks {
+			let Some(other_network) = other.networks.get(id) else { return false };
+			if !network.value_equal(other_network) {
+				return false;
+			}
+		}
+
+		true
+	}
+
+	/// True if the relative timestamp order on every shared timestamped slot agrees across
+	/// the two registries. Catches LWW-bookkeeping bugs that `value_equal` deliberately ignores.
+	///
+	/// For every pair of shared keys (a, b), checks that `self[a].cmp(self[b])` and
+	/// `other[a].cmp(other[b])` are compatible: `Equal` on either side is always compatible;
+	/// otherwise both sides must agree on direction. Equality on one side imposes no order, so
+	/// a registry with all-equal timestamps trivially passes against any other.
+	///
+	/// Slots present in only one registry are skipped. O(N²) in the number of shared timestamped
+	/// slots; intended for debug-only use.
+	pub fn order_consistent(&self, other: &Self) -> bool {
+		let self_stamps = collect_timestamps(self);
+		let other_stamps = collect_timestamps(other);
+
+		let shared: Vec<(TimestampKey, TimeStamp, TimeStamp)> = self_stamps.into_iter().filter_map(|(key, ts)| other_stamps.get(&key).map(|other_ts| (key, ts, *other_ts))).collect();
+
+		for i in 0..shared.len() {
+			for j in (i + 1)..shared.len() {
+				let self_order = shared[i].1.cmp(&shared[j].1);
+				let other_order = shared[i].2.cmp(&shared[j].2);
+				use std::cmp::Ordering::*;
+				let compatible = matches!((self_order, other_order), (Equal, _) | (_, Equal) | (Less, Less) | (Greater, Greater));
+				if !compatible {
+					return false;
+				}
+			}
+		}
+		true
+	}
+}
+
+fn attributes_value_equal(a: &Attributes, b: &Attributes) -> bool {
+	if a.len() != b.len() {
+		return false;
+	}
+	a.iter().all(|(key, value)| b.get(key).is_some_and(|other| value.value == other.value))
+}
+
+/// Stable identity for any timestamped slot in a `Registry`. Used by `order_consistent`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum TimestampKey {
+	NodeInput(NodeId, usize),
+	NodeInputAttribute(NodeId, usize, String),
+	NodeAttribute(NodeId, String),
+	NetworkExport(NetworkId, usize),
+	NetworkAttribute(NetworkId, String),
+	DocumentAttribute(String),
+}
+
+fn collect_timestamps(registry: &Registry) -> HashMap<TimestampKey, TimeStamp> {
+	let mut out = HashMap::new();
+	for (node_id, node) in &registry.node_instances {
+		for (i, slot) in node.inputs.iter().enumerate() {
+			out.insert(TimestampKey::NodeInput(*node_id, i), slot.timestamp);
+		}
+		for (i, attrs) in node.inputs_attributes.iter().enumerate() {
+			for (key, value) in attrs {
+				out.insert(TimestampKey::NodeInputAttribute(*node_id, i, key.clone()), value.timestamp);
+			}
+		}
+		for (key, value) in &node.attributes {
+			out.insert(TimestampKey::NodeAttribute(*node_id, key.clone()), value.timestamp);
+		}
+	}
+	for (network_id, network) in &registry.networks {
+		for (i, slot) in network.exports.iter().enumerate() {
+			out.insert(TimestampKey::NetworkExport(*network_id, i), slot.timestamp);
+		}
+		for (key, value) in &network.attributes {
+			out.insert(TimestampKey::NetworkAttribute(*network_id, key.clone()), value.timestamp);
+		}
+	}
+	for (key, value) in &registry.attributes {
+		out.insert(TimestampKey::DocumentAttribute(key.clone()), value.timestamp);
+	}
+	out
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Document {
 	registry: Registry,
@@ -319,13 +443,51 @@ impl AttributesRead for Attributes {
 	}
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Node {
 	implementation: Implementation,
 	inputs: Vec<InputSlot>,
 	inputs_attributes: Vec<Attributes>,
 	attributes: Attributes,
 	network: NetworkId,
+}
+
+impl Node {
+	pub fn implementation(&self) -> &Implementation {
+		&self.implementation
+	}
+	pub fn inputs(&self) -> &[InputSlot] {
+		&self.inputs
+	}
+	pub fn inputs_attributes(&self) -> &[Attributes] {
+		&self.inputs_attributes
+	}
+	pub fn attributes(&self) -> &Attributes {
+		&self.attributes
+	}
+	pub fn network(&self) -> NetworkId {
+		self.network
+	}
+
+	/// True if both nodes agree on every value-bearing field, ignoring slot/attribute timestamps.
+	pub fn value_equal(&self, other: &Self) -> bool {
+		if self.implementation != other.implementation || self.network != other.network {
+			return false;
+		}
+		if self.inputs.len() != other.inputs.len() {
+			return false;
+		}
+		if !self.inputs.iter().zip(&other.inputs).all(|(a, b)| a.input == b.input) {
+			return false;
+		}
+		if self.inputs_attributes.len() != other.inputs_attributes.len() {
+			return false;
+		}
+		if !self.inputs_attributes.iter().zip(&other.inputs_attributes).all(|(a, b)| attributes_value_equal(a, b)) {
+			return false;
+		}
+		attributes_value_equal(&self.attributes, &other.attributes)
+	}
 }
 
 /// One positional input. The timestamp drives LWW on concurrent `ChangeNodeInput` ops targeting
@@ -360,12 +522,25 @@ pub enum Implementation {
 	Network(NetworkId),
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Network {
 	pub exports: Vec<ExportSlot>,
 	/// Per-network `ui::*` state (navigation, previewing). Separate from `Node.attributes` so
 	/// view-state edits LWW independently.
 	pub attributes: Attributes,
+}
+
+impl Network {
+	/// True if both networks agree on every value-bearing field, ignoring slot/attribute timestamps.
+	pub fn value_equal(&self, other: &Self) -> bool {
+		if self.exports.len() != other.exports.len() {
+			return false;
+		}
+		if !self.exports.iter().zip(&other.exports).all(|(a, b)| a.target == b.target) {
+			return false;
+		}
+		attributes_value_equal(&self.attributes, &other.attributes)
+	}
 }
 
 /// One positional export slot. `target == None` marks an empty/removed slot. Timestamp drives LWW
@@ -376,7 +551,7 @@ pub struct ExportSlot {
 	pub timestamp: TimeStamp,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct ProtoNode {
 	identifier: ProtoNodeId,
 	code: Option<String>,

@@ -1809,6 +1809,49 @@ impl DocumentMessageHandler {
 		let view = StorageMetadataView::new(&self.network_interface);
 		if let Err(error) = self.storage.commit_from_runtime(&network, &view) {
 			log::error!("Storage snapshot commit failed: {error}");
+			return;
+		}
+
+		#[cfg(debug_assertions)]
+		self.verify_storage_round_trip(&network, &view);
+	}
+
+	/// Debug-only: stored registry should equal a fresh `from_runtime`, and a `to_runtime` of the
+	/// stored registry should equal the original network. Logs on drift; never crashes autosave.
+	#[cfg(debug_assertions)]
+	fn verify_storage_round_trip(
+		&self,
+		network: &graph_craft::document::NodeNetwork,
+		view: &crate::messages::portfolio::document::utility_types::network_interface::storage_metadata::StorageMetadataView,
+	) {
+		let peer = self.storage.peer();
+
+		let target = match graph_storage::Registry::from_runtime_with_metadata(network, view, peer) {
+			Ok(target) => target,
+			Err(error) => {
+				log::error!("Storage round-trip verification: from_runtime failed: {error}");
+				return;
+			}
+		};
+
+		let stored = self.storage.registry();
+		if !stored.value_equal(&target) {
+			log::error!("Storage round-trip: registry value drift after commit\n{}", diff_registries(stored, &target));
+		}
+		if !stored.order_consistent(&target) {
+			log::error!("Storage round-trip: timestamp order inconsistent between stored and target");
+		}
+
+		let round_tripped = match stored.to_runtime_with_metadata() {
+			Ok((network, _entries)) => network,
+			Err(error) => {
+				log::error!("Storage round-trip verification: to_runtime failed: {error}");
+				return;
+			}
+		};
+
+		if &round_tripped != network {
+			log::error!("Storage round-trip: network drift after to_runtime\n{}", diff_networks(network, &round_tripped));
 		}
 	}
 
@@ -3500,6 +3543,211 @@ impl DocumentMessageHandler {
 		}
 		resources.into_iter().collect::<Vec<_>>().into_boxed_slice()
 	}
+}
+
+#[cfg(debug_assertions)]
+fn diff_registries(stored: &graph_storage::Registry, target: &graph_storage::Registry) -> String {
+	use std::fmt::Write;
+	let mut out = String::new();
+
+	let stored_node_ids: std::collections::BTreeSet<_> = stored.node_instances.keys().copied().collect();
+	let target_node_ids: std::collections::BTreeSet<_> = target.node_instances.keys().copied().collect();
+	let missing_nodes: Vec<_> = target_node_ids.difference(&stored_node_ids).collect();
+	let extra_nodes: Vec<_> = stored_node_ids.difference(&target_node_ids).collect();
+	let shared_node_diffs: Vec<_> = stored_node_ids
+		.intersection(&target_node_ids)
+		.filter(|id| !stored.node_instances[id].value_equal(&target.node_instances[id]))
+		.collect();
+
+	let stored_network_ids: std::collections::BTreeSet<_> = stored.networks.keys().copied().collect();
+	let target_network_ids: std::collections::BTreeSet<_> = target.networks.keys().copied().collect();
+	let missing_networks: Vec<_> = target_network_ids.difference(&stored_network_ids).collect();
+	let extra_networks: Vec<_> = stored_network_ids.difference(&target_network_ids).collect();
+	let shared_network_diffs: Vec<_> = stored_network_ids
+		.intersection(&target_network_ids)
+		.filter(|id| !stored.networks[id].value_equal(&target.networks[id]))
+		.collect();
+
+	let _ = writeln!(out, "  nodes:    stored={} target={}", stored_node_ids.len(), target_node_ids.len());
+	if !missing_nodes.is_empty() {
+		let _ = writeln!(out, "    missing from stored: {missing_nodes:?}");
+	}
+	if !extra_nodes.is_empty() {
+		let _ = writeln!(out, "    extra in stored:     {extra_nodes:?}");
+	}
+	if !shared_node_diffs.is_empty() {
+		let _ = writeln!(out, "    differing payloads:  {shared_node_diffs:?}");
+		for id in &shared_node_diffs {
+			let stored_node = &stored.node_instances[id];
+			let target_node = &target.node_instances[id];
+			let _ = writeln!(out, "      node {id}:");
+			diff_node(&mut out, stored_node, target_node);
+		}
+	}
+
+	let _ = writeln!(out, "  networks: stored={} target={}", stored_network_ids.len(), target_network_ids.len());
+	if !missing_networks.is_empty() {
+		let _ = writeln!(out, "    missing from stored: {missing_networks:?}");
+	}
+	if !extra_networks.is_empty() {
+		let _ = writeln!(out, "    extra in stored:     {extra_networks:?}");
+	}
+	if !shared_network_diffs.is_empty() {
+		let _ = writeln!(out, "    differing payloads:  {shared_network_diffs:?}");
+		for id in &shared_network_diffs {
+			let stored_network = &stored.networks[id];
+			let target_network = &target.networks[id];
+			let _ = writeln!(out, "      network {id}:");
+			diff_network(&mut out, stored_network, target_network);
+		}
+	}
+
+	let stored_decls: std::collections::BTreeSet<_> = stored.declaration_ids().collect();
+	let target_decls: std::collections::BTreeSet<_> = target.declaration_ids().collect();
+	let missing_decls: Vec<_> = target_decls.difference(&stored_decls).collect();
+	let extra_decls: Vec<_> = stored_decls.difference(&target_decls).collect();
+	if !missing_decls.is_empty() || !extra_decls.is_empty() {
+		let _ = writeln!(out, "  node_declarations: stored={} target={}", stored_decls.len(), target_decls.len());
+		if !missing_decls.is_empty() {
+			let _ = writeln!(out, "    missing from stored: {missing_decls:?}");
+		}
+		if !extra_decls.is_empty() {
+			let _ = writeln!(out, "    extra in stored:     {extra_decls:?}");
+		}
+	}
+
+	if stored.exported_nodes != target.exported_nodes {
+		let _ = writeln!(out, "  exported_nodes differ: stored={:?} target={:?}", stored.exported_nodes, target.exported_nodes);
+	}
+	if stored.attributes != target.attributes {
+		let stored_keys: std::collections::BTreeSet<_> = stored.attributes.keys().collect();
+		let target_keys: std::collections::BTreeSet<_> = target.attributes.keys().collect();
+		let _ = writeln!(out, "  document attributes differ: stored_keys={stored_keys:?} target_keys={target_keys:?}");
+	}
+	if stored.peer_users != target.peer_users {
+		let _ = writeln!(out, "  peer_users differ: stored={:?} target={:?}", stored.peer_users, target.peer_users);
+	}
+
+	out
+}
+
+#[cfg(debug_assertions)]
+fn diff_node(out: &mut String, stored: &graph_storage::Node, target: &graph_storage::Node) {
+	use std::fmt::Write;
+
+	if stored.implementation() != target.implementation() {
+		let _ = writeln!(out, "        implementation: stored={:?} target={:?}", stored.implementation(), target.implementation());
+	}
+	if stored.network() != target.network() {
+		let _ = writeln!(out, "        network back-pointer: stored={} target={}", stored.network(), target.network());
+	}
+
+	let stored_inputs = stored.inputs();
+	let target_inputs = target.inputs();
+	if stored_inputs.len() != target_inputs.len() {
+		let _ = writeln!(out, "        inputs.len: stored={} target={}", stored_inputs.len(), target_inputs.len());
+	}
+	for (i, (s, t)) in stored_inputs.iter().zip(target_inputs.iter()).enumerate() {
+		if s != t {
+			let value_differs = s.input != t.input;
+			let timestamp_differs = s.timestamp != t.timestamp;
+			let _ = writeln!(out, "        input[{i}]: value_differs={value_differs} timestamp_differs={timestamp_differs}");
+			if value_differs {
+				let _ = writeln!(out, "          stored.value={:?}\n          target.value={:?}", s.input, t.input);
+			}
+		}
+	}
+
+	let stored_input_attrs = stored.inputs_attributes();
+	let target_input_attrs = target.inputs_attributes();
+	if stored_input_attrs.len() != target_input_attrs.len() {
+		let _ = writeln!(out, "        inputs_attributes.len: stored={} target={}", stored_input_attrs.len(), target_input_attrs.len());
+	}
+	for (i, (s, t)) in stored_input_attrs.iter().zip(target_input_attrs.iter()).enumerate() {
+		if s != t {
+			diff_attributes(out, &format!("        inputs_attributes[{i}]"), s, t);
+		}
+	}
+
+	if stored.attributes() != target.attributes() {
+		diff_attributes(out, "        attributes", stored.attributes(), target.attributes());
+	}
+}
+
+#[cfg(debug_assertions)]
+fn diff_network(out: &mut String, stored: &graph_storage::Network, target: &graph_storage::Network) {
+	use std::fmt::Write;
+
+	if stored.exports.len() != target.exports.len() {
+		let _ = writeln!(out, "        exports.len: stored={} target={}", stored.exports.len(), target.exports.len());
+	}
+	for (i, (s, t)) in stored.exports.iter().zip(target.exports.iter()).enumerate() {
+		if s != t {
+			let target_differs = s.target != t.target;
+			let timestamp_differs = s.timestamp != t.timestamp;
+			let _ = writeln!(out, "        export[{i}]: target_differs={target_differs} timestamp_differs={timestamp_differs}");
+			if target_differs {
+				let _ = writeln!(out, "          stored.target={:?}\n          target.target={:?}", s.target, t.target);
+			}
+		}
+	}
+
+	if stored.attributes != target.attributes {
+		diff_attributes(out, "        attributes", &stored.attributes, &target.attributes);
+	}
+}
+
+#[cfg(debug_assertions)]
+fn diff_attributes(out: &mut String, label: &str, stored: &graph_storage::Attributes, target: &graph_storage::Attributes) {
+	use std::fmt::Write;
+
+	let stored_keys: std::collections::BTreeSet<_> = stored.keys().collect();
+	let target_keys: std::collections::BTreeSet<_> = target.keys().collect();
+	let missing: Vec<_> = target_keys.difference(&stored_keys).collect();
+	let extra: Vec<_> = stored_keys.difference(&target_keys).collect();
+	let differing: Vec<_> = stored_keys.intersection(&target_keys).filter(|k| stored.get(**k) != target.get(**k)).collect();
+
+	let _ = writeln!(out, "{label}: missing_from_stored={missing:?} extra_in_stored={extra:?} differing_values={differing:?}");
+}
+
+#[cfg(debug_assertions)]
+fn diff_networks(expected: &graph_craft::document::NodeNetwork, actual: &graph_craft::document::NodeNetwork) -> String {
+	use std::fmt::Write;
+	let mut out = String::new();
+
+	if expected.exports != actual.exports {
+		let _ = writeln!(out, "  exports differ: expected={} actual={}", expected.exports.len(), actual.exports.len());
+		for (i, (exp, act)) in expected.exports.iter().zip(actual.exports.iter()).enumerate() {
+			if exp != act {
+				let _ = writeln!(out, "    [{i}] expected={exp:?}\n        actual=  {act:?}");
+			}
+		}
+	}
+
+	let expected_ids: std::collections::BTreeSet<_> = expected.nodes.keys().copied().collect();
+	let actual_ids: std::collections::BTreeSet<_> = actual.nodes.keys().copied().collect();
+	let missing: Vec<_> = expected_ids.difference(&actual_ids).collect();
+	let extra: Vec<_> = actual_ids.difference(&expected_ids).collect();
+	let differing: Vec<_> = expected_ids.intersection(&actual_ids).filter(|id| expected.nodes.get(id) != actual.nodes.get(id)).collect();
+
+	if !missing.is_empty() || !extra.is_empty() || !differing.is_empty() {
+		let _ = writeln!(out, "  nodes: expected={} actual={}", expected_ids.len(), actual_ids.len());
+		if !missing.is_empty() {
+			let _ = writeln!(out, "    missing from actual: {missing:?}");
+		}
+		if !extra.is_empty() {
+			let _ = writeln!(out, "    extra in actual:     {extra:?}");
+		}
+		if !differing.is_empty() {
+			let _ = writeln!(out, "    differing payloads:  {differing:?}");
+		}
+	}
+
+	if expected.scope_injections != actual.scope_injections {
+		let _ = writeln!(out, "  scope_injections differ");
+	}
+
+	out
 }
 
 /// Create a network interface with a single export
