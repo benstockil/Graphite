@@ -24,9 +24,10 @@ The `Registry` is a **flat** node graph. All nodes from all nested networks live
 ```rs
 pub struct Registry {
     pub node_instances: HashMap<NodeId, Node>,                 // all nodes, flat
-    pub networks: HashMap<NetworkId, Network>,                  // exports per network
+    pub networks: HashMap<NetworkId, Network>,                  // exports + per-network attrs
     pub node_declarations: HashMap<DeclarationId, ProtoNode>,   // interned identifiers
     pub exported_nodes: Vec<NodeId>,                            // library API surface
+    pub peer_users: HashMap<PeerId, UserId>,                    // per-device → per-human identity
     pub attributes: Attributes,                                 // document-level metadata
 }
 
@@ -45,6 +46,7 @@ pub struct InputSlot {
 
 pub struct Network {
     pub exports: Vec<ExportSlot>,
+    pub attributes: Attributes,              // per-network ui::* (navigation, previewing)
 }
 
 pub struct ExportSlot {
@@ -54,6 +56,8 @@ pub struct ExportSlot {
 
 pub const ROOT_NETWORK: NetworkId = 0;
 ```
+
+`peer_users` records the append-only `PeerId → UserId` mapping written by each device's first contribution (see [Concurrency model](#concurrency-model--cmrdt)).
 
 The renderable graph lives in `networks[&ROOT_NETWORK]`. By convention the renderer consumes slot 0 of its exports; the editor can pick a different slot via type-based heuristics or user choice.
 
@@ -89,37 +93,44 @@ A `RegistryDelta` is one atomic change to the registry, simultaneously a history
 pub enum RegistryDelta {
     AddNode      { node_id: NodeId, node: Node },
     RemoveNode   { node_id: NodeId },
-    ChangeNodeInput          { node_id: NodeId, input_idx: usize, new_input: NodeInput, timestamp: TimeStamp },
+    ChangeNodeInput          { node_id: NodeId, input_idx: usize, new_input: NodeInput },
     ChangeNodeAttribute      { node_id: NodeId, delta: AttributeDelta },
     ChangeNodeInputAttribute { node_id: NodeId, input_idx: usize, delta: AttributeDelta },
-    SetExport     { network: NetworkId, slot: u32, target: Option<NodeInput>, timestamp: TimeStamp },
+    SetExport     { network: NetworkId, slot: u32, target: Option<NodeInput> },
     AddNetwork    { network: NetworkId, contents: Network },
     RemoveNetwork { network: NetworkId, snapshot: Network },
-    SetExportedNodes        { nodes: Vec<NodeId>, timestamp: TimeStamp },
+    SetExportedNodes        { nodes: Vec<NodeId> },
     ChangeDocumentAttribute { delta: AttributeDelta },
+    RegisterPeer            { peer: PeerId, user: UserId },
 }
 
-pub enum AttributeDelta {
-    Set    { key: String, value: serde_json::Value, timestamp: TimeStamp },
-    Remove { key: String, timestamp: TimeStamp },
+/// `value: None` is the removal case. Timestamp lives on the wrapping `Delta`.
+pub struct AttributeDelta {
+    pub key: String,
+    pub value: Option<serde_json::Value>,
 }
 ```
 
-Each delta is wrapped with metadata for history and causality:
+Each delta is wrapped with metadata for history, identity, and causality. `Rev` is content-addressed: `blake3` truncated to 128 bits of `(parents, author, timestamp, delta_type)`, so identical content always produces the same `Rev` and concurrent retirements that converge collapse by construction.
 
 ```rs
+pub type Rev = u128;
+
 pub struct Delta {
     pub id: Rev,
+    pub parents: Vec<Rev>,           // multi-parent for JJ-style merges
+    pub author: PeerId,
     pub timestamp: TimeStamp,
-    pub predecessor: Option<Rev>,
     pub delta_type: RegistryDelta,
-    pub reverse: RegistryDelta,      // precomputed for undo
+    pub reverse: RegistryDelta,      // precomputed for undo; excluded from id
 }
 ```
+
+One timestamp per `Delta` applies to every LWW-eligible write inside its `delta_type` — slot writes, attribute writes, and whole-list writes all read the same `Delta.timestamp`.
 
 ## History as a tree
 
-Branching is implicit. Every concurrent or out-of-sync edit creates a branch by virtue of sharing a `predecessor` with another delta. Linear undo is the common case; branching falls out naturally when two peers (or two windows on one machine) edit from the same predecessor.
+History is a multi-parent DAG. Branching is implicit: every concurrent or out-of-sync edit creates a branch by virtue of sharing a parent with another delta. A user's first commit after observing remote work adds the remote tip as an additional parent, so merges ride on the user's own edit rather than introducing phantom merge commits.
 
 ```
               D1 ── D2 ── D3        (one user's session)
@@ -129,13 +140,30 @@ Branching is implicit. Every concurrent or out-of-sync edit creates a branch by 
               D4 ── D5              (another peer, branched at root)
 ```
 
-A history UI lets users navigate this tree to recover from convoluted undo/redo sessions or revisit past exploration. History compression collapses similar consecutive deltas (e.g., three sequential "move shape" ops) into a single coarser delta.
+Linear undo is the common case; branching falls out naturally when two peers (or two windows on one machine) edit from the same parent. A history UI lets users navigate this tree to recover from convoluted undo/redo sessions or revisit past exploration. History compression collapses similar consecutive deltas (e.g., three sequential "move shape" ops) into a single coarser delta.
+
+## Two-tier history: hot ops and retired commits
+
+History has two tiers:
+
+- **Hot ops** — speculative, broadcast per-keystroke for live collaboration. Carry only a Lamport timestamp; no parents, no content-addressed `Rev`. Live in `Document.hot_log`, GC'd at retirement, persisted as a sidecar for crash recovery. May pass through non-compiling intermediate states.
+- **Retired commits** — coarser `Delta`s produced by retirement. Every retired commit compiles in the leader's local view. Content-addressed, multi-parent, durable, browseable, replayable.
+
+A leader-elected peer periodically retires a window of hot ops into one or more semantically-equivalent retired commits (one per logical `(node, field)` group, not one giant commit per window). Retired commits use a single retirement timestamp for every field they write; the original hot-op timestamps are discarded. Leader election is gossip-based — lowest `PeerId` among peers whose `retirement_tip` matches the session max — and best-effort: there is no quorum, since content-addressed `Rev`s make concurrent retirements that converge dedupe by construction.
+
+Undo is always a forward reverse-delta commit with a fresh timestamp; hot or retired target, same mechanism. Do/undo pair collapse only happens when both land in the same retirement window, subject to dependency closure (collapse must not orphan a reference to `X`).
+
+Solo retirement is the same mechanism with a session of one — history compaction during solo editing falls out for free.
+
+See [the collaboration model note](../../notes/document-format-collaboration.md) for the full retirement, leader-election, persistence, and reconnect semantics.
 
 ## Concurrency model — CmRDT
 
-The format uses an operation-based CRDT. The transport layer delivers ops in causal order exactly once (TCP plus the `predecessor` chain); the storage layer assumes this and requires only that concurrent op pairs commute. It does not need idempotency, state-merge, or out-of-order replay.
+The format uses an operation-based CRDT. The transport layer delivers ops in causal order exactly once (TCP plus the multi-parent chain in each `Delta`); the storage layer assumes this and requires only that concurrent op pairs commute. It does not need idempotency, state-merge, or out-of-order replay.
 
 Graph-shape invariants (the graph remaining a DAG, the result compiling) are best-effort: conflicts that produce a non-compiling graph surface as wiring or type errors rather than being masked by the CRDT.
+
+Identity is two-tier: `PeerId` is per-device (stable per `(device, document)`, used for CRDT tiebreaking and `NodeId` scoping); `UserId` is per-human (stable across devices, used for identity display and undo-chain walking). Each device's first contribution emits `RegisterPeer { peer, user }`, which writes an append-only entry to `Registry.peer_users`. Causal delivery guarantees the registration arrives before any of that peer's other ops.
 
 ## Editor pipeline
 
@@ -166,7 +194,7 @@ The editor operates on its existing runtime types. Storage is a serialization la
                 └─────────────────────────────────────────┘
 ```
 
-The runtime is the source of truth during editing. Conversion runs on save, on load, and across the sync boundary when broadcasting or receiving ops.
+The runtime is the source of truth during editing. Conversion runs on save, on load, and across the sync boundary when broadcasting or receiving ops. The editor-facing handle is `Session` (`graph_storage::Session`); `Document` is internal. `Session::commit_from_runtime(&NodeNetwork, &dyn NodeMetadataSource)` is the single entry point: it diffs the stored registry against a fresh conversion, ticks the clock once per emitted op, wraps each in a `Delta`, and applies + records to history.
 
 ## On-disk container
 
@@ -193,7 +221,7 @@ Migrations live in a dedicated crate so they are usable both from the editor and
 
 `from_runtime` flattens the recursive `NodeNetwork` into the flat `Registry`:
 
-- Each node's path through the runtime nesting is hashed to produce a stable global `NodeId`. The original local ID is stashed in an attribute (`compute::original_node_id`) so the round-trip can rebuild the runtime's per-network local IDs.
+- Each node's path through the runtime nesting is hashed (blake3 truncated to 64 bits, with the document's `PeerId` mixed in) to produce a stable global `NodeId`. The original local ID is stashed in an attribute (`compute::original_node_id`) so the round-trip can rebuild the runtime's per-network local IDs. Subsequent live edits mint fresh peer-scoped IDs via `Document::next_node_id` (`blake3(peer, counter)`) instead of going through the path-hash bootstrap.
 - Each nested `NodeNetwork` is assigned a fresh `NetworkId`. Aliasing (multiple nodes referencing the same network) is structurally supported by the storage model — `Implementation::Network(NetworkId)` is a reference — but the converter does not exploit it yet. Aliasing is fixed at the runtime layer first; the converter then preserves sharing without an explicit dedup pass.
 - Non-structural `DocumentNode` fields (`call_argument`, `context_features`, `visible`, `skip_deduplication`, ...) become entries in the node's `attributes`. UI metadata from `DocumentNodeMetadata` (positions, display names, locked, pinned, ...) flows through the same bucket under `ui::*` keys.
 
@@ -213,15 +241,15 @@ For the full design and per-op derivation, see the [CmRDT design doc](../../note
 
 - **Timestamps.** `TimeStamp = (u64, PeerId)` — a Lamport counter with a peer-ID tiebreak. Comparison is lexicographic. Wall-clock time is not used.
 - **NodeId identity.** Every new `AddNode` issues a peer-scoped ID, so concurrent creates cannot collide.
-- **Causal delivery.** `apply_delta` requires the predecessor is already in local history. The storage layer does not buffer; out-of-order delivery is a transport concern. New peers initialize via snapshot transfer (`Registry` + history) before streaming deltas.
+- **Causal delivery.** `apply_delta` requires every entry in `delta.parents` is already in local history. The storage layer does not buffer; out-of-order delivery is a transport concern. New peers initialize via snapshot transfer (`Registry` + history) before streaming deltas.
 - **Removal.** Physical, no tombstones. If a later op targets an absent node or network, the receiver replays the most recent `AddNode` / network creation from history before applying. `RemoveNetwork` carries `snapshot: Network` so its reverse and resurrection don't require re-walking history. Removal is therefore non-durable under concurrent edits: any concurrent reference to a removed node revives it.
-- **LWW primitives.** Per-input (`InputSlot.timestamp`), per-export-slot (`ExportSlot.timestamp`), per-attribute-value (the `TimeStamp` in `Attributes`), and whole-list for `SetExportedNodes` via a sidecar timestamp in `Registry.attributes` under `library::exported_nodes_ts`. `AttributeDelta::Remove` carries a timestamp so `Set` vs. `Remove` has a defined winner.
+- **LWW primitives.** Per-input (`InputSlot.timestamp`), per-export-slot (`ExportSlot.timestamp`), per-attribute-value (the `TimeStamp` in `Attributes`), and whole-list for `SetExportedNodes` via a sidecar timestamp in `Registry.attributes` under `library::exported_nodes_ts`. The timestamp driving every LWW arm comes from the wrapping `Delta`; `AttributeDelta` carries `value: Option<_>` so a single shape covers both `Set` (`Some`) and `Remove` (`None`) and `Set` vs. `Remove` has a defined winner.
 
 The CRDT does not mask graph-shape conflicts. Concurrent same-slot `SetExport`s with different targets resolve by LWW, but the resulting wiring may be wrong; downstream consumers see it as a compile or wiring error.
 
 ## History storage
 
-`HashMap<Rev, Delta>` plus a `head: Rev`. Walking history follows `predecessor` chains. Branches are siblings under a shared predecessor; merges are not modeled as nodes — they are implicit in applying a delta from a different branch onto the local head.
+`HashMap<Rev, Delta>` plus a `head: Rev` (the local cursor; advances only on local commits) and a `hot_log: Vec<HotOp>` (in-flight unretired ops). Walking history follows `delta.parents`; the default walk follows the first parent to reconstruct a single peer's local chain. Branches are siblings under a shared parent; merges aren't modeled as nodes — they're implicit in a delta listing multiple parents.
 
 ## Editor metadata
 
@@ -229,7 +257,7 @@ The CRDT does not mask graph-shape conflicts. Concurrent same-slot `SetExport`s 
 
 # Drawbacks
 
-- **Diffing two full `Registry`s on every edit is O(N) in document size per gesture.** The interim cost of treating storage as a serialization layer derived from the runtime; addressed later by computing deltas directly on runtime mutations.
+- **Diffing two full `Registry`s on every autosave is O(N) in document size.** The interim cost of treating storage as a serialization layer derived from the runtime; currently triggered at autosave boundaries (`commit_storage_snapshot`) rather than per gesture, and addressed long-term by computing deltas directly on runtime mutations.
 - **Attributes as `serde_json::Value` carry per-value overhead.** Mitigable with postcard encoding or a typed fast path for hot keys without changing the design.
 - **Single global format version is a sharp edge** when libraries diverge: a breaking change in one library bumps the version for documents that don't use it.
 - **`RemoveNode` is non-durable under concurrency.** Any concurrent reference to a removed node revives it from history.
