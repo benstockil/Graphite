@@ -1,0 +1,231 @@
+//! Container abstraction for the on-disk side of the `.gdd` document format.
+//!
+//! A [`Container`] is a virtual filesystem of named byte payloads.
+//! Backends include a loose folder, an in-memory map, and an OPFS-backed wasm store.
+//! Archive codecs ([`archive::Zip`], [`archive::Xz`]) round-trip a container's contents
+//! through a compressed byte stream.
+//!
+//! Reads return a [`ByteHolder`], an ownership-carrying handle whose variant depends on
+//! how the backend produced the bytes (mmap region, owned vector, external file mmap).
+//! [`AsyncContainer`] mirrors [`Container`] for inherently async backends; every sync
+//! [`Container`] is reachable from async code via a blanket impl.
+
+use std::future::{Future, ready};
+
+pub mod archive;
+pub mod backends;
+
+pub enum ByteHolder {
+	/// Bytes synthesized in memory (decompressed from an archive, produced by serialization).
+	/// The only variant available on `target_family = "wasm"`.
+	Owned(Vec<u8>),
+	/// Bytes mmap'd from a file inside the container.
+	#[cfg(not(target_family = "wasm"))]
+	Mmapped(MmappedBytes),
+	/// Bytes mmap'd from a file outside the container (e.g. a linked resource).
+	#[cfg(not(target_family = "wasm"))]
+	External { path: std::path::PathBuf, bytes: MmappedBytes },
+}
+
+impl ByteHolder {
+	pub fn as_slice(&self) -> &[u8] {
+		match self {
+			ByteHolder::Owned(bytes) => bytes,
+			#[cfg(not(target_family = "wasm"))]
+			ByteHolder::Mmapped(bytes) => bytes.as_ref(),
+			#[cfg(not(target_family = "wasm"))]
+			ByteHolder::External { bytes, .. } => bytes.as_ref(),
+		}
+	}
+
+	/// Open an external file and produce a [`ByteHolder::External`] backed by mmap.
+	#[cfg(not(target_family = "wasm"))]
+	pub fn open_external(path: impl Into<std::path::PathBuf>) -> Result<Self> {
+		let path = path.into();
+		let file = mmap_io::mmap::MemoryMappedFile::open_ro(&path).map_err(|error| ContainerError::Backend(format!("mmap of {path:?} failed: {error}")))?;
+		Ok(ByteHolder::External { path, bytes: MmappedBytes::new(file) })
+	}
+}
+
+impl std::fmt::Debug for ByteHolder {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			ByteHolder::Owned(bytes) => f.debug_tuple("Owned").field(&format_args!("{} bytes", bytes.len())).finish(),
+			#[cfg(not(target_family = "wasm"))]
+			ByteHolder::Mmapped(bytes) => f.debug_tuple("Mmapped").field(&format_args!("{} bytes", bytes.as_ref().len())).finish(),
+			#[cfg(not(target_family = "wasm"))]
+			ByteHolder::External { path, bytes } => f.debug_struct("External").field("path", path).field("len", &bytes.as_ref().len()).finish(),
+		}
+	}
+}
+
+/// Owning wrapper around a memory-mapped file that exposes the mapped region as `&[u8]`.
+#[cfg(not(target_family = "wasm"))]
+pub struct MmappedBytes(mmap_io::mmap::MemoryMappedFile);
+
+#[cfg(not(target_family = "wasm"))]
+impl MmappedBytes {
+	pub fn new(file: mmap_io::mmap::MemoryMappedFile) -> Self {
+		Self(file)
+	}
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl AsRef<[u8]> for MmappedBytes {
+	fn as_ref(&self) -> &[u8] {
+		let len = self.0.len();
+		match self.0.as_slice(0, len) {
+			Ok(slice) => slice,
+			Err(error) => {
+				log::error!("Failed to obtain mmap slice: {error}");
+				&[]
+			}
+		}
+	}
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ContainerError {
+	#[error("path not found: {0}")]
+	NotFound(String),
+
+	#[error("invalid path: {0}")]
+	InvalidPath(String),
+
+	#[error("I/O error: {0}")]
+	Io(#[from] std::io::Error),
+
+	#[error("backend error: {0}")]
+	Backend(String),
+}
+
+pub type Result<T> = std::result::Result<T, ContainerError>;
+
+/// Validate that `path` is a relative, container-safe path:
+/// no `..` components, no absolute or Windows-prefixed paths, no backslashes.
+///
+/// Backends use this to reject paths that could escape the container root,
+/// and archive codecs use it on entry names from untrusted input.
+pub fn validate_path(path: &str) -> Result<()> {
+	let invalid = || ContainerError::InvalidPath(path.to_string());
+
+	if path.contains('\\') || path.starts_with('/') {
+		return Err(invalid());
+	}
+
+	// Reject Windows drive-letter prefixes (`C:foo`, `C:/foo`) that platform-agnostic Path doesn't recognize as absolute on Linux.
+	let bytes = path.as_bytes();
+	if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+		return Err(invalid());
+	}
+
+	for component in std::path::Path::new(path).components() {
+		use std::path::Component;
+		match component {
+			Component::Normal(_) | Component::CurDir => {}
+			Component::ParentDir | Component::Prefix(_) | Component::RootDir => return Err(invalid()),
+		}
+	}
+	Ok(())
+}
+
+/// Synchronous virtual filesystem of named byte payloads.
+pub trait Container {
+	/// Read the contents of `path` into a [`ByteHolder`].
+	fn read(&self, path: &str) -> Result<ByteHolder>;
+
+	/// Write `bytes` at `path`, creating intermediate directories as needed.
+	fn write(&mut self, path: &str, bytes: &[u8]) -> Result<()>;
+
+	/// Write `size` bytes whose contents are produced by `fill`.
+	/// The default implementation allocates and forwards to [`Container::write`];
+	/// backends that can mmap a writable region may override to fill in place.
+	fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8])) -> Result<()> {
+		let mut buffer = vec![0; size];
+		fill(&mut buffer);
+		self.write(path, &buffer)
+	}
+
+	/// List file entries directly under `prefix` (non-recursive).
+	/// Returned paths include the `prefix` (e.g. `list("resources")` returns
+	/// `["resources/abc123", ...]`).
+	fn list(&self, prefix: &str) -> Result<Vec<String>>;
+
+	/// List subdirectory entries directly under `prefix` (non-recursive).
+	/// Returned names include the `prefix`, without a trailing slash
+	/// (e.g. `list_dirs("")` returns `["resources"]`).
+	fn list_dirs(&self, prefix: &str) -> Result<Vec<String>>;
+
+	/// Whether a file exists at `path`. Directories return `false`.
+	fn exists(&self, path: &str) -> bool;
+
+	/// Remove the file at `path`. Errors if the path does not exist or names a directory.
+	fn remove(&mut self, path: &str) -> Result<()>;
+}
+
+/// Asynchronous virtual filesystem of named byte payloads. Mirrors [`Container`].
+pub trait AsyncContainer {
+	fn read(&self, path: &str) -> impl Future<Output = Result<ByteHolder>> + '_;
+
+	fn write(&mut self, path: &str, bytes: &[u8]) -> impl Future<Output = Result<()>> + '_;
+
+	fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8])) -> impl Future<Output = Result<()>> + '_;
+
+	fn list(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>>> + '_;
+
+	fn list_dirs(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>>> + '_;
+
+	fn exists(&self, path: &str) -> impl Future<Output = bool> + '_;
+
+	fn remove(&mut self, path: &str) -> impl Future<Output = Result<()>> + '_;
+}
+
+impl<C: Container + ?Sized> AsyncContainer for C {
+	fn read(&self, path: &str) -> impl Future<Output = Result<ByteHolder>> + '_ {
+		ready(Container::read(self, path))
+	}
+
+	fn write(&mut self, path: &str, bytes: &[u8]) -> impl Future<Output = Result<()>> + '_ {
+		ready(Container::write(self, path, bytes))
+	}
+
+	fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8])) -> impl Future<Output = Result<()>> + '_ {
+		ready(Container::write_sized(self, path, size, fill))
+	}
+
+	fn list(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>>> + '_ {
+		ready(Container::list(self, prefix))
+	}
+
+	fn list_dirs(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>>> + '_ {
+		ready(Container::list_dirs(self, prefix))
+	}
+
+	fn exists(&self, path: &str) -> impl Future<Output = bool> + '_ {
+		ready(Container::exists(self, path))
+	}
+
+	fn remove(&mut self, path: &str) -> impl Future<Output = Result<()>> + '_ {
+		ready(Container::remove(self, path))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{ContainerError, validate_path};
+
+	#[test]
+	fn validate_path_accepts_well_formed() {
+		for ok in ["manifest.json", "resources/abc", "a/b/c.bin", "my..file.txt", "..hidden", "."] {
+			assert!(validate_path(ok).is_ok(), "{ok:?} should be accepted");
+		}
+	}
+
+	#[test]
+	fn validate_path_rejects_unsafe() {
+		for bad in ["../escape", "a/../b", "/abs", "back\\slash", "C:/win", "\\\\?\\unc"] {
+			let result = validate_path(bad);
+			assert!(matches!(result, Err(ContainerError::InvalidPath(_))), "{bad:?} should be rejected, got {result:?}");
+		}
+	}
+}

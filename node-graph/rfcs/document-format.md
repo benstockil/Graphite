@@ -189,8 +189,10 @@ The editor operates on its existing runtime types. Storage is a serialization la
                 │ On-disk  (.gdd container)               │
                 │  named payloads: manifest, document,    │
                 │  history, resources/<hash>              │
-                │  served by an interchangeable backend   │
-                │  (folder, zip, xz, ...)                 │
+                │  served by a Container backend          │
+                │  (folder, in-memory, OPFS), optionally  │
+                │  encoded through an Archive codec       │
+                │  (zip, xz)                              │
                 └─────────────────────────────────────────┘
 ```
 
@@ -198,9 +200,9 @@ The runtime is the source of truth during editing. Conversion runs on save, on l
 
 ## On-disk container
 
-A `.gdd` document is a collection of named byte payloads held together by an interchangeable container backend. The same logical document can be saved as a loose folder (VCS-friendly, diffable), a zip archive (compact, portable), or an xz-compressed archive (archival), without any change above the container layer.
+A `.gdd` document is a collection of named byte payloads. A `Container` backend (loose folder, in-memory, OPFS in the browser) provides the path-keyed read/write surface; an `Archive` codec (zip, xz-compressed tarball) optionally encodes a container into a single byte stream for compact distribution. The same logical document can be saved as a loose folder for VCS-friendly checkouts or as an archive for shipping, without any change above the container layer.
 
-The container abstraction lives in two downstream crates: `gdd-container` owns the backends and byte-ownership (`memmap2` regions, decompressed buffers, mmap'd external files), and `gdd-format` defines the typed `Gdd` handle, the layout (logical-payload-name → in-container path), the codec, and the save/load orchestration. `graph-storage` itself stays disk-unaware.
+The two concerns live in downstream crates: `gdd-container` defines the `Container` and `AsyncContainer` traits, the backends, byte ownership (mmap regions, owned buffers, external file mmaps via `mmap-io`), and the `Archive` trait. `gdd-format` defines the typed `Gdd` handle, the layout (logical-payload-name → in-container path), the data codec (JSON or binary), the manifest, and the save/load orchestration. `graph-storage` itself stays disk-unaware.
 
 ```
             ┌─────────────────────────────────┐
@@ -217,7 +219,9 @@ The container abstraction lives in two downstream crates: `gdd-container` owns t
                                               ▼
                                ┌──────────────────────────────┐
                                │ gdd-container                │
-                               │  backends (folder, zip, xz)  │
+                               │  Container backends + Archive│
+                               │  codecs (folder, memory,     │
+                               │  OPFS / zip, xz)             │
                                └──────────────────────────────┘
 ```
 
@@ -230,7 +234,7 @@ A document contains:
 - `history.{jsonl,bin}` — the serialized delta DAG. JSON history is line-oriented (one delta per line) so appending is a one-line diff.
 - `resources/<hash>` — embedded resource bytes, keyed by `ResourceHash`.
 
-In the folder backend the same layout shows up as plain files on disk; archive backends pack the same named entries into a single file.
+The folder backend stores these as plain files on disk; an archive codec packs the same named entries into a single file.
 
 ```
             my-doc.gdd/
@@ -242,7 +246,7 @@ In the folder backend the same layout shows up as plain files on disk; archive b
                 └── 2c91...
 ```
 
-The `Gdd` handle owns the loaded bytes and exposes them as zero-copy slices. On the folder backend, reads are direct mmap references; on archive backends, contents are decompressed once on open. Writes mutate the handle in place; `save()` / `save_as()` persists to a chosen backend.
+The `Gdd` handle owns the loaded bytes and exposes them as zero-copy slices. On the folder backend, reads are direct mmap references; loading from an archive decompresses once on open into an in-memory backend. Writes mutate the handle in place; `save()` / `save_as()` persists to a chosen backend, optionally through an archive codec.
 
 A `SaveOptions` struct controls scope per-save: `include_registry` (skip = rebuild from history on load), `include_history` (skip = state-only snapshot), `embed_all_resources` (materialize every linked-file resource into the container for a portable file, without mutating the in-memory state), and `codec`. These compose freely except that `include_registry: false && include_history: false` is rejected.
 
@@ -250,7 +254,7 @@ A `SaveOptions` struct controls scope per-save: `include_registry` (skip = rebui
 
 Resource bytes are content-addressed by `ResourceHash` and resolved through the `ResourceRegistry` (`node-graph/libraries/resources`). Each resource carries a chain of `DataSource` variants tried in order: `Embedded` (bytes live in `resources/<hash>` inside the container), `FilePath(PathBuf)` (bytes mmap'd from an external file at the recorded path), `Url`, `Font` (runtime-resolved, not container-resolved). Multiple sources can coexist on one resource — e.g., `FilePath` for the local working copy and `Embedded` as a portability fallback.
 
-On disk, each `DataSource` is encoded as `serde_json::Value` rather than a typed enum, with the same motivation as the `Attributes` bucket: type-erasure lets migrations rename or restructure variants without keeping old enum shapes alive in Rust, and lets older binaries preserve unknown variants instead of failing to deserialize. `DataSource` stays a typed enum at the runtime layer; the conversion happens at the serialization boundary.
+On disk, each `DataSource` is encoded as `serde_json::Value` rather than a typed enum, with the same motivation as the `Attributes` bucket: type-erasure lets migrations rename or restructure variants without keeping old enum shapes alive in Rust. `DataSource` stays a typed enum at the runtime layer; the conversion happens at the serialization boundary. Unknown variants are not preserved across versions — an older binary loading a document with a variant it doesn't recognize is a hard error.
 
 Legacy documents with inline image `TaggedValue`s have those values extracted into the resource registry at load time; new saves never embed inline blobs in `NodeInput::Value`. Embed-vs-link policy on save is dictated by the registry's `DataSource` chain, not by the container.
 
