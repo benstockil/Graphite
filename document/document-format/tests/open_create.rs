@@ -233,7 +233,8 @@ fn export_zip_round_trips_via_deserialize() {
 			.unwrap_or_else(|error| panic!("export failed: {error:?}"));
 
 		let bytes = std::fs::read(&dest).unwrap();
-		let restored = Zip::deserialize(&bytes).unwrap();
+		let mut restored = document_container::backends::memory::MemoryBackend::new();
+		Zip::deserialize(std::io::Cursor::new(&bytes), &mut restored).unwrap();
 		use document_container::Container;
 		assert!(restored.exists("manifest.bin"));
 		assert!(restored.exists("registry.bin"));

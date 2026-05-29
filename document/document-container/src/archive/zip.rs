@@ -1,13 +1,8 @@
 //! Zip archive codec.
 
 use crate::archive::{Archive, ArchiveWriter};
-use crate::backends::memory::MemoryBackend;
 use crate::{Container, ContainerError, Result, validate_path};
-use std::io::{Cursor, Read, Seek, Write};
-
-/// Cap the pre-allocation hint taken from archive metadata so a malicious
-/// archive cannot trigger a huge allocation before any bytes are read.
-const PREALLOC_CAP: usize = 64 * 1024 * 1024;
+use std::io::{Read, Seek, Write};
 
 use zip::ZipArchive;
 use zip::write::{SimpleFileOptions, ZipWriter as InnerZipWriter};
@@ -29,9 +24,8 @@ impl Archive for Zip {
 		})
 	}
 
-	fn deserialize(bytes: &[u8]) -> Result<MemoryBackend> {
-		let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(zip_err)?;
-		let mut backend = MemoryBackend::new();
+	fn deserialize<R: Read + Seek, C: Container>(source: R, dest: &mut C) -> Result<()> {
+		let mut archive = ZipArchive::new(source).map_err(zip_err)?;
 
 		for index in 0..archive.len() {
 			let mut entry = archive.by_index(index).map_err(zip_err)?;
@@ -40,13 +34,14 @@ impl Archive for Zip {
 			}
 			let name = entry.name().to_string();
 			validate_path(&name)?;
-			let cap = (entry.size() as usize).min(PREALLOC_CAP);
-			let mut contents = Vec::with_capacity(cap);
-			entry.read_to_end(&mut contents)?;
-			Container::write(&mut backend, &name, &contents)?;
+			let size = entry.size() as usize;
+			dest.write_sized(&name, size, &mut |buffer| {
+				entry.read_exact(buffer).map_err(ContainerError::Io)?;
+				Ok(())
+			})?;
 		}
 
-		Ok(backend)
+		Ok(())
 	}
 }
 

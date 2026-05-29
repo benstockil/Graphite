@@ -88,7 +88,7 @@ impl Container for FolderBackend {
 		Ok(())
 	}
 
-	fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8])) -> Result<()> {
+	fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()> {
 		if size == 0 {
 			return self.write(path, &[]);
 		}
@@ -103,7 +103,7 @@ impl Container for FolderBackend {
 			let mut slice = file
 				.as_slice_mut(0, size as u64)
 				.map_err(|error| ContainerError::Backend(format!("as_slice_mut {full:?} failed: {error}")))?;
-			fill(slice.as_mut());
+			fill(slice.as_mut())?;
 		}
 		file.flush().map_err(|error| ContainerError::Backend(format!("flush {full:?} failed: {error}")))?;
 		Ok(())

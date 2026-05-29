@@ -40,9 +40,9 @@ impl AsyncContainer for OpfsBackend {
 		append_file(&self.root, path, bytes).await.map_err(js_err)
 	}
 
-	async fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8])) -> Result<()> {
+	async fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()> {
 		let mut buffer = vec![0; size];
-		fill(&mut buffer);
+		fill(&mut buffer)?;
 		write_file(&self.root, path, &buffer).await.map_err(js_err)
 	}
 

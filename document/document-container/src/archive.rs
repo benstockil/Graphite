@@ -1,12 +1,10 @@
 //! Archive codecs (zip, xz).
 //!
-//! Each codec exposes a writer type that streams entries into an `io::Write` sink, so callers
-//! can drive the entry sequence and the output destination (file, buffer, anything) themselves.
-//! Decoding produces a [`MemoryBackend`].
+//! Each codec streams entries in both directions: writers wrap an `io::Write` sink, and
+//! `deserialize` reads from any `io::Read + Seek` source and streams entries into any [`Container`].
 
-use crate::Result;
-use crate::backends::memory::MemoryBackend;
-use std::io::{Seek, Write};
+use crate::{Container, Result};
+use std::io::{Read, Seek, Write};
 
 #[cfg(feature = "zip")]
 mod zip;
@@ -28,7 +26,9 @@ pub trait Archive {
 
 	fn writer<W: Write + Seek>(output: W) -> Result<Self::Writer<W>>;
 
-	fn deserialize(bytes: &[u8]) -> Result<MemoryBackend>;
+	/// Read entries from `source` and write each into `dest`, streaming so neither the full
+	/// archive nor the full container ever sits in memory at once.
+	fn deserialize<R: Read + Seek, C: Container>(source: R, dest: &mut C) -> Result<()>;
 }
 
 pub trait ArchiveWriter {

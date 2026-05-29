@@ -1,13 +1,9 @@
 //! Xz-compressed tarball archive codec.
 
 use crate::archive::{Archive, ArchiveWriter};
-use crate::backends::memory::MemoryBackend;
 use crate::{Container, ContainerError, Result, validate_path};
 use lzma_rust2::{XzOptions, XzReader, XzWriter as InnerXzWriter};
-use std::io::{Cursor, Read, Seek, Write};
-
-/// Cap the pre-allocation hint taken from tar metadata.
-const ENTRY_PREALLOC_CAP: usize = 64 * 1024 * 1024;
+use std::io::{Read, Seek, Write};
 
 /// Hard cap on the total decompressed size from an xz stream.
 /// Defends against decompression bombs at the cost of refusing legitimately large archives.
@@ -31,12 +27,11 @@ impl Archive for Xz {
 		})
 	}
 
-	fn deserialize(bytes: &[u8]) -> Result<MemoryBackend> {
-		let xz_reader = XzReader::new(Cursor::new(bytes), false);
+	fn deserialize<R: Read + Seek, C: Container>(source: R, dest: &mut C) -> Result<()> {
+		let xz_reader = XzReader::new(source, false);
 		let bounded = xz_reader.take(MAX_DECOMPRESSED_SIZE);
 
 		let mut tar_reader = tar::Archive::new(bounded);
-		let mut backend = MemoryBackend::new();
 
 		for entry in tar_reader.entries()? {
 			let mut entry = entry?;
@@ -45,13 +40,14 @@ impl Archive for Xz {
 			}
 			let path = entry.path()?.to_string_lossy().into_owned();
 			validate_path(&path)?;
-			let cap = (entry.size() as usize).min(ENTRY_PREALLOC_CAP);
-			let mut contents = Vec::with_capacity(cap);
-			entry.read_to_end(&mut contents)?;
-			Container::write(&mut backend, &path, &contents)?;
+			let size = entry.size() as usize;
+			dest.write_sized(&path, size, &mut |buffer| {
+				entry.read_exact(buffer).map_err(ContainerError::Io)?;
+				Ok(())
+			})?;
 		}
 
-		Ok(backend)
+		Ok(())
 	}
 }
 

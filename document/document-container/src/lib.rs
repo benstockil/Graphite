@@ -162,9 +162,9 @@ pub trait Container {
 	/// Write `size` bytes whose contents are produced by `fill`.
 	/// The default implementation allocates and forwards to [`Container::write`];
 	/// backends that can mmap a writable region may override to fill in place.
-	fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8])) -> Result<()> {
+	fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()> {
 		let mut buffer = vec![0; size];
-		fill(&mut buffer);
+		fill(&mut buffer)?;
 		self.write(path, &buffer)
 	}
 
@@ -198,7 +198,7 @@ pub trait AsyncContainer {
 
 	async fn append(&mut self, path: &str, bytes: &[u8]) -> Result<()>;
 
-	async fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8])) -> Result<()>;
+	async fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()>;
 
 	async fn list(&self, prefix: &str) -> Result<Vec<String>>;
 
@@ -222,7 +222,7 @@ impl<C: Container + ?Sized> AsyncContainer for C {
 		Container::append(self, path, bytes)
 	}
 
-	async fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8])) -> Result<()> {
+	async fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()> {
 		Container::write_sized(self, path, size, fill)
 	}
 
@@ -287,7 +287,7 @@ impl AsyncContainer for AnyContainer {
 		}
 	}
 
-	async fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8])) -> Result<()> {
+	async fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()> {
 		match self {
 			Self::Memory(backend) => AsyncContainer::write_sized(backend, path, size, fill).await,
 			#[cfg(not(target_family = "wasm"))]

@@ -106,6 +106,7 @@ fn folder_backend_write_sized_fills_via_mmap() {
 	backend
 		.write_sized("resources/sized", payload.len(), &mut |buffer| {
 			buffer.copy_from_slice(payload);
+			Ok(())
 		})
 		.unwrap();
 

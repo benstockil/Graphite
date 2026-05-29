@@ -2,6 +2,7 @@
 
 use document_container::Container;
 use document_container::archive::{Archive, ArchiveWriter};
+use document_container::backends::folder::FolderBackend;
 use document_container::backends::memory::MemoryBackend;
 
 fn entries() -> Vec<(&'static str, &'static [u8])> {
@@ -35,8 +36,30 @@ fn zip_round_trip() {
 	}
 	writer.finish().unwrap();
 
-	let restored = <Zip as Archive>::deserialize(buffer.get_ref()).unwrap();
+	let mut restored = MemoryBackend::new();
+	<Zip as Archive>::deserialize(Cursor::new(buffer.get_ref()), &mut restored).unwrap();
 	assert_round_trip(&restored);
+}
+
+#[cfg(feature = "zip")]
+#[test]
+fn zip_deserialize_streams_into_folder_backend() {
+	use document_container::archive::Zip;
+	use std::io::Cursor;
+
+	let mut buffer = Cursor::new(Vec::new());
+	let mut writer = Zip::writer(&mut buffer).unwrap();
+	for (path, bytes) in entries() {
+		writer.write_entry(path, bytes).unwrap();
+	}
+	writer.finish().unwrap();
+
+	let dir = tempfile::tempdir().unwrap();
+	let mut restored = FolderBackend::create(dir.path()).unwrap();
+	<Zip as Archive>::deserialize(Cursor::new(buffer.get_ref()), &mut restored).unwrap();
+
+	assert_eq!(restored.read("manifest.json").unwrap().as_slice(), br#"{"format":"gdd"}"#);
+	assert_eq!(restored.read("resources/abc123").unwrap().as_slice(), &[0xDE, 0xAD, 0xBE, 0xEF]);
 }
 
 #[cfg(feature = "xz")]
@@ -52,6 +75,7 @@ fn xz_round_trip() {
 	}
 	writer.finish().unwrap();
 
-	let restored = <Xz as Archive>::deserialize(buffer.get_ref()).unwrap();
+	let mut restored = MemoryBackend::new();
+	<Xz as Archive>::deserialize(Cursor::new(buffer.get_ref()), &mut restored).unwrap();
 	assert_round_trip(&restored);
 }
