@@ -9,6 +9,7 @@ members = [
 	"desktop/platform/win",
 	"document/graph-storage",
 	"document/gdd-container",
+	"document/document-format",
 	"editor",
 	"frontend/wrapper",
 	"libraries/dyn-any",
