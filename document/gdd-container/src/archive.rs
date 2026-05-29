@@ -1,61 +1,37 @@
 //! Archive codecs (zip, xz).
 //!
-//! Each codec is a stateless [`Archive`] impl:
-//! `serialize_from` streams a source container's contents into archive bytes,
-//! `deserialize` parses a byte buffer into a [`MemoryBackend`](crate::backends::memory::MemoryBackend).
+//! Each codec exposes a writer type that streams entries into an `io::Write` sink, so callers
+//! can drive the entry sequence and the output destination (file, buffer, anything) themselves.
+//! Decoding produces a [`MemoryBackend`].
 
+use crate::Result;
 use crate::backends::memory::MemoryBackend;
-use crate::{AsyncContainer, Result};
-use std::future::Future;
+use std::io::{Seek, Write};
 
 #[cfg(feature = "zip")]
 mod zip;
 #[cfg(feature = "zip")]
-pub use zip::Zip;
+pub use zip::{Zip, ZipWriter};
 
 #[cfg(feature = "xz")]
 mod xz;
 #[cfg(feature = "xz")]
-pub use xz::Xz;
+pub use xz::{Xz, XzWriter};
 
-/// Bidirectional codec between a byte stream and a container's worth of named payloads.
+/// Streaming archive codec. The associated `Writer` type wraps a `Write + Seek` sink (zip needs
+/// `Seek` for the central directory; xz doesn't but `Seek` is free on file-like sinks) and
+/// accepts entries one at a time. `finish` flushes the codec's trailer and consumes the wrapper.
 pub trait Archive {
-	fn serialize_from<S>(src: &S) -> impl Future<Output = Result<Vec<u8>>>
+	type Writer<W: Write + Seek>: ArchiveWriter
 	where
-		S: AsyncContainer + ?Sized;
+		W: Write + Seek;
+
+	fn writer<W: Write + Seek>(output: W) -> Result<Self::Writer<W>>;
 
 	fn deserialize(bytes: &[u8]) -> Result<MemoryBackend>;
 }
 
-/// Walk every file under `src` in path-sorted order, recursing into subdirectories.
-/// Invokes `visit` with each `(path, &bytes)` pair so codec implementations can stream
-/// entries into their writer without buffering the whole container.
-#[cfg(any(feature = "zip", feature = "xz"))]
-pub(crate) async fn for_each_file<S, F>(src: &S, mut visit: F) -> Result<()>
-where
-	S: AsyncContainer + ?Sized,
-	F: FnMut(&str, &[u8]) -> Result<()>,
-{
-	walk(src, "", &mut visit).await
-}
-
-#[cfg(any(feature = "zip", feature = "xz"))]
-async fn walk<S, F>(src: &S, prefix: &str, visit: &mut F) -> Result<()>
-where
-	S: AsyncContainer + ?Sized,
-	F: FnMut(&str, &[u8]) -> Result<()>,
-{
-	let mut files = src.list(prefix).await?;
-	files.sort();
-	for path in files {
-		let holder = src.read(&path).await?;
-		visit(&path, holder.as_slice())?;
-	}
-
-	let mut dirs = src.list_dirs(prefix).await?;
-	dirs.sort();
-	for dir in dirs {
-		Box::pin(walk(src, &dir, visit)).await?;
-	}
-	Ok(())
+pub trait ArchiveWriter {
+	fn write_entry(&mut self, path: &str, bytes: &[u8]) -> Result<()>;
+	fn finish(self) -> Result<()>;
 }

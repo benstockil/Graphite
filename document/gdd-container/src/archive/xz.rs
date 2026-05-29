@@ -1,10 +1,10 @@
 //! Xz-compressed tarball archive codec.
 
-use crate::archive::{Archive, for_each_file};
+use crate::archive::{Archive, ArchiveWriter};
 use crate::backends::memory::MemoryBackend;
-use crate::{AsyncContainer, Container, ContainerError, Result, validate_path};
-use lzma_rust2::{XzOptions, XzReader, XzWriter};
-use std::io::{Cursor, Read};
+use crate::{Container, ContainerError, Result, validate_path};
+use lzma_rust2::{XzOptions, XzReader, XzWriter as InnerXzWriter};
+use std::io::{Cursor, Read, Seek, Write};
 
 /// Cap the pre-allocation hint taken from tar metadata.
 const ENTRY_PREALLOC_CAP: usize = 64 * 1024 * 1024;
@@ -15,28 +15,20 @@ const MAX_DECOMPRESSED_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 
 pub struct Xz;
 
+/// xz-tar writer. Held as an `Option` so `finish` can take ownership and unwind the layered
+/// writers in the right order: drop the tar builder first to flush its trailer, then finish xz.
+pub struct XzWriter<W: Write + Seek> {
+	tar: Option<tar::Builder<InnerXzWriter<W>>>,
+}
+
 impl Archive for Xz {
-	async fn serialize_from<S>(src: &S) -> Result<Vec<u8>>
-	where
-		S: AsyncContainer + ?Sized,
-	{
-		let mut xz_writer = XzWriter::new(Cursor::new(Vec::new()), XzOptions::default()).map_err(lzma_err)?;
-		{
-			let mut tar_builder = tar::Builder::new(&mut xz_writer);
-			for_each_file(src, |path, bytes| {
-				let mut header = tar::Header::new_gnu();
-				header.set_path(path).map_err(|error| ContainerError::Backend(format!("tar: invalid path {path}: {error}")))?;
-				header.set_size(bytes.len() as u64);
-				header.set_mode(0o644);
-				header.set_cksum();
-				tar_builder.append(&header, bytes)?;
-				Ok(())
-			})
-			.await?;
-			tar_builder.finish()?;
-		}
-		let buffer = xz_writer.finish().map_err(lzma_err)?;
-		Ok(buffer.into_inner())
+	type Writer<W: Write + Seek> = XzWriter<W>;
+
+	fn writer<W: Write + Seek>(output: W) -> Result<Self::Writer<W>> {
+		let xz_writer = InnerXzWriter::new(output, XzOptions::default()).map_err(lzma_err)?;
+		Ok(XzWriter {
+			tar: Some(tar::Builder::new(xz_writer)),
+		})
 	}
 
 	fn deserialize(bytes: &[u8]) -> Result<MemoryBackend> {
@@ -60,6 +52,28 @@ impl Archive for Xz {
 		}
 
 		Ok(backend)
+	}
+}
+
+impl<W: Write + Seek> ArchiveWriter for XzWriter<W> {
+	fn write_entry(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+		validate_path(path)?;
+		let tar = self.tar.as_mut().ok_or_else(|| ContainerError::Backend("XzWriter already finished".into()))?;
+		let mut header = tar::Header::new_gnu();
+		header.set_path(path).map_err(|error| ContainerError::Backend(format!("tar: invalid path {path}: {error}")))?;
+		header.set_size(bytes.len() as u64);
+		header.set_mode(0o644);
+		header.set_cksum();
+		tar.append(&header, bytes)?;
+		Ok(())
+	}
+
+	fn finish(mut self) -> Result<()> {
+		let mut tar = self.tar.take().ok_or_else(|| ContainerError::Backend("XzWriter already finished".into()))?;
+		tar.finish()?;
+		let xz_writer = tar.into_inner()?;
+		xz_writer.finish().map_err(lzma_err)?;
+		Ok(())
 	}
 }
 

@@ -1,38 +1,32 @@
 //! Zip archive codec.
 
-use crate::archive::{Archive, for_each_file};
+use crate::archive::{Archive, ArchiveWriter};
 use crate::backends::memory::MemoryBackend;
-use crate::{AsyncContainer, Container, ContainerError, Result, validate_path};
-use std::io::{Cursor, Read, Write};
+use crate::{Container, ContainerError, Result, validate_path};
+use std::io::{Cursor, Read, Seek, Write};
 
 /// Cap the pre-allocation hint taken from archive metadata so a malicious
 /// archive cannot trigger a huge allocation before any bytes are read.
 const PREALLOC_CAP: usize = 64 * 1024 * 1024;
+
 use zip::ZipArchive;
-use zip::write::{SimpleFileOptions, ZipWriter};
+use zip::write::{SimpleFileOptions, ZipWriter as InnerZipWriter};
 
 pub struct Zip;
 
+pub struct ZipWriter<W: Write + Seek> {
+	inner: InnerZipWriter<W>,
+	options: SimpleFileOptions,
+}
+
 impl Archive for Zip {
-	async fn serialize_from<S>(src: &S) -> Result<Vec<u8>>
-	where
-		S: AsyncContainer + ?Sized,
-	{
-		let mut buffer = Cursor::new(Vec::new());
-		{
-			let mut writer = ZipWriter::new(&mut buffer);
-			let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+	type Writer<W: Write + Seek> = ZipWriter<W>;
 
-			for_each_file(src, |path, bytes| {
-				writer.start_file(path, options).map_err(zip_err)?;
-				writer.write_all(bytes)?;
-				Ok(())
-			})
-			.await?;
-
-			writer.finish().map_err(zip_err)?;
-		}
-		Ok(buffer.into_inner())
+	fn writer<W: Write + Seek>(output: W) -> Result<Self::Writer<W>> {
+		Ok(ZipWriter {
+			inner: InnerZipWriter::new(output),
+			options: SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
+		})
 	}
 
 	fn deserialize(bytes: &[u8]) -> Result<MemoryBackend> {
@@ -53,6 +47,20 @@ impl Archive for Zip {
 		}
 
 		Ok(backend)
+	}
+}
+
+impl<W: Write + Seek> ArchiveWriter for ZipWriter<W> {
+	fn write_entry(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+		validate_path(path)?;
+		self.inner.start_file(path, self.options).map_err(zip_err)?;
+		self.inner.write_all(bytes)?;
+		Ok(())
+	}
+
+	fn finish(self) -> Result<()> {
+		self.inner.finish().map_err(zip_err)?;
+		Ok(())
 	}
 }
 

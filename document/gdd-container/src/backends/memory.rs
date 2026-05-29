@@ -27,6 +27,11 @@ impl Container for MemoryBackend {
 		Ok(())
 	}
 
+	fn append(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+		self.files.entry(path.to_string()).or_default().extend_from_slice(bytes);
+		Ok(())
+	}
+
 	fn list(&self, prefix: &str) -> Result<Vec<String>> {
 		let normalized = normalize_prefix(prefix);
 		let results = self

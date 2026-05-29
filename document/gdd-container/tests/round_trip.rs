@@ -1,6 +1,6 @@
 use gdd_container::backends::folder::FolderBackend;
 use gdd_container::backends::memory::MemoryBackend;
-use gdd_container::{Container, ContainerError};
+use gdd_container::{AnyContainer, Container, ContainerError};
 
 fn run_round_trip<C: Container>(mut container: C) {
 	container.write("manifest.json", br#"{"format":"gdd"}"#).unwrap();
@@ -53,6 +53,48 @@ fn folder_backend_rejects_path_traversal() {
 		let result = backend.write(bad, b"nope");
 		assert!(matches!(result, Err(ContainerError::InvalidPath(_))), "expected InvalidPath for {bad:?}, got {result:?}");
 	}
+}
+
+fn run_append<C: Container>(mut container: C) {
+	// Appending to a non-existent path creates it — same semantics as `OpenOptions::append().create(true)`.
+	container.append("history.jsonl", b"{\"op\":1}\n").unwrap();
+	container.append("history.jsonl", b"{\"op\":2}\n").unwrap();
+	container.append("history.jsonl", b"{\"op\":3}\n").unwrap();
+
+	let log = container.read("history.jsonl").unwrap();
+	assert_eq!(log.as_slice(), b"{\"op\":1}\n{\"op\":2}\n{\"op\":3}\n");
+}
+
+#[test]
+fn memory_backend_append() {
+	run_append(MemoryBackend::new());
+}
+
+#[test]
+fn folder_backend_append() {
+	let dir = tempfile::tempdir().unwrap();
+	let backend = FolderBackend::create(dir.path()).unwrap();
+	run_append(backend);
+}
+
+#[test]
+fn any_container_dispatches_to_active_variant() {
+	use gdd_container::AsyncContainer;
+
+	let mut container = AnyContainer::Memory(MemoryBackend::new());
+
+	futures::executor::block_on(async {
+		container.write("manifest.json", br#"{"format":"gdd"}"#).await.unwrap();
+		container.append("history.jsonl", b"frame-1\n").await.unwrap();
+		container.append("history.jsonl", b"frame-2\n").await.unwrap();
+
+		assert!(container.exists("manifest.json").await);
+		let manifest = container.read("manifest.json").await.unwrap();
+		assert_eq!(manifest.as_slice(), br#"{"format":"gdd"}"#);
+
+		let history = container.read("history.jsonl").await.unwrap();
+		assert_eq!(history.as_slice(), b"frame-1\nframe-2\n");
+	});
 }
 
 #[test]

@@ -2,7 +2,8 @@
 
 use crate::{ByteHolder, Container, ContainerError, MmappedBytes, Result, validate_path};
 use mmap_io::mmap::{MemoryMappedFile, MmapMode};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub struct FolderBackend {
@@ -24,6 +25,10 @@ impl FolderBackend {
 		let root = root.into();
 		fs::create_dir_all(&root)?;
 		Ok(Self { root })
+	}
+
+	pub fn root(&self) -> &std::path::Path {
+		&self.root
 	}
 
 	fn resolve(&self, path: &str) -> Result<PathBuf> {
@@ -70,6 +75,16 @@ impl Container for FolderBackend {
 			fs::create_dir_all(parent)?;
 		}
 		fs::write(&full, bytes)?;
+		Ok(())
+	}
+
+	fn append(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+		let full = self.resolve(path)?;
+		if let Some(parent) = full.parent() {
+			fs::create_dir_all(parent)?;
+		}
+		let mut file = OpenOptions::new().create(true).append(true).open(&full)?;
+		file.write_all(bytes)?;
 		Ok(())
 	}
 

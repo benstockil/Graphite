@@ -27,6 +27,7 @@ web-sys = { workspace = true, features = [
 	"DomException",
 	"Window",
 	"StorageManager",
+	"FileSystemCreateWritableOptions",
 	"FileSystemDirectoryHandle",
 	"FileSystemFileHandle",
 	"FileSystemGetFileOptions",

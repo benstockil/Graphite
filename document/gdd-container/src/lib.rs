@@ -10,8 +10,6 @@
 //! [`AsyncContainer`] mirrors [`Container`] for inherently async backends; every sync
 //! [`Container`] is reachable from async code via a blanket impl.
 
-use std::future::{Future, ready};
-
 pub mod archive;
 pub mod backends;
 
@@ -36,6 +34,22 @@ impl ByteHolder {
 			#[cfg(not(target_family = "wasm"))]
 			ByteHolder::External { bytes, .. } => bytes.as_ref(),
 		}
+	}
+
+	/// If the bytes are backed by a real filesystem path, return it. Enables consumers to
+	/// short-circuit byte copies with `fs::copy` (CoW on supported filesystems).
+	#[cfg(not(target_family = "wasm"))]
+	pub fn source_path(&self) -> Option<&std::path::Path> {
+		match self {
+			ByteHolder::Owned(_) => None,
+			ByteHolder::Mmapped(bytes) => Some(bytes.path()),
+			ByteHolder::External { path, .. } => Some(path),
+		}
+	}
+
+	#[cfg(target_family = "wasm")]
+	pub fn source_path(&self) -> Option<&std::path::Path> {
+		None
 	}
 
 	/// Open an external file and produce a [`ByteHolder::External`] backed by mmap.
@@ -67,6 +81,10 @@ pub struct MmappedBytes(mmap_io::mmap::MemoryMappedFile);
 impl MmappedBytes {
 	pub fn new(file: mmap_io::mmap::MemoryMappedFile) -> Self {
 		Self(file)
+	}
+
+	pub fn path(&self) -> &std::path::Path {
+		self.0.path()
 	}
 }
 
@@ -137,6 +155,10 @@ pub trait Container {
 	/// Write `bytes` at `path`, creating intermediate directories as needed.
 	fn write(&mut self, path: &str, bytes: &[u8]) -> Result<()>;
 
+	/// Append `bytes` to the file at `path`, creating it (and any intermediate directories)
+	/// if it does not yet exist. Equivalent to `write` on a fresh path.
+	fn append(&mut self, path: &str, bytes: &[u8]) -> Result<()>;
+
 	/// Write `size` bytes whose contents are produced by `fill`.
 	/// The default implementation allocates and forwards to [`Container::write`];
 	/// backends that can mmap a writable region may override to fill in place.
@@ -164,49 +186,155 @@ pub trait Container {
 }
 
 /// Asynchronous virtual filesystem of named byte payloads. Mirrors [`Container`].
+///
+/// The returned futures are intentionally not `Send`: native uses `block_on` at the save seam
+/// and wasm is single-threaded, so neither needs cross-thread futures. Revisit if we ever want
+/// to run container I/O on a thread pool.
+#[allow(async_fn_in_trait, reason = "see trait docs — Send is not required")]
 pub trait AsyncContainer {
-	fn read(&self, path: &str) -> impl Future<Output = Result<ByteHolder>> + '_;
+	async fn read(&self, path: &str) -> Result<ByteHolder>;
 
-	fn write(&mut self, path: &str, bytes: &[u8]) -> impl Future<Output = Result<()>> + '_;
+	async fn write(&mut self, path: &str, bytes: &[u8]) -> Result<()>;
 
-	fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8])) -> impl Future<Output = Result<()>> + '_;
+	async fn append(&mut self, path: &str, bytes: &[u8]) -> Result<()>;
 
-	fn list(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>>> + '_;
+	async fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8])) -> Result<()>;
 
-	fn list_dirs(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>>> + '_;
+	async fn list(&self, prefix: &str) -> Result<Vec<String>>;
 
-	fn exists(&self, path: &str) -> impl Future<Output = bool> + '_;
+	async fn list_dirs(&self, prefix: &str) -> Result<Vec<String>>;
 
-	fn remove(&mut self, path: &str) -> impl Future<Output = Result<()>> + '_;
+	async fn exists(&self, path: &str) -> bool;
+
+	async fn remove(&mut self, path: &str) -> Result<()>;
 }
 
 impl<C: Container + ?Sized> AsyncContainer for C {
-	fn read(&self, path: &str) -> impl Future<Output = Result<ByteHolder>> + '_ {
-		ready(Container::read(self, path))
+	async fn read(&self, path: &str) -> Result<ByteHolder> {
+		Container::read(self, path)
 	}
 
-	fn write(&mut self, path: &str, bytes: &[u8]) -> impl Future<Output = Result<()>> + '_ {
-		ready(Container::write(self, path, bytes))
+	async fn write(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+		Container::write(self, path, bytes)
 	}
 
-	fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8])) -> impl Future<Output = Result<()>> + '_ {
-		ready(Container::write_sized(self, path, size, fill))
+	async fn append(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+		Container::append(self, path, bytes)
 	}
 
-	fn list(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>>> + '_ {
-		ready(Container::list(self, prefix))
+	async fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8])) -> Result<()> {
+		Container::write_sized(self, path, size, fill)
 	}
 
-	fn list_dirs(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>>> + '_ {
-		ready(Container::list_dirs(self, prefix))
+	async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+		Container::list(self, prefix)
 	}
 
-	fn exists(&self, path: &str) -> impl Future<Output = bool> + '_ {
-		ready(Container::exists(self, path))
+	async fn list_dirs(&self, prefix: &str) -> Result<Vec<String>> {
+		Container::list_dirs(self, prefix)
 	}
 
-	fn remove(&mut self, path: &str) -> impl Future<Output = Result<()>> + '_ {
-		ready(Container::remove(self, path))
+	async fn exists(&self, path: &str) -> bool {
+		Container::exists(self, path)
+	}
+
+	async fn remove(&mut self, path: &str) -> Result<()> {
+		Container::remove(self, path)
+	}
+}
+
+/// Type-erased container that dispatches to one of the in-tree backends.
+///
+/// `AsyncContainer::read` returns `impl Future`, so `dyn AsyncContainer` is not object-safe.
+/// `AnyContainer` is the workaround: `Gdd` holds one of these by value, and the `AsyncContainer`
+/// impl forwards to the active variant.
+pub enum AnyContainer {
+	Memory(backends::memory::MemoryBackend),
+	#[cfg(not(target_family = "wasm"))]
+	Folder(backends::folder::FolderBackend),
+	#[cfg(target_family = "wasm")]
+	Opfs(backends::opfs::OpfsBackend),
+}
+
+impl AsyncContainer for AnyContainer {
+	async fn read(&self, path: &str) -> Result<ByteHolder> {
+		match self {
+			Self::Memory(backend) => AsyncContainer::read(backend, path).await,
+			#[cfg(not(target_family = "wasm"))]
+			Self::Folder(backend) => AsyncContainer::read(backend, path).await,
+			#[cfg(target_family = "wasm")]
+			Self::Opfs(backend) => AsyncContainer::read(backend, path).await,
+		}
+	}
+
+	async fn write(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+		match self {
+			Self::Memory(backend) => AsyncContainer::write(backend, path, bytes).await,
+			#[cfg(not(target_family = "wasm"))]
+			Self::Folder(backend) => AsyncContainer::write(backend, path, bytes).await,
+			#[cfg(target_family = "wasm")]
+			Self::Opfs(backend) => AsyncContainer::write(backend, path, bytes).await,
+		}
+	}
+
+	async fn append(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+		match self {
+			Self::Memory(backend) => AsyncContainer::append(backend, path, bytes).await,
+			#[cfg(not(target_family = "wasm"))]
+			Self::Folder(backend) => AsyncContainer::append(backend, path, bytes).await,
+			#[cfg(target_family = "wasm")]
+			Self::Opfs(backend) => AsyncContainer::append(backend, path, bytes).await,
+		}
+	}
+
+	async fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8])) -> Result<()> {
+		match self {
+			Self::Memory(backend) => AsyncContainer::write_sized(backend, path, size, fill).await,
+			#[cfg(not(target_family = "wasm"))]
+			Self::Folder(backend) => AsyncContainer::write_sized(backend, path, size, fill).await,
+			#[cfg(target_family = "wasm")]
+			Self::Opfs(backend) => AsyncContainer::write_sized(backend, path, size, fill).await,
+		}
+	}
+
+	async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+		match self {
+			Self::Memory(backend) => AsyncContainer::list(backend, prefix).await,
+			#[cfg(not(target_family = "wasm"))]
+			Self::Folder(backend) => AsyncContainer::list(backend, prefix).await,
+			#[cfg(target_family = "wasm")]
+			Self::Opfs(backend) => AsyncContainer::list(backend, prefix).await,
+		}
+	}
+
+	async fn list_dirs(&self, prefix: &str) -> Result<Vec<String>> {
+		match self {
+			Self::Memory(backend) => AsyncContainer::list_dirs(backend, prefix).await,
+			#[cfg(not(target_family = "wasm"))]
+			Self::Folder(backend) => AsyncContainer::list_dirs(backend, prefix).await,
+			#[cfg(target_family = "wasm")]
+			Self::Opfs(backend) => AsyncContainer::list_dirs(backend, prefix).await,
+		}
+	}
+
+	async fn exists(&self, path: &str) -> bool {
+		match self {
+			Self::Memory(backend) => AsyncContainer::exists(backend, path).await,
+			#[cfg(not(target_family = "wasm"))]
+			Self::Folder(backend) => AsyncContainer::exists(backend, path).await,
+			#[cfg(target_family = "wasm")]
+			Self::Opfs(backend) => AsyncContainer::exists(backend, path).await,
+		}
+	}
+
+	async fn remove(&mut self, path: &str) -> Result<()> {
+		match self {
+			Self::Memory(backend) => AsyncContainer::remove(backend, path).await,
+			#[cfg(not(target_family = "wasm"))]
+			Self::Folder(backend) => AsyncContainer::remove(backend, path).await,
+			#[cfg(target_family = "wasm")]
+			Self::Opfs(backend) => AsyncContainer::remove(backend, path).await,
+		}
 	}
 }
 

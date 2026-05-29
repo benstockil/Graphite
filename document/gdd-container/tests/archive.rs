@@ -1,17 +1,17 @@
 #![cfg(any(feature = "zip", feature = "xz"))]
 
 use gdd_container::Container;
-use gdd_container::archive::Archive;
+use gdd_container::archive::{Archive, ArchiveWriter};
 use gdd_container::backends::memory::MemoryBackend;
 
-fn make_source() -> MemoryBackend {
-	let mut backend = MemoryBackend::new();
-	backend.write("manifest.json", br#"{"format":"gdd"}"#).unwrap();
-	backend.write("document.json", b"{\"registry\":\"...\"}").unwrap();
-	backend.write("history.jsonl", b"{\"rev\":1}\n{\"rev\":2}\n").unwrap();
-	backend.write("resources/abc123", &[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
-	backend.write("resources/xyz789", b"another resource").unwrap();
-	backend
+fn entries() -> Vec<(&'static str, &'static [u8])> {
+	vec![
+		("manifest.json", br#"{"format":"gdd"}"#),
+		("document.json", b"{\"registry\":\"...\"}"),
+		("history.jsonl", b"{\"rev\":1}\n{\"rev\":2}\n"),
+		("resources/abc123", &[0xDE, 0xAD, 0xBE, 0xEF]),
+		("resources/xyz789", b"another resource"),
+	]
 }
 
 fn assert_round_trip(restored: &MemoryBackend) {
@@ -26,9 +26,16 @@ fn assert_round_trip(restored: &MemoryBackend) {
 #[test]
 fn zip_round_trip() {
 	use gdd_container::archive::Zip;
-	let src = make_source();
-	let bytes = futures::executor::block_on(<Zip as Archive>::serialize_from(&src)).unwrap();
-	let restored = <Zip as Archive>::deserialize(&bytes).unwrap();
+	use std::io::Cursor;
+
+	let mut buffer = Cursor::new(Vec::new());
+	let mut writer = Zip::writer(&mut buffer).unwrap();
+	for (path, bytes) in entries() {
+		writer.write_entry(path, bytes).unwrap();
+	}
+	writer.finish().unwrap();
+
+	let restored = <Zip as Archive>::deserialize(buffer.get_ref()).unwrap();
 	assert_round_trip(&restored);
 }
 
@@ -36,8 +43,15 @@ fn zip_round_trip() {
 #[test]
 fn xz_round_trip() {
 	use gdd_container::archive::Xz;
-	let src = make_source();
-	let bytes = futures::executor::block_on(<Xz as Archive>::serialize_from(&src)).unwrap();
-	let restored = <Xz as Archive>::deserialize(&bytes).unwrap();
+	use std::io::Cursor;
+
+	let mut buffer = Cursor::new(Vec::new());
+	let mut writer = Xz::writer(&mut buffer).unwrap();
+	for (path, bytes) in entries() {
+		writer.write_entry(path, bytes).unwrap();
+	}
+	writer.finish().unwrap();
+
+	let restored = <Xz as Archive>::deserialize(buffer.get_ref()).unwrap();
 	assert_round_trip(&restored);
 }

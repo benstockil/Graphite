@@ -2,11 +2,13 @@
 
 use crate::{AsyncContainer, ByteHolder, ContainerError, Result};
 use js_sys::Uint8Array;
-use std::future::Future;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Blob, DomException, FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetDirectoryOptions, FileSystemGetFileOptions, FileSystemWritableFileStream, WritableStream};
+use web_sys::{
+	Blob, DomException, FileSystemCreateWritableOptions, FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetDirectoryOptions, FileSystemGetFileOptions, FileSystemWritableFileStream,
+	WritableStream,
+};
 
 pub struct OpfsBackend {
 	root: FileSystemDirectoryHandle,
@@ -25,45 +27,39 @@ impl OpfsBackend {
 }
 
 impl AsyncContainer for OpfsBackend {
-	fn read(&self, path: &str) -> impl Future<Output = Result<ByteHolder>> + '_ {
-		let path = path.to_string();
-		async move {
-			let bytes = read_file(&self.root, &path).await.map_err(js_err)?;
-			Ok(ByteHolder::Owned(bytes))
-		}
+	async fn read(&self, path: &str) -> Result<ByteHolder> {
+		let bytes = read_file(&self.root, path).await.map_err(js_err)?;
+		Ok(ByteHolder::Owned(bytes))
 	}
 
-	fn write(&mut self, path: &str, bytes: &[u8]) -> impl Future<Output = Result<()>> + '_ {
-		let path = path.to_string();
-		let bytes = bytes.to_vec();
-		async move { write_file(&self.root, &path, &bytes).await.map_err(js_err) }
+	async fn write(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+		write_file(&self.root, path, bytes).await.map_err(js_err)
 	}
 
-	fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8])) -> impl Future<Output = Result<()>> + '_ {
+	async fn append(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+		append_file(&self.root, path, bytes).await.map_err(js_err)
+	}
+
+	async fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8])) -> Result<()> {
 		let mut buffer = vec![0; size];
 		fill(&mut buffer);
-		let path = path.to_string();
-		async move { write_file(&self.root, &path, &buffer).await.map_err(js_err) }
+		write_file(&self.root, path, &buffer).await.map_err(js_err)
 	}
 
-	fn list(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>>> + '_ {
-		let prefix = prefix.to_string();
-		async move { list_entries(&self.root, &prefix, EntryKind::File).await.map_err(js_err) }
+	async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+		list_entries(&self.root, prefix, EntryKind::File).await.map_err(js_err)
 	}
 
-	fn list_dirs(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>>> + '_ {
-		let prefix = prefix.to_string();
-		async move { list_entries(&self.root, &prefix, EntryKind::Directory).await.map_err(js_err) }
+	async fn list_dirs(&self, prefix: &str) -> Result<Vec<String>> {
+		list_entries(&self.root, prefix, EntryKind::Directory).await.map_err(js_err)
 	}
 
-	fn exists(&self, path: &str) -> impl Future<Output = bool> + '_ {
-		let path = path.to_string();
-		async move { file_exists(&self.root, &path).await }
+	async fn exists(&self, path: &str) -> bool {
+		file_exists(&self.root, path).await
 	}
 
-	fn remove(&mut self, path: &str) -> impl Future<Output = Result<()>> + '_ {
-		let path = path.to_string();
-		async move { remove_file(&self.root, &path).await.map_err(js_err) }
+	async fn remove(&mut self, path: &str) -> Result<()> {
+		remove_file(&self.root, path).await.map_err(js_err)
 	}
 }
 
@@ -115,6 +111,39 @@ async fn write_file(root: &FileSystemDirectoryHandle, path: &str, bytes: &[u8]) 
 	let stream: WritableStream = writable.clone().unchecked_into();
 	let array = Uint8Array::from(bytes);
 
+	if let Err(error) = JsFuture::from(writable.write_with_js_u8_array(&array)?).await {
+		let _ = JsFuture::from(stream.abort()).await;
+		return Err(error);
+	}
+
+	JsFuture::from(stream.close()).await?;
+	Ok(())
+}
+
+async fn append_file(root: &FileSystemDirectoryHandle, path: &str, bytes: &[u8]) -> std::result::Result<(), JsValue> {
+	let (directory, name) = descend(root, path, true).await?;
+
+	let file_options = FileSystemGetFileOptions::new();
+	file_options.set_create(true);
+	let handle: FileSystemFileHandle = JsFuture::from(directory.get_file_handle_with_options(name, &file_options)).await?.dyn_into()?;
+
+	// Determine the current end-of-file so we can seek there before writing.
+	let file_value = JsFuture::from(handle.get_file()).await?;
+	let blob: Blob = file_value.dyn_into()?;
+	let offset = blob.size();
+
+	// `keepExistingData: true` preserves bytes outside the written range; without it OPFS truncates to the written length.
+	let writable_options = FileSystemCreateWritableOptions::new();
+	writable_options.set_keep_existing_data(true);
+	let writable: FileSystemWritableFileStream = JsFuture::from(handle.create_writable_with_options(&writable_options)).await?.dyn_into()?;
+	let stream: WritableStream = writable.clone().unchecked_into();
+
+	if let Err(error) = JsFuture::from(writable.seek_with_f64(offset)?).await {
+		let _ = JsFuture::from(stream.abort()).await;
+		return Err(error);
+	}
+
+	let array = Uint8Array::from(bytes);
 	if let Err(error) = JsFuture::from(writable.write_with_js_u8_array(&array)?).await {
 		let _ = JsFuture::from(stream.abort()).await;
 		return Err(error);
