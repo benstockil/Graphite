@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::hash::Hash;
 use std::ops::Deref;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -250,6 +251,7 @@ pub type DataSources = Box<[DataSource]>;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum DataSource {
 	Embedded,
+	FilePath(PathBuf),
 	Url(url::Url),
 	Font { family: String, style: Option<String> },
 }
