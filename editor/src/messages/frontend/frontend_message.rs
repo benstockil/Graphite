@@ -1,7 +1,7 @@
 use super::IconName;
 use super::utility_types::{MouseCursorIcon, PersistedState};
 use crate::messages::app_window::app_window_message_handler::AppWindowPlatform;
-use crate::messages::frontend::utility_types::{DocumentInfo, EyedropperPreviewImage, FrontendMessageFuture};
+use crate::messages::frontend::utility_types::{DocumentInfo, EyedropperPreviewImage, MessageFuture};
 use crate::messages::input_mapper::utility_types::misc::ActionShortcut;
 use crate::messages::layout::utility_types::widget_prelude::*;
 use crate::messages::portfolio::document::node_graph::utility_types::{
@@ -31,7 +31,7 @@ pub enum FrontendMessage {
 		#[serde(skip, default)]
 		#[derivative(Debug = "ignore", PartialEq = "ignore")]
 		#[cfg_attr(feature = "wasm", tsify(type = "unknown"))]
-		future: FrontendMessageFuture,
+		future: MessageFuture,
 	},
 
 	// Display prefix: make the frontend show something, like a dialog

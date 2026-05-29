@@ -934,7 +934,7 @@ impl MessageHandler<DocumentMessage, DocumentMessageContext<'_>> for DocumentMes
 				let resources_load_handle = resource_storage.resources();
 
 				responses.add(FrontendMessage::Await {
-					future: FrontendMessageFuture::new(async move {
+					future: async move {
 						document.resources.garbage_collect(document.used_resources(false).as_ref());
 						document.resources.embed_resources(resources_load_handle).await;
 
@@ -947,7 +947,9 @@ impl MessageHandler<DocumentMessage, DocumentMessageContext<'_>> for DocumentMes
 							folder,
 							content,
 						}
-					}),
+						.into()
+					}
+					.into(),
 				});
 			}
 			DocumentMessage::SavedDocument { path } => {

@@ -87,29 +87,38 @@ pub struct EyedropperPreviewImage {
 }
 
 #[derive(Clone, Default)]
-pub struct FrontendMessageFuture {
-	inner: Arc<Mutex<Option<InnerFrontendMessageFuture>>>,
+pub struct MessageFuture {
+	inner: Arc<Mutex<Option<InnerMessageFuture>>>,
 }
 
-impl FrontendMessageFuture {
-	pub fn new(future: impl Future<Output = FrontendMessage> + Send + 'static) -> Self {
+impl MessageFuture {
+	pub fn new(future: impl Future<Output = Message> + Send + 'static) -> Self {
 		Self {
 			inner: Arc::new(Mutex::new(Some(Box::pin(future)))),
 		}
 	}
 }
 
-type InnerFrontendMessageFuture = Pin<Box<dyn Future<Output = FrontendMessage> + Send + 'static>>;
+impl<T> From<T> for MessageFuture
+where
+	T: Future<Output = Message> + Send + 'static,
+{
+	fn from(future: T) -> Self {
+		Self::new(future)
+	}
+}
 
-impl IntoFuture for FrontendMessageFuture {
-	type Output = FrontendMessage;
-	type IntoFuture = InnerFrontendMessageFuture;
+type InnerMessageFuture = Pin<Box<dyn Future<Output = Message> + Send + 'static>>;
+
+impl IntoFuture for MessageFuture {
+	type Output = Message;
+	type IntoFuture = InnerMessageFuture;
 
 	fn into_future(self) -> Self::IntoFuture {
 		self.inner
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner())
 			.take()
-			.expect("FrontendMessageFuture can only be awaited once")
+			.expect("MessageFuture can only be awaited once")
 	}
 }

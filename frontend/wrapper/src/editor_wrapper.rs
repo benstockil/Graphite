@@ -148,7 +148,7 @@ impl EditorWrapper {
 		if let FrontendMessage::Await { future } = message {
 			let wrapper = self.clone();
 			wasm_bindgen_futures::spawn_local(async move {
-				wrapper.send_frontend_message_to_js(future.await);
+				wrapper.dispatch(future.await);
 			});
 			return;
 		}
