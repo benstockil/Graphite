@@ -271,8 +271,16 @@ impl Session {
 	pub fn commit_from_runtime<M: NodeMetadataSource>(&mut self, network: &graph_craft::document::NodeNetwork, metadata: &M) -> Result<Vec<Rev>, CommitError> {
 		let target = Registry::from_runtime_with_metadata(network, metadata, self.document.peer)?;
 		let ops = crate::delta::compute_deltas(&self.document.registry, &target);
+		Ok(self.commit_ops(ops, false)?)
+	}
 
-		let mut produced = Vec::with_capacity(ops.len());
+	/// Wrap each op as a `Delta`, apply it, and chain it onto the local history. One tick per op.
+	/// `idempotent` is forwarded to `apply_op`: pass `true` when the registry already reflects the
+	/// op (e.g. retirement of a hot op that was applied at broadcast time) so duplicate
+	/// structural inserts no-op rather than error.
+	fn commit_ops(&mut self, ops: impl IntoIterator<Item = RegistryDelta>, idempotent: bool) -> Result<Vec<Rev>, CrdtError> {
+		let ops = ops.into_iter();
+		let mut produced = Vec::with_capacity(ops.size_hint().0);
 		for op in ops {
 			let reverse = self.document.compute_reverse_delta(&op)?;
 			let timestamp = self.document.clock.tick();
@@ -285,13 +293,107 @@ impl Session {
 			for parent in &delta.parents {
 				assert!(self.document.history.contains_key(parent), "commit parent must be in history");
 			}
-			self.document.apply_op(delta.delta_type.clone(), delta.timestamp, false)?;
+			self.document.apply_op(delta.delta_type.clone(), delta.timestamp, idempotent)?;
 			self.document.history.insert(rev, delta);
 			self.document.head = rev;
 			produced.push(rev);
 		}
 
 		Ok(produced)
+	}
+
+	/// Wrap an already-materialized snapshot. Trusts `registry` to match `history`; advances the
+	/// clock past every observed timestamp but does not re-apply ops.
+	pub fn load(peer: PeerId, registry: Registry, history: HashMap<Rev, Delta>, head: Rev, next_node_counter: u64) -> Self {
+		let mut clock = LamportClock::new(peer);
+		for delta in history.values() {
+			clock.observe(delta.timestamp);
+		}
+
+		Self {
+			document: Document {
+				registry,
+				history,
+				hot_log: Vec::new(),
+				head,
+				clock,
+				peer,
+				last_broadcast_rev: None,
+				next_node_counter,
+			},
+			remote_tips: HashMap::new(),
+		}
+	}
+
+	/// Rebuild the registry from scratch by applying every delta in causal order.
+	/// `deltas` must be in causal order (every parent before its children).
+	pub fn replay_from_history(peer: PeerId, deltas: impl IntoIterator<Item = Delta>, next_node_counter: u64) -> Result<Self, CrdtError> {
+		let mut session = Self::with_peer(peer);
+		session.document.next_node_counter = next_node_counter;
+
+		for delta in deltas {
+			let rev = delta.id;
+			session.document.apply_op(delta.delta_type.clone(), delta.timestamp, true)?;
+			session.document.history.insert(rev, delta);
+			session.document.head = rev;
+		}
+
+		Ok(session)
+	}
+
+	/// Apply a hot op without going through the broadcast stream.
+	pub fn apply_hot_op(&mut self, hot_op: HotOp) -> Result<(), CrdtError> {
+		self.document.apply_hot_op(hot_op)
+	}
+
+	/// Replay a persisted hot op. Idempotent on structural ops, suitable for crash recovery
+	/// where the registry may already reflect the op's effect from a prior retired snapshot.
+	pub fn replay_hot_op(&mut self, hot_op: HotOp) -> Result<(), CrdtError> {
+		self.document.replay_hot_op(hot_op)
+	}
+
+	/// Promote hot ops with timestamp `≤ up_to` into retired deltas, re-applied with fresh
+	/// retirement timestamps so LWW arms bump field timestamps to `T_retire`.
+	///
+	/// Today: one retired delta per hot op. Coarsening is a future step.
+	pub fn retire(&mut self, up_to: TimeStamp) -> Result<Vec<Rev>, CrdtError> {
+		let mut drained = Vec::new();
+		let mut remaining = Vec::with_capacity(self.document.hot_log.len());
+		for hot_op in self.document.hot_log.drain(..) {
+			if hot_op.timestamp <= up_to {
+				drained.push(hot_op);
+			} else {
+				remaining.push(hot_op);
+			}
+		}
+		self.document.hot_log = remaining;
+
+		self.commit_ops(drained.into_iter().map(|hot_op| hot_op.op), true)
+	}
+
+	/// Build a synthetic linear history whose replay reproduces `registry`. Each op gets a
+	/// freshly-ticked clock timestamp and chains to the previous op's `Rev`.
+	pub fn bootstrap_from_registry(peer: PeerId, registry: Registry) -> Result<Self, CrdtError> {
+		let ops = crate::delta::compute_deltas(&Registry::default(), &registry);
+		let mut session = Self::with_peer(peer);
+		session.commit_ops(ops, false)?;
+		Ok(session)
+	}
+
+	pub fn history(&self) -> impl Iterator<Item = &Delta> + '_ {
+		self.document.history.values()
+	}
+
+	pub fn hot_log(&self) -> &[HotOp] {
+		&self.document.hot_log
+	}
+
+	pub fn head_rev(&self) -> Rev {
+		self.document.head
+	}
+
+	pub fn next_node_counter(&self) -> u64 {
+		self.document.next_node_counter
 	}
 }
 
@@ -566,17 +668,17 @@ struct ProtoNode {
 /// observing the same forward delta against different local states would otherwise compute
 /// different Revs for the same logical op.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct Delta {
-	id: Rev,
-	parents: Vec<Rev>,
-	author: PeerId,
-	timestamp: TimeStamp,
-	delta_type: RegistryDelta,
-	reverse: RegistryDelta,
+pub struct Delta {
+	pub id: Rev,
+	pub parents: Vec<Rev>,
+	pub author: PeerId,
+	pub timestamp: TimeStamp,
+	pub delta_type: RegistryDelta,
+	pub reverse: RegistryDelta,
 }
 
 impl Delta {
-	fn new(parents: Vec<Rev>, author: PeerId, timestamp: TimeStamp, delta_type: RegistryDelta, reverse: RegistryDelta) -> Self {
+	pub fn new(parents: Vec<Rev>, author: PeerId, timestamp: TimeStamp, delta_type: RegistryDelta, reverse: RegistryDelta) -> Self {
 		let id = compute_rev(&parents, author, timestamp, &delta_type);
 		Self {
 			id,
@@ -721,7 +823,18 @@ impl Document {
 	/// Apply a live broadcast op. Updates the registry via LWW and appends to the hot log.
 	/// Doesn't touch history or `head` — hot ops are transient.
 	pub fn apply_hot_op(&mut self, hot_op: HotOp) -> Result<(), CrdtError> {
-		self.apply_op(hot_op.op.clone(), hot_op.timestamp, false)?;
+		self.apply_hot_op_with(hot_op, false)
+	}
+
+	/// Replay a hot op recovered from persisted state. Idempotent on structural ops so that
+	/// re-applying an op whose effect is already reflected in the registry is a no-op rather
+	/// than an error.
+	pub fn replay_hot_op(&mut self, hot_op: HotOp) -> Result<(), CrdtError> {
+		self.apply_hot_op_with(hot_op, true)
+	}
+
+	fn apply_hot_op_with(&mut self, hot_op: HotOp, idempotent: bool) -> Result<(), CrdtError> {
+		self.apply_op(hot_op.op.clone(), hot_op.timestamp, idempotent)?;
 		self.hot_log.push(hot_op);
 		Ok(())
 	}
