@@ -1,13 +1,13 @@
 [package]
 name = "document-format"
-description = "Typed handle for the .gdd document format, sitting over graph-storage and gdd-container"
+description = "Typed handle for the .gdd document format, sitting over graph-storage and document-container"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
 
 [dependencies]
-gdd-container = { path = "../gdd-container", features = ["zip", "xz"] }
+document-container = { path = "../document-container", features = ["zip", "xz"] }
 graph-storage = { workspace = true }
 graph-craft = { workspace = true }
 graphene-resource = { workspace = true }

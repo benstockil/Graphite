@@ -1,8 +1,8 @@
 #![cfg(any(feature = "zip", feature = "xz"))]
 
-use gdd_container::Container;
-use gdd_container::archive::{Archive, ArchiveWriter};
-use gdd_container::backends::memory::MemoryBackend;
+use document_container::Container;
+use document_container::archive::{Archive, ArchiveWriter};
+use document_container::backends::memory::MemoryBackend;
 
 fn entries() -> Vec<(&'static str, &'static [u8])> {
 	vec![
@@ -25,7 +25,7 @@ fn assert_round_trip(restored: &MemoryBackend) {
 #[cfg(feature = "zip")]
 #[test]
 fn zip_round_trip() {
-	use gdd_container::archive::Zip;
+	use document_container::archive::Zip;
 	use std::io::Cursor;
 
 	let mut buffer = Cursor::new(Vec::new());
@@ -42,7 +42,7 @@ fn zip_round_trip() {
 #[cfg(feature = "xz")]
 #[test]
 fn xz_round_trip() {
-	use gdd_container::archive::Xz;
+	use document_container::archive::Xz;
 	use std::io::Cursor;
 
 	let mut buffer = Cursor::new(Vec::new());

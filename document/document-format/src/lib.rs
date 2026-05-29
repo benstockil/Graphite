@@ -1,6 +1,6 @@
 //! Typed handle for `.gdd` documents.
 //!
-//! [`Gdd`] owns a [`graph_storage::Session`] plus a working-copy [`gdd_container::AnyContainer`].
+//! [`Gdd`] owns a [`graph_storage::Session`] plus a working-copy [`document_container::AnyContainer`].
 //! Mutations flow through `Gdd` to keep the session and the on-disk working copy mirrored.
 //! Export is a separate, explicit operation — see [`export::ExportFormat`].
 //!
@@ -9,9 +9,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use gdd_container::archive::Archive;
-use gdd_container::backends::folder::FolderBackend;
-use gdd_container::{AnyContainer, AsyncContainer, ByteHolder, ContainerError};
+use document_container::archive::Archive;
+use document_container::backends::folder::FolderBackend;
+use document_container::{AnyContainer, AsyncContainer, ByteHolder, ContainerError};
 use graph_storage::{CommitError, CrdtError, Delta, HotOp, NodeMetadataSource, PeerId, Registry, Rev, Session, TimeStamp};
 use graphene_resource::ResourceHash;
 
@@ -70,7 +70,7 @@ impl<L: Layout + Default> Gdd<L> {
 }
 
 impl<L: Layout> Gdd<L> {
-	/// Backend-agnostic open. Splits out so tests can supply a [`gdd_container::backends::memory::MemoryBackend`].
+	/// Backend-agnostic open. Splits out so tests can supply a [`document_container::backends::memory::MemoryBackend`].
 	pub async fn open_in(working: AnyContainer, layout: L) -> Result<Self, OpenError> {
 		let (manifest, _): (Manifest, _) = io::read_single_by_basename(&working, layout.manifest_basename()).await?;
 		validate_manifest(&manifest)?;
@@ -361,22 +361,22 @@ impl<L: Layout> Gdd<L> {
 
 		match format {
 			ExportFormat::Folder { .. } => {
-				let mut folder = gdd_container::backends::folder::FolderBackend::create(dest)?;
+				let mut folder = document_container::backends::folder::FolderBackend::create(dest)?;
 				let mut sink = FolderSink { folder: &mut folder };
 				self.stream_entries(codec, options, &mut sink).await?;
 			}
 			ExportFormat::Zip { .. } => {
-				let file = std::fs::File::create(dest).map_err(gdd_container::ContainerError::Io)?;
-				let mut writer = gdd_container::archive::Zip::writer(file)?;
+				let file = std::fs::File::create(dest).map_err(document_container::ContainerError::Io)?;
+				let mut writer = document_container::archive::Zip::writer(file)?;
 				self.stream_entries(codec, options, &mut writer).await?;
-				use gdd_container::archive::ArchiveWriter;
+				use document_container::archive::ArchiveWriter;
 				writer.finish()?;
 			}
 			ExportFormat::Xz { .. } => {
-				let file = std::fs::File::create(dest).map_err(gdd_container::ContainerError::Io)?;
-				let mut writer = gdd_container::archive::Xz::writer(file)?;
+				let file = std::fs::File::create(dest).map_err(document_container::ContainerError::Io)?;
+				let mut writer = document_container::archive::Xz::writer(file)?;
 				self.stream_entries(codec, options, &mut writer).await?;
-				use gdd_container::archive::ArchiveWriter;
+				use document_container::archive::ArchiveWriter;
 				writer.finish()?;
 			}
 		}
@@ -390,7 +390,7 @@ impl<L: Layout> Gdd<L> {
 	/// with `codec` and passing resources verbatim. Each entry is written one at a time so the
 	/// sink only ever sees one payload's bytes at a time.
 	async fn stream_entries(&self, codec: Codec, options: ExportOptions, sink: &mut dyn ExportSink) -> Result<(), ExportError> {
-		use gdd_container::AsyncContainer;
+		use document_container::AsyncContainer;
 
 		let manifest = self.read_manifest().await?;
 		sink.write_entry(&io::path_for(self.layout.manifest_basename(), codec), &codec.write_single(&manifest)?)?;
@@ -433,43 +433,43 @@ trait ExportSink {
 	/// forwards to `write_entry`; sinks like the folder writer override to use `fs::copy`
 	/// (CoW on supported filesystems, kernel-side copy otherwise).
 	fn write_entry_from_path(&mut self, path: &str, src: &std::path::Path) -> Result<(), ExportError> {
-		let bytes = std::fs::read(src).map_err(gdd_container::ContainerError::Io)?;
+		let bytes = std::fs::read(src).map_err(document_container::ContainerError::Io)?;
 		self.write_entry(path, &bytes)
 	}
 }
 
 struct FolderSink<'a> {
-	folder: &'a mut gdd_container::backends::folder::FolderBackend,
+	folder: &'a mut document_container::backends::folder::FolderBackend,
 }
 
 impl ExportSink for FolderSink<'_> {
 	fn write_entry(&mut self, path: &str, bytes: &[u8]) -> Result<(), ExportError> {
-		gdd_container::Container::write(self.folder, path, bytes)?;
+		document_container::Container::write(self.folder, path, bytes)?;
 		Ok(())
 	}
 
 	fn write_entry_from_path(&mut self, path: &str, src: &std::path::Path) -> Result<(), ExportError> {
-		gdd_container::validate_path(path)?;
+		document_container::validate_path(path)?;
 		let dest = self.folder.root().join(path);
 		if let Some(parent) = dest.parent() {
-			std::fs::create_dir_all(parent).map_err(gdd_container::ContainerError::Io)?;
+			std::fs::create_dir_all(parent).map_err(document_container::ContainerError::Io)?;
 		}
-		std::fs::copy(src, &dest).map_err(gdd_container::ContainerError::Io)?;
+		std::fs::copy(src, &dest).map_err(document_container::ContainerError::Io)?;
 		Ok(())
 	}
 }
 
-impl<W: std::io::Write + std::io::Seek> ExportSink for gdd_container::archive::ZipWriter<W> {
+impl<W: std::io::Write + std::io::Seek> ExportSink for document_container::archive::ZipWriter<W> {
 	fn write_entry(&mut self, path: &str, bytes: &[u8]) -> Result<(), ExportError> {
-		use gdd_container::archive::ArchiveWriter;
+		use document_container::archive::ArchiveWriter;
 		ArchiveWriter::write_entry(self, path, bytes)?;
 		Ok(())
 	}
 }
 
-impl<W: std::io::Write + std::io::Seek> ExportSink for gdd_container::archive::XzWriter<W> {
+impl<W: std::io::Write + std::io::Seek> ExportSink for document_container::archive::XzWriter<W> {
 	fn write_entry(&mut self, path: &str, bytes: &[u8]) -> Result<(), ExportError> {
-		use gdd_container::archive::ArchiveWriter;
+		use document_container::archive::ArchiveWriter;
 		ArchiveWriter::write_entry(self, path, bytes)?;
 		Ok(())
 	}

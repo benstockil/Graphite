@@ -1,6 +1,6 @@
-use gdd_container::backends::folder::FolderBackend;
-use gdd_container::backends::memory::MemoryBackend;
-use gdd_container::{AnyContainer, Container, ContainerError};
+use document_container::backends::folder::FolderBackend;
+use document_container::backends::memory::MemoryBackend;
+use document_container::{AnyContainer, Container, ContainerError};
 
 fn run_round_trip<C: Container>(mut container: C) {
 	container.write("manifest.json", br#"{"format":"gdd"}"#).unwrap();
@@ -79,7 +79,7 @@ fn folder_backend_append() {
 
 #[test]
 fn any_container_dispatches_to_active_variant() {
-	use gdd_container::AsyncContainer;
+	use document_container::AsyncContainer;
 
 	let mut container = AnyContainer::Memory(MemoryBackend::new());
 

@@ -1267,6 +1267,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2db04e74f0a9a93103b50e90b96024c9b2bdca8bce6a632ec71b88736d3d359"
 
 [[package]]
+name = "document-container"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "js-sys",
+ "log",
+ "lzma-rust2",
+ "mmap-io",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "zip",
+]
+
+[[package]]
 name = "document-features"
 version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1281,8 +1299,8 @@ version = "0.0.0"
 dependencies = [
  "chrono",
  "core-types",
+ "document-container",
  "futures",
- "gdd-container",
  "graph-craft",
  "graph-storage",
  "graphene-resource",
@@ -1764,24 +1782,6 @@ dependencies = [
  "pin-project-lite",
  "pin-utils",
  "slab",
-]
-
-[[package]]
-name = "gdd-container"
-version = "0.0.0"
-dependencies = [
- "futures",
- "js-sys",
- "log",
- "lzma-rust2",
- "mmap-io",
- "tar",
- "tempfile",
- "thiserror 2.0.18",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "zip",
 ]
 
 [[package]]

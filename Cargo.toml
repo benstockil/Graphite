@@ -8,7 +8,7 @@ members = [
 	"desktop/platform/mac",
 	"desktop/platform/win",
 	"document/graph-storage",
-	"document/gdd-container",
+	"document/document-container",
 	"document/document-format",
 	"editor",
 	"frontend/wrapper",

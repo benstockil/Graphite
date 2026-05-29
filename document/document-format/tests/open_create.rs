@@ -1,6 +1,6 @@
+use document_container::AnyContainer;
+use document_container::backends::memory::MemoryBackend;
 use document_format::{Codec, Gdd, GddV1, Layout, Manifest, OpenError, io, manifest};
-use gdd_container::AnyContainer;
-use gdd_container::backends::memory::MemoryBackend;
 use graph_storage::{HotOp, Network, NetworkId, PeerId, ROOT_NETWORK, RegistryDelta, TimeStamp};
 
 fn empty_container() -> AnyContainer {
@@ -60,7 +60,7 @@ fn open_in_picks_up_alternate_codec_for_manifest() {
 
 		// Read the current manifest, drop the .json copy, re-emit as .jsonl.
 		let (manifest, _): (Manifest, _) = io::read_single_by_basename(&working, layout.manifest_basename()).await.unwrap();
-		use gdd_container::AsyncContainer;
+		use document_container::AsyncContainer;
 		working.remove(&io::path_for(layout.manifest_basename(), Codec::Json)).await.unwrap();
 		io::write_single_by_basename(&mut working, layout.manifest_basename(), Codec::JsonLines, &manifest).await.unwrap();
 
@@ -217,8 +217,8 @@ fn export_folder_round_trips_through_open() {
 
 #[test]
 fn export_zip_round_trips_via_deserialize() {
+	use document_container::archive::{Archive, Zip};
 	use document_format::{ExportFormat, ExportOptions};
-	use gdd_container::archive::{Archive, Zip};
 
 	futures::executor::block_on(async {
 		let gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(4), 0xCD, "ed".into(), "std".into())
@@ -234,7 +234,7 @@ fn export_zip_round_trips_via_deserialize() {
 
 		let bytes = std::fs::read(&dest).unwrap();
 		let restored = Zip::deserialize(&bytes).unwrap();
-		use gdd_container::Container;
+		use document_container::Container;
 		assert!(restored.exists("manifest.bin"));
 		assert!(restored.exists("registry.bin"));
 		assert!(!restored.exists("session.json"));
@@ -318,8 +318,8 @@ fn resource_survives_reopen() {
 
 #[test]
 fn resource_from_path_uses_fs_copy_on_folder_backend() {
-	use gdd_container::AnyContainer;
-	use gdd_container::backends::folder::FolderBackend;
+	use document_container::AnyContainer;
+	use document_container::backends::folder::FolderBackend;
 	use graphene_resource::ResourceHash;
 
 	futures::executor::block_on(async {

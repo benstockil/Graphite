@@ -1,5 +1,5 @@
 [package]
-name = "gdd-container"
+name = "document-container"
 description = "Container abstraction for the on-disk side of the .gdd document format"
 edition.workspace = true
 version.workspace = true

@@ -1,7 +1,7 @@
-//! Bridge between [`crate::Codec`] and [`gdd_container::AnyContainer`]. Reads and writes
+//! Bridge between [`crate::Codec`] and [`document_container::AnyContainer`]. Reads and writes
 //! to/from basenames, picking the codec by extension on read.
 
-use gdd_container::{AnyContainer, AsyncContainer};
+use document_container::{AnyContainer, AsyncContainer};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -20,7 +20,7 @@ pub enum ReadError {
 	#[error("no file found for basename {basename:?} with any known codec")]
 	NotFound { basename: String },
 	#[error("container error: {0}")]
-	Container(#[from] gdd_container::ContainerError),
+	Container(#[from] document_container::ContainerError),
 	#[error("codec error: {0}")]
 	Codec(#[from] CodecError),
 }
@@ -51,7 +51,7 @@ pub async fn basename_exists(container: &AnyContainer, basename: &str) -> bool {
 	false
 }
 
-async fn read_bytes_by_basename(container: &AnyContainer, basename: &str) -> Result<(gdd_container::ByteHolder, Codec), ReadError> {
+async fn read_bytes_by_basename(container: &AnyContainer, basename: &str) -> Result<(document_container::ByteHolder, Codec), ReadError> {
 	for &codec in KNOWN_CODECS {
 		let path = path_for(basename, codec);
 		if container.exists(&path).await {
