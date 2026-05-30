@@ -72,7 +72,7 @@ pub fn text_bounding_box(layer: LayerNodeIdentifier, document: &DocumentMessageH
 	}
 
 	// Fallback: recompute from text content (e.g. layer hasn't rendered yet)
-	let Some((text, font, typesetting, _)) = get_text(layer, &document.network_interface, fonts, &document.resources.registry) else {
+	let Some((text, font, typesetting, _)) = get_text(layer, &document.network_interface, fonts, &document.resources) else {
 		return Quad::from_box([DVec2::ZERO, DVec2::ZERO]);
 	};
 	let blob = fonts.get_blob_or_queue_load(&font, responses);

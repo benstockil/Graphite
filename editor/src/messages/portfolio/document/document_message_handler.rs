@@ -233,10 +233,11 @@ impl MessageHandler<DocumentMessage, DocumentMessageContext<'_>> for DocumentMes
 			}
 			DocumentMessage::PropertiesPanel(message) => {
 				let context = PropertiesPanelMessageContext {
+					executor,
 					network_interface: &mut self.network_interface,
+					resources: &self.resources,
 					selection_network_path: &self.selection_network_path,
 					document_name: self.name.as_str(),
-					executor,
 					fonts,
 					properties_panel_open,
 				};

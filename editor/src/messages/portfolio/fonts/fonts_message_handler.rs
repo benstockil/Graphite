@@ -1,7 +1,7 @@
 use crate::messages::portfolio::fonts::FALLBACK_FONT_BLOB;
 use crate::messages::portfolio::fonts::utility_types::FontCatalog;
 use crate::messages::prelude::*;
-use graph_craft::application_io::resource::{DataSource, Resource, ResourceHash, ResourceId, ResourceRegistry};
+use graph_craft::application_io::resource::{DataSource, Resource, ResourceHash, ResourceId};
 use graphene_std::text::{Blob, Font};
 use std::sync::Arc;
 
@@ -113,8 +113,8 @@ impl FontsMessageHandler {
 
 	/// Read the [`Font`] recorded for a resource id in the given document registry (its first
 	/// `DataSource::Font` source). Used by the font picker to display the current selection.
-	pub fn id_font(&self, registry: &ResourceRegistry, resource_id: ResourceId) -> Option<Font> {
-		let info = registry.info(&resource_id)?;
+	pub fn id_font(&self, resources: &ResourceMessageHandler, resource_id: ResourceId) -> Option<Font> {
+		let info = resources.registry.info(&resource_id)?;
 		info.sources.iter().find_map(|source| match source {
 			DataSource::Font { family, style } => Some(font_from_pair(family, style.as_deref())),
 			_ => None,

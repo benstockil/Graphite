@@ -60,14 +60,14 @@ pub fn commit_value<T>(_: &T) -> Message {
 /// follow-up `RunDocumentGraph`, the registry already knows about the id. Otherwise the preprocessor
 /// would see an unresolved `Resource(id)` and fail with `ResourceNotFound`, and (when the font is already
 /// cached in `font_hashes`) no further `RunDocumentGraph` would re-fire to recover.
-pub fn assign_font_message(node_id: NodeId, input_index: usize, font: Font) -> Message {
+pub fn assign_font_message(node_id: NodeId, font: Font) -> Message {
 	let resource_id = graph_craft::application_io::resource::ResourceId::new();
 	Message::Batched {
 		messages: Box::new([
 			DocumentMessage::Resource(ResourceMessage::AddFont { resource_id, font }).into(),
 			NodeGraphMessage::SetInputValue {
 				node_id,
-				input_index,
+				input_index: graphene_std::text::text::FontInput::INDEX,
 				value: TaggedValue::Resource(resource_id),
 			}
 			.into(),
@@ -845,7 +845,12 @@ pub fn array_of_number_widget(parameter_widgets_info: ParameterWidgetsInfo, text
 
 pub fn font_inputs(parameter_widgets_info: ParameterWidgetsInfo) -> (Vec<WidgetInstance>, Option<Vec<WidgetInstance>>) {
 	let ParameterWidgetsInfo {
-		document_node, node_id, index, fonts, ..
+		document_node,
+		node_id,
+		index,
+		resources,
+		fonts,
+		..
 	} = parameter_widgets_info;
 
 	let mut first_widgets = start_widgets(parameter_widgets_info);
@@ -857,13 +862,12 @@ pub fn font_inputs(parameter_widgets_info: ParameterWidgetsInfo) -> (Vec<WidgetI
 		return (vec![], None);
 	};
 
-	if let Some(TaggedValue::Resource(_resource_id)) = input.as_non_exposed_value() {
+	if let Some(TaggedValue::Resource(resource_id)) = input.as_non_exposed_value() {
 		// The font's family/style live in the resource's `DataSource::Font`. The picker mints a fresh `ResourceId`,
 		// wires it into the text node's font input, and registers the `DataSource::Font` for that id via
 		// `ResourceMessage::AddFont`. `NodePropertiesContext` doesn't carry the registry, so the "currently selected"
 		// dropdown labels fall back to the default font for now.
-		let font = Font::default();
-		let font_input_index = graphene_std::text::text::FontInput::INDEX;
+		let font = fonts.id_font(resources, *resource_id).unwrap_or_default();
 		first_widgets.extend_from_slice(&[
 			Separator::new(SeparatorStyle::Unrelated).widget_instance(),
 			DropdownInput::new(vec![
@@ -878,10 +882,10 @@ pub fn font_inputs(parameter_widgets_info: ParameterWidgetsInfo) -> (Vec<WidgetI
 						MenuListEntry::new(family.name.clone())
 							.label(family.name.clone())
 							.font(family.closest_style(400, false).preview_url(&family.name))
-							.on_update(move |_| assign_font_message(node_id, font_input_index, new_font.clone()))
+							.on_update(move |_| assign_font_message(node_id, new_font.clone()))
 							.on_commit(move |_| {
 								DeferMessage::AfterGraphRun {
-									messages: vec![assign_font_message(node_id, font_input_index, commit_font.clone()), commit_value(&())],
+									messages: vec![assign_font_message(node_id, commit_font.clone()), commit_value(&())],
 								}
 								.into()
 							})
@@ -910,7 +914,7 @@ pub fn font_inputs(parameter_widgets_info: ParameterWidgetsInfo) -> (Vec<WidgetI
 							let new_font = Font::new(font_family, font_style.clone());
 							MenuListEntry::new(font_style.clone())
 								.label(font_style)
-								.on_update(move |_| assign_font_message(node_id, font_input_index, new_font.clone()))
+								.on_update(move |_| assign_font_message(node_id, new_font.clone()))
 								.on_commit(commit_value)
 						};
 
@@ -2791,7 +2795,7 @@ pub fn math_properties(node_id: NodeId, context: &mut NodePropertiesContext) -> 
 
 pub struct ParameterWidgetsInfo<'a> {
 	network_interface: &'a NodeNetworkInterface,
-	fonts: &'a FontsMessageHandler,
+	resources: &'a ResourceMessageHandler,
 	selection_network_path: &'a [NodeId],
 	document_node: Option<&'a DocumentNode>,
 	node_id: NodeId,
@@ -2801,6 +2805,7 @@ pub struct ParameterWidgetsInfo<'a> {
 	input_type: FrontendGraphDataType,
 	blank_assist: bool,
 	exposable: bool,
+	fonts: &'a FontsMessageHandler,
 }
 
 impl<'a> ParameterWidgetsInfo<'a> {
@@ -2813,9 +2818,10 @@ impl<'a> ParameterWidgetsInfo<'a> {
 		let document_node = context.network_interface.document_node(&node_id, context.selection_network_path);
 
 		ParameterWidgetsInfo {
-			fonts: context.fonts,
 			network_interface: context.network_interface,
+			resources: context.resources,
 			selection_network_path: context.selection_network_path,
+			fonts: context.fonts,
 			document_node,
 			node_id,
 			index,

@@ -111,10 +111,9 @@ fn create_text_widgets(tool: &TextTool, font_catalog: &FontCatalog, document: &D
 	// for the next created text.
 	let text_node_id = can_edit_selected(document).and_then(|layer| graph_modification_utils::get_text_id(layer, &document.network_interface));
 
-	let font_input_index = graphene_std::text::text::FontInput::INDEX;
 	let apply_font = move |new_font: Font| -> Message {
 		match text_node_id {
-			Some(node_id) => crate::messages::portfolio::document::node_graph::node_properties::assign_font_message(node_id, font_input_index, new_font),
+			Some(node_id) => crate::messages::portfolio::document::node_graph::node_properties::assign_font_message(node_id, new_font),
 			None => TextToolMessage::UpdateOptions {
 				options: TextOptionsUpdate::Font { font: new_font },
 			}
@@ -289,7 +288,7 @@ impl<'a> MessageHandler<ToolMessage, &mut ToolActionMessageContext<'a>> for Text
 			ToolMessage::Text(TextToolMessage::UpdateOptions { options }) => options,
 			ToolMessage::Text(TextToolMessage::SelectionChanged) => {
 				if let Some(layer) = can_edit_selected(context.document)
-					&& let Some((_, font, typesetting, _)) = graph_modification_utils::get_text(layer, &context.document.network_interface, context.fonts, &context.document.resources.registry)
+					&& let Some((_, font, typesetting, _)) = graph_modification_utils::get_text(layer, &context.document.network_interface, context.fonts, &context.document.resources)
 				{
 					self.options.align = typesetting.align;
 					self.options.font_size = typesetting.font_size;
@@ -507,7 +506,7 @@ impl TextToolData {
 	fn load_layer_text_node(&mut self, document: &DocumentMessageHandler, fonts: &FontsMessageHandler) -> Option<()> {
 		let transform = document.metadata().transform_to_viewport(self.layer);
 		let color = graph_modification_utils::get_fill_color(self.layer, &document.network_interface).unwrap_or(Color::BLACK);
-		let (text, font, typesetting, _) = graph_modification_utils::get_text(self.layer, &document.network_interface, fonts, &document.resources.registry)?;
+		let (text, font, typesetting, _) = graph_modification_utils::get_text(self.layer, &document.network_interface, fonts, &document.resources)?;
 		self.editing_text = Some(EditingText {
 			text: text.clone(),
 			font,
@@ -647,7 +646,6 @@ impl Fsm for TextToolFsmState {
 		responses: &mut VecDeque<Message>,
 	) -> Self {
 		let ToolActionMessageContext { document, input, fonts, viewport, .. } = transition_data;
-		let fonts: &FontsMessageHandler = &**fonts;
 		let fill_color = COLOR_OVERLAY_BLUE_05;
 
 		let ToolMessage::Text(event) = event else { return self };
@@ -700,7 +698,7 @@ impl Fsm for TextToolFsmState {
 						bounding_box_manager.render_quad(&mut overlay_context);
 						// Draw red overlay if text is clipped
 						let transformed_quad = layer_transform * bounds;
-						if let Some((text, font, typesetting, _)) = graph_modification_utils::get_text(layer.unwrap(), &document.network_interface, fonts, &document.resources.registry) {
+						if let Some((text, font, typesetting, _)) = graph_modification_utils::get_text(layer.unwrap(), &document.network_interface, fonts, &document.resources) {
 							let blob = fonts.get_blob_or_queue_load(&font, responses);
 							if lines_clipping(text.as_str(), &blob, typesetting) {
 								overlay_context.line(transformed_quad.0[2], transformed_quad.0[3], Some(COLOR_OVERLAY_RED), Some(3.));
