@@ -426,6 +426,10 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 					document.garbage_collect_resources();
 					used_resources.extend(document.resources.registry.resolved().filter_map(|info| info.hash.cloned()));
 				}
+				// Fonts loaded earlier in the session may not be referenced by any current document but still need
+				// to survive — the picker can re-assign them at any moment, and re-fetching would cause a render
+				// blank-out while the bytes come back from the network.
+				used_resources.extend(self.fonts.used_resources());
 				responses.add(ResourceStorageMessage::GarbageCollect {
 					used: Vec::from_iter(used_resources).into_boxed_slice(),
 				});

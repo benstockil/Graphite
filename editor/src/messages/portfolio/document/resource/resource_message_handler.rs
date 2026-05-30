@@ -57,8 +57,13 @@ impl MessageHandler<ResourceMessage, ResourceMessageContext<'_>> for ResourceMes
 			ResourceMessage::Resolve => {
 				let unresolved_ids: Vec<ResourceId> = self.registry.unresolved().map(|info| info.id).collect();
 				for id in unresolved_ids {
-					self.pending_resolves.entry(id).or_default();
-					responses.add(ResourceMessage::ResolveStep { resource_id: id });
+					// Only kick off a step if this id isn't already mid-walk; otherwise a second `Resolve` (often
+					// queued right after `AddFont`) would queue another `ResolveStep` whose counter is already
+					// past the available sources, producing "no more sources to try" errors.
+					if !self.pending_resolves.contains_key(&id) {
+						self.pending_resolves.insert(id, ResolveProgress::default());
+						responses.add(ResourceMessage::ResolveStep { resource_id: id });
+					}
 				}
 			}
 			ResourceMessage::ResolveStep { resource_id } => {

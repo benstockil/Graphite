@@ -121,9 +121,12 @@ impl FontsMessageHandler {
 		})
 	}
 
-	/// Hashes held by the byte cache, so they survive resource garbage collection.
-	pub fn used_hashes(&self) -> impl Iterator<Item = ResourceHash> + '_ {
-		self.font_data.keys().copied()
+	/// Every content hash this handler has learned about (from both the lazy byte cache and the `Font → hash`
+	/// index), so they survive `PortfolioMessage::GarbageCollectResources`. Without this, a font that was
+	/// resolved earlier in the session would be GC'd from storage as soon as no live document referenced it,
+	/// even though we still need its hash for the next picker action.
+	pub fn used_resources(&self) -> impl Iterator<Item = ResourceHash> + '_ {
+		self.font_hashes.values().copied().chain(self.font_data.keys().copied())
 	}
 
 	/// Snap a requested font to the closest style present in the catalog.
