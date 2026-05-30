@@ -111,9 +111,9 @@ impl MessageHandler<ResourceMessage, ResourceMessageContext<'_>> for ResourceMes
 							progress.next += 1;
 							return;
 						}
-						// Catalog hasn't loaded yet: ask the frontend to load it and try this id again afterwards.
+						// Catalog hasn't loaded yet. Ask the frontend to load it and leave this id pending; `CatalogLoaded`
+						// will broadcast `PortfolioMessage::ResolveAllResources`, which re-walks this id with the URL available.
 						responses.add(FrontendMessage::TriggerFontCatalogLoad);
-						responses.add(ResourceMessage::ResolveStep { resource_id });
 					}
 				}
 			}
@@ -136,6 +136,8 @@ impl MessageHandler<ResourceMessage, ResourceMessageContext<'_>> for ResourceMes
 
 				// Auto-Resolve hook: other ids might now resolve via the freshly learnt font hash.
 				responses.add(ResourceMessage::Resolve);
+				// Re-render the document graph now that the formerly-unresolved id has bytes.
+				responses.add(NodeGraphMessage::RunDocumentGraph);
 			}
 		}
 	}

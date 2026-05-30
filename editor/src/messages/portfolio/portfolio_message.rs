@@ -63,6 +63,9 @@ pub enum PortfolioMessage {
 		resource_id: ResourceId,
 		data: Arc<[u8]>,
 	},
+	/// Re-walk every document's unresolved resource ids. Fired by `FontsMessage::CatalogLoaded` so font ids that
+	/// gave up waiting for a URL get another shot.
+	ResolveAllResources,
 	LoadPersistedState {
 		state: PersistedState,
 	},

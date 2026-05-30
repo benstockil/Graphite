@@ -249,12 +249,15 @@ impl<'a> ModifyInputsContext<'a> {
 	}
 
 	pub fn insert_text(&mut self, text: String, font: Font, typesetting: TypesettingConfig, layer: LayerNodeIdentifier) {
+		// Use a default `Resource(0)` placeholder for the font input here — the real resource id is minted
+		// by `ResourceMessage::SetFont` below, which also pushes the `DataSource::Font` into the document's registry
+		// and kicks off `Resolve`. Input 0 is `None` so the node uses its default primary `()` value.
 		let text = resolve_proto_node_type(graphene_std::text::text::IDENTIFIER)
 			.expect("Text node does not exist")
 			.node_template_input_override([
-				Some(NodeInput::scope("editor-api")),
+				Some(NodeInput::value(TaggedValue::None, false)),
 				Some(NodeInput::value(TaggedValue::String(text), false)),
-				Some(NodeInput::value(TaggedValue::Font(font), false)),
+				Some(NodeInput::value(TaggedValue::Resource(ResourceId::default()), false)),
 				Some(NodeInput::value(TaggedValue::F64(typesetting.font_size), false)),
 				Some(NodeInput::value(TaggedValue::F64(typesetting.line_height_ratio), false)),
 				Some(NodeInput::value(TaggedValue::F64(typesetting.character_spacing), false)),
@@ -264,6 +267,7 @@ impl<'a> ModifyInputsContext<'a> {
 				Some(NodeInput::value(TaggedValue::F64(typesetting.max_height.unwrap_or(100.)), false)),
 				Some(NodeInput::value(TaggedValue::F64(typesetting.tilt), false)),
 				Some(NodeInput::value(TaggedValue::TextAlign(typesetting.align), false)),
+				Some(NodeInput::value(TaggedValue::Bool(false), false)),
 			]);
 		let transform = resolve_proto_node_type(graphene_std::transform_nodes::transform::IDENTIFIER)
 			.expect("Transform node does not exist")
@@ -275,6 +279,10 @@ impl<'a> ModifyInputsContext<'a> {
 		let text_id = NodeId::new();
 		self.network_interface.insert_node(text_id, text, &[]);
 		self.network_interface.move_node_to_chain_start(&text_id, layer, &[], self.import);
+
+		// Replace the placeholder font input with a freshly minted resource id whose `DataSource::Font` is recorded
+		// in the document registry. `ResourceMessage::SetFont` also queues `Resolve`, so the bytes start fetching.
+		self.responses.add(DocumentMessage::Resource(ResourceMessage::SetFont { node_id: text_id, font }));
 
 		let transform_id = NodeId::new();
 		self.network_interface.insert_node(transform_id, transform, &[]);

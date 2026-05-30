@@ -132,6 +132,17 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 					log::warn!("Resource resolved for unknown document {document_id:?}");
 				}
 			}
+			PortfolioMessage::ResolveAllResources => {
+				for document_id in self.document_ids.iter().copied().collect::<Vec<_>>() {
+					if let Some(document) = self.documents.get_mut(&document_id) {
+						let context = ResourceMessageContext {
+							document_id,
+							fonts: &self.fonts,
+						};
+						document.resources.process_message(ResourceMessage::Resolve, responses, context);
+					}
+				}
+			}
 
 			// Messages
 			PortfolioMessage::Init => {

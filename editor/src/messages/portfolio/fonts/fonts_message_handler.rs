@@ -32,13 +32,9 @@ impl MessageHandler<FontsMessage, FontsMessageContext<'_>> for FontsMessageHandl
 			FontsMessage::CatalogLoaded { catalog } => {
 				self.font_catalog = catalog;
 
-				// Warm the default font so freshly created text resolves without an extra trip; this only succeeds
-				// once some document has caused the default font to be loaded into `font_hashes`.
-				responses.add(FontsMessage::Load {
-					family: graphene_std::consts::DEFAULT_FONT_FAMILY.into(),
-					style: Some(graphene_std::consts::DEFAULT_FONT_STYLE.into()),
-					response: None,
-				});
+				// Any `ResolveStep` that gave up because the catalog wasn't loaded yet can now run; rebroadcast
+				// `Resolve` so every document re-walks its unresolved ids with URLs available.
+				responses.add(PortfolioMessage::ResolveAllResources);
 			}
 			FontsMessage::ResourceResolved { family, style, hash } => {
 				let font = font_from_pair(&family, style.as_deref());
