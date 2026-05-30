@@ -1,6 +1,5 @@
 use crate::messages::prelude::*;
 use graph_craft::application_io::resource::ResourceId;
-use graph_craft::document::NodeId;
 use graphene_std::text::Font;
 use std::sync::Arc;
 
@@ -12,10 +11,10 @@ pub enum ResourceMessage {
 		resource_id: ResourceId,
 		data: Arc<[u8]>,
 	},
-	/// Replace the font input on a text node with a freshly minted `Resource(id)` whose registry source is
-	/// `DataSource::Font { family, style }`. Auto-enqueues `Resolve` so the fetch (or cache hit) follows.
-	SetFont {
-		node_id: NodeId,
+	/// Register a font `DataSource` against an existing `ResourceId` (one the caller already wired into a node
+	/// input). Auto-enqueues `Resolve` so the fetch (or cache hit) follows.
+	AddFont {
+		resource_id: ResourceId,
 		font: Font,
 	},
 	/// Walk every unresolved id in the registry and dispatch a `ResolveStep` per id.

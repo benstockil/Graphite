@@ -105,14 +105,16 @@ impl ToolMetadata for TextTool {
 }
 
 fn create_text_widgets(tool: &TextTool, font_catalog: &FontCatalog, document: &DocumentMessageHandler) -> Vec<WidgetInstance> {
-	// If a single text layer is selected, the font/style menus assign the font on that layer via `ResourceMessage::SetFont`
-	// (which mints a fresh `ResourceId`, records the DataSource, and kicks off `Resolve`). Otherwise the menus only update
-	// the control bar option for the next created text.
+	// If a single text layer is selected, the font/style menus assign the font on that layer: mint a fresh `ResourceId`,
+	// wire it into the text node's font input via `SetInputValue`, and register the `DataSource::Font` for that id via
+	// `ResourceMessage::AddFont` (which kicks off `Resolve`). Otherwise the menus only update the control bar option
+	// for the next created text.
 	let text_node_id = can_edit_selected(document).and_then(|layer| graph_modification_utils::get_text_id(layer, &document.network_interface));
 
+	let font_input_index = graphene_std::text::text::FontInput::INDEX;
 	let apply_font = move |new_font: Font| -> Message {
 		match text_node_id {
-			Some(node_id) => DocumentMessage::Resource(ResourceMessage::SetFont { node_id, font: new_font }).into(),
+			Some(node_id) => crate::messages::portfolio::document::node_graph::node_properties::assign_font_message(node_id, font_input_index, new_font),
 			None => TextToolMessage::UpdateOptions {
 				options: TextOptionsUpdate::Font { font: new_font },
 			}

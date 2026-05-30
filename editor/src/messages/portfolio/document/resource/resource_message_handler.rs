@@ -3,10 +3,6 @@ use crate::messages::prelude::*;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use graph_craft::application_io::resource::{DataSource, LoadResource, Resource, ResourceHash, ResourceId, ResourceRegistry};
-use graph_craft::document::value::TaggedValue;
-
-/// Index of the font-resource input on the text node (after the primary `()` and the text string).
-pub const TEXT_FONT_INPUT_INDEX: usize = 2;
 
 #[derive(ExtractField)]
 pub struct ResourceMessageContext<'a> {
@@ -44,24 +40,17 @@ impl MessageHandler<ResourceMessage, ResourceMessageContext<'_>> for ResourceMes
 				// Auto-Resolve hook: other ids may now be resolvable indirectly (sibling ids sharing the same hash via font equality).
 				responses.add(ResourceMessage::Resolve);
 			}
-			ResourceMessage::SetFont { node_id, font } => {
-				// Build the DataSource normalized through the catalog when possible.
+			ResourceMessage::AddFont { resource_id, font } => {
+				// Normalize through the catalog when possible (the catalog might be empty until the frontend reports it).
 				let style = fonts.font_catalog.find_font_style_in_catalog(&font);
 				let style_name = style.map(|style| style.to_named_style()).unwrap_or_else(|| font.font_style.clone());
-				let resource_id = ResourceId::new();
 				self.registry.push_source_back(
 					&resource_id,
 					DataSource::Font {
-						family: font.font_family.clone(),
-						style: Some(style_name.clone()),
+						family: font.font_family,
+						style: Some(style_name),
 					},
 				);
-				// Defer the input swap to a NodeGraph operation so the network interface mutation runs inside the document handler.
-				responses.add(NodeGraphMessage::SetInputValue {
-					node_id,
-					input_index: TEXT_FONT_INPUT_INDEX,
-					value: TaggedValue::Resource(resource_id),
-				});
 				// Auto-Resolve hook: the new unresolved id needs to be picked up.
 				responses.add(ResourceMessage::Resolve);
 			}

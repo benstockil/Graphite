@@ -249,15 +249,16 @@ impl<'a> ModifyInputsContext<'a> {
 	}
 
 	pub fn insert_text(&mut self, text: String, font: Font, typesetting: TypesettingConfig, layer: LayerNodeIdentifier) {
-		// Use a default `Resource(0)` placeholder for the font input here — the real resource id is minted
-		// by `ResourceMessage::SetFont` below, which also pushes the `DataSource::Font` into the document's registry
-		// and kicks off `Resolve`. Input 0 is `None` so the node uses its default primary `()` value.
+		// Mint the font resource id up front so the inserted node already has the right `Resource(id)` value, and
+		// hand the same id to `ResourceMessage::AddFont` to register its `DataSource::Font` in the document's
+		// registry (which kicks off `Resolve`). Input 0 is `None` so the node uses its default primary `()` value.
+		let font_resource_id = ResourceId::new();
 		let text = resolve_proto_node_type(graphene_std::text::text::IDENTIFIER)
 			.expect("Text node does not exist")
 			.node_template_input_override([
 				Some(NodeInput::value(TaggedValue::None, false)),
 				Some(NodeInput::value(TaggedValue::String(text), false)),
-				Some(NodeInput::value(TaggedValue::Resource(ResourceId::default()), false)),
+				Some(NodeInput::value(TaggedValue::Resource(font_resource_id), false)),
 				Some(NodeInput::value(TaggedValue::F64(typesetting.font_size), false)),
 				Some(NodeInput::value(TaggedValue::F64(typesetting.line_height_ratio), false)),
 				Some(NodeInput::value(TaggedValue::F64(typesetting.character_spacing), false)),
@@ -280,9 +281,12 @@ impl<'a> ModifyInputsContext<'a> {
 		self.network_interface.insert_node(text_id, text, &[]);
 		self.network_interface.move_node_to_chain_start(&text_id, layer, &[], self.import);
 
-		// Replace the placeholder font input with a freshly minted resource id whose `DataSource::Font` is recorded
-		// in the document registry. `ResourceMessage::SetFont` also queues `Resolve`, so the bytes start fetching.
-		self.responses.add(DocumentMessage::Resource(ResourceMessage::SetFont { node_id: text_id, font }));
+		// Register the font's `DataSource` for the resource id we just wired into the text node. `AddFont` queues
+		// `Resolve`, so the bytes start fetching (or resolve immediately from `font_hashes` if already known).
+		self.responses.add(DocumentMessage::Resource(ResourceMessage::AddFont {
+			resource_id: font_resource_id,
+			font,
+		}));
 
 		let transform_id = NodeId::new();
 		self.network_interface.insert_node(transform_id, transform, &[]);

@@ -53,6 +53,23 @@ pub fn commit_value<T>(_: &T) -> Message {
 	DocumentMessage::AddTransaction.into()
 }
 
+/// Mint a fresh `ResourceId`, wire it into a text node's font input, and register the corresponding
+/// `DataSource::Font` against that id via [`ResourceMessage::AddFont`].
+pub fn assign_font_message(node_id: NodeId, input_index: usize, font: Font) -> Message {
+	let resource_id = graph_craft::application_io::resource::ResourceId::new();
+	Message::Batched {
+		messages: Box::new([
+			NodeGraphMessage::SetInputValue {
+				node_id,
+				input_index,
+				value: TaggedValue::Resource(resource_id),
+			}
+			.into(),
+			DocumentMessage::Resource(ResourceMessage::AddFont { resource_id, font }).into(),
+		]),
+	}
+}
+
 pub fn expose_widget(node_id: NodeId, index: usize, data_type: FrontendGraphDataType, exposed: bool) -> WidgetInstance {
 	ParameterExposeButton::new()
 		.exposed(exposed)
@@ -836,10 +853,12 @@ pub fn font_inputs(parameter_widgets_info: ParameterWidgetsInfo) -> (Vec<WidgetI
 	};
 
 	if let Some(TaggedValue::Resource(_resource_id)) = input.as_non_exposed_value() {
-		// The font's family/style live in the resource's `DataSource::Font`. The picker writes via `ResourceMessage::SetFont`,
-		// which mints a fresh ResourceId and kicks off Resolve. NodePropertiesContext doesn't carry the registry, so the
-		// "currently selected" dropdown labels fall back to the default font for now.
+		// The font's family/style live in the resource's `DataSource::Font`. The picker mints a fresh `ResourceId`,
+		// wires it into the text node's font input, and registers the `DataSource::Font` for that id via
+		// `ResourceMessage::AddFont`. `NodePropertiesContext` doesn't carry the registry, so the "currently selected"
+		// dropdown labels fall back to the default font for now.
 		let font = Font::default();
+		let font_input_index = graphene_std::text::text::FontInput::INDEX;
 		first_widgets.extend_from_slice(&[
 			Separator::new(SeparatorStyle::Unrelated).widget_instance(),
 			DropdownInput::new(vec![
@@ -854,17 +873,10 @@ pub fn font_inputs(parameter_widgets_info: ParameterWidgetsInfo) -> (Vec<WidgetI
 						MenuListEntry::new(family.name.clone())
 							.label(family.name.clone())
 							.font(family.closest_style(400, false).preview_url(&family.name))
-							.on_update(move |_| DocumentMessage::Resource(ResourceMessage::SetFont { node_id, font: new_font.clone() }).into())
+							.on_update(move |_| assign_font_message(node_id, font_input_index, new_font.clone()))
 							.on_commit(move |_| {
 								DeferMessage::AfterGraphRun {
-									messages: vec![
-										DocumentMessage::Resource(ResourceMessage::SetFont {
-											node_id,
-											font: commit_font.clone(),
-										})
-										.into(),
-										commit_value(&()),
-									],
+									messages: vec![assign_font_message(node_id, font_input_index, commit_font.clone()), commit_value(&())],
 								}
 								.into()
 							})
@@ -893,7 +905,7 @@ pub fn font_inputs(parameter_widgets_info: ParameterWidgetsInfo) -> (Vec<WidgetI
 							let new_font = Font::new(font_family, font_style.clone());
 							MenuListEntry::new(font_style.clone())
 								.label(font_style)
-								.on_update(move |_| DocumentMessage::Resource(ResourceMessage::SetFont { node_id, font: new_font.clone() }).into())
+								.on_update(move |_| assign_font_message(node_id, font_input_index, new_font.clone()))
 								.on_commit(commit_value)
 						};
 
