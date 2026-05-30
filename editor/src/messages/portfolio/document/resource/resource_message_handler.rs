@@ -17,10 +17,15 @@ pub struct ResourceMessageHandler {
 	/// Per-id state for [`ResourceMessage::ResolveStep`]: `(next_source_index, last_attempted_source_index)`.
 	/// The "last attempted" index is used by [`ResourceMessage::Resolved`] to learn which `DataSource` produced
 	/// the bytes so a font hash can be reported back to [`FontsMessage::ResourceResolved`].
+	///
+	/// In-flight state only; never persisted. The custom `Deserialize` impl below treats unknown JSON keys as
+	/// `ResourceHash` entries (legacy embedded format), so if this field were serialized, opening a freshly-saved
+	/// document would fail trying to parse `"pending_resolves"` as a hash.
+	#[serde(skip)]
 	pending_resolves: HashMap<ResourceId, ResolveProgress>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct ResolveProgress {
 	next: usize,
 	last_attempted: Option<usize>,

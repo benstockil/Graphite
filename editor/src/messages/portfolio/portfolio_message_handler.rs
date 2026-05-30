@@ -123,10 +123,7 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 			}
 			PortfolioMessage::ResourceResolved { document_id, resource_id, data } => {
 				if let Some(document) = self.documents.get_mut(&document_id) {
-					let context = ResourceMessageContext {
-						document_id,
-						fonts: &self.fonts,
-					};
+					let context = ResourceMessageContext { document_id, fonts: &self.fonts };
 					document.resources.process_message(ResourceMessage::Resolved { resource_id, data }, responses, context);
 				} else {
 					log::warn!("Resource resolved for unknown document {document_id:?}");
@@ -135,10 +132,7 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 			PortfolioMessage::ResolveAllResources => {
 				for document_id in self.document_ids.iter().copied().collect::<Vec<_>>() {
 					if let Some(document) = self.documents.get_mut(&document_id) {
-						let context = ResourceMessageContext {
-							document_id,
-							fonts: &self.fonts,
-						};
+						let context = ResourceMessageContext { document_id, fonts: &self.fonts };
 						document.resources.process_message(ResourceMessage::Resolve, responses, context);
 					}
 				}
@@ -843,6 +837,7 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 				let mut document = match document {
 					Ok(document) => document,
 					Err(e) => {
+						log::error!("{e}");
 						// TODO: Eventually remove this document upgrade code
 						// TODO: (Only the `if` branch, the `else` branch's manual-open dialog stays)
 						if document_is_auto_saved {
@@ -867,7 +862,6 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 							responses.add(PortfolioMessage::UpdateOpenDocumentsList);
 							self.tick_autosave_load_progress(responses, true);
 						} else {
-							log::error!("{e}");
 							let name = document_name
 								.filter(|n| !n.trim().is_empty())
 								.or_else(|| document_path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()))
