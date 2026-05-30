@@ -53,19 +53,24 @@ pub fn commit_value<T>(_: &T) -> Message {
 	DocumentMessage::AddTransaction.into()
 }
 
-/// Mint a fresh `ResourceId`, wire it into a text node's font input, and register the corresponding
-/// `DataSource::Font` against that id via [`ResourceMessage::AddFont`].
+/// Mint a fresh `ResourceId`, register the `DataSource::Font` against it via [`ResourceMessage::AddFont`],
+/// then wire it into a text node's font input.
+///
+/// **Order matters**: `AddFont` is dispatched first so that by the time `SetInputValue` fires its
+/// follow-up `RunDocumentGraph`, the registry already knows about the id. Otherwise the preprocessor
+/// would see an unresolved `Resource(id)` and fail with `ResourceNotFound`, and (when the font is already
+/// cached in `font_hashes`) no further `RunDocumentGraph` would re-fire to recover.
 pub fn assign_font_message(node_id: NodeId, input_index: usize, font: Font) -> Message {
 	let resource_id = graph_craft::application_io::resource::ResourceId::new();
 	Message::Batched {
 		messages: Box::new([
+			DocumentMessage::Resource(ResourceMessage::AddFont { resource_id, font }).into(),
 			NodeGraphMessage::SetInputValue {
 				node_id,
 				input_index,
 				value: TaggedValue::Resource(resource_id),
 			}
 			.into(),
-			DocumentMessage::Resource(ResourceMessage::AddFont { resource_id, font }).into(),
 		]),
 	}
 }

@@ -93,6 +93,9 @@ impl MessageHandler<ResourceMessage, ResourceMessageContext<'_>> for ResourceMes
 						if let Some(hash) = fonts.cached_hash(&family, style.as_deref()) {
 							self.registry.resolve(&resource_id, hash);
 							self.pending_resolves.remove(&resource_id);
+							// Re-render now that this id is resolved (in case the caller already queued a render
+							// against an unresolved id that would have hit `ResourceNotFound`).
+							responses.add(NodeGraphMessage::RunDocumentGraph);
 							return;
 						}
 						if let Some(url) = fonts.cached_url(&family, style.as_deref()) {

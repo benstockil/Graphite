@@ -1620,6 +1620,13 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 					return;
 				};
 
+				// Skip rendering while any resource is still unresolved — the preprocessor would otherwise fail with
+				// `ResourceNotFound`. `ResourceMessage::Resolved` queues `RunDocumentGraph` once each id resolves,
+				// so the render fires automatically once the registry is complete.
+				if document.resources.registry.unresolved().next().is_some() {
+					return;
+				}
+
 				let document_to_viewport = document
 					.navigation_handler
 					.calculate_offset_transform(viewport.center_in_viewport_space().into(), &document.document_ptz);
