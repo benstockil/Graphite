@@ -3,7 +3,6 @@ use graphene_std::uuid::NodeId;
 use crate::messages::layout::utility_types::widget_prelude::*;
 use crate::messages::portfolio::document::node_graph::document_node_definitions::NodePropertiesContext;
 use crate::messages::portfolio::document::utility_types::network_interface::NodeNetworkInterface;
-use crate::messages::portfolio::utility_types::CachedData;
 use crate::messages::prelude::*;
 use crate::node_graph_executor::NodeGraphExecutor;
 

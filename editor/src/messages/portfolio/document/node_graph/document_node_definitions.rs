@@ -8,8 +8,7 @@ use crate::messages::portfolio::document::utility_types::network_interface::{
 	DocumentNodeMetadata, DocumentNodePersistentMetadata, InputMetadata, NodeNetworkInterface, NodeNetworkMetadata, NodeNetworkPersistentMetadata, NodeTemplate, NodeTypePersistentMetadata,
 	Vec2InputSettings, WidgetOverride,
 };
-use crate::messages::portfolio::utility_types::CachedData;
-use crate::messages::prelude::Message;
+use crate::messages::prelude::{FontsMessageHandler, Message};
 use crate::node_graph_executor::NodeGraphExecutor;
 use glam::DVec2;
 use graph_craft::ProtoNodeIdentifier;

@@ -6,7 +6,7 @@ use crate::messages::layout::utility_types::widget_prelude::*;
 use crate::messages::portfolio::document::node_graph::document_node_definitions::resolve_document_node_type;
 use crate::messages::portfolio::document::utility_types::document_metadata::LayerNodeIdentifier;
 use crate::messages::portfolio::document::utility_types::network_interface::{InputConnector, NodeNetworkInterface};
-use crate::messages::portfolio::utility_types::{CachedData, FontCatalogStyle};
+use crate::messages::portfolio::fonts::utility_types::FontCatalogStyle;
 use crate::messages::prelude::*;
 use crate::messages::tool::common_functionality::graph_modification_utils;
 use choice::enum_choice;
@@ -835,9 +835,11 @@ pub fn font_inputs(parameter_widgets_info: ParameterWidgetsInfo) -> (Vec<WidgetI
 		return (vec![], None);
 	};
 
-	if let Some(TaggedValue::Resource(resource_id)) = input.as_non_exposed_value() {
-		// The font's family/style live in the resource's `DataSource::Font`, surfaced via the editor's font index.
-		let font = fonts.id_font(resource_id).cloned().unwrap_or_default();
+	if let Some(TaggedValue::Resource(_resource_id)) = input.as_non_exposed_value() {
+		// The font's family/style live in the resource's `DataSource::Font`. The picker writes via `ResourceMessage::SetFont`,
+		// which mints a fresh ResourceId and kicks off Resolve. NodePropertiesContext doesn't carry the registry, so the
+		// "currently selected" dropdown labels fall back to the default font for now.
+		let font = Font::default();
 		first_widgets.extend_from_slice(&[
 			Separator::new(SeparatorStyle::Unrelated).widget_instance(),
 			DropdownInput::new(vec![
@@ -846,52 +848,25 @@ pub fn font_inputs(parameter_widgets_info: ParameterWidgetsInfo) -> (Vec<WidgetI
 					.0
 					.iter()
 					.map(|family| {
+						let FontCatalogStyle { weight, italic, .. } = FontCatalogStyle::from_named_style(&font.font_style, "");
+						let new_font = Font::new(family.name.clone(), family.closest_style(weight, italic).to_named_style());
+						let commit_font = new_font.clone();
 						MenuListEntry::new(family.name.clone())
 							.label(family.name.clone())
 							.font(family.closest_style(400, false).preview_url(&family.name))
-							.on_update({
-								// Construct the new font using the new family and the initial or previous style, although this style might not exist in the catalog
-								let mut new_font = Font::new(family.name.clone(), font.font_style_to_restore.clone().unwrap_or_else(|| font.font_style.clone()));
-								new_font.font_style_to_restore = font.font_style_to_restore.clone();
-
-								// If not already, store the initial style so it can be restored if the user switches to another family
-								if new_font.font_style_to_restore.is_none() {
-									new_font.font_style_to_restore = Some(new_font.font_style.clone());
+							.on_update(move |_| DocumentMessage::Resource(ResourceMessage::SetFont { node_id, font: new_font.clone() }).into())
+							.on_commit(move |_| {
+								DeferMessage::AfterGraphRun {
+									messages: vec![
+										DocumentMessage::Resource(ResourceMessage::SetFont {
+											node_id,
+											font: commit_font.clone(),
+										})
+										.into(),
+										commit_value(&()),
+									],
 								}
-
-								// Use the closest style available in the family for the new font to ensure the style exists
-								let FontCatalogStyle { weight, italic, .. } = FontCatalogStyle::from_named_style(&new_font.font_style, "");
-								new_font.font_style = family.closest_style(weight, italic).to_named_style();
-
-								move |_| {
-									let new_font = new_font.clone();
-
-									Message::Batched {
-										messages: Box::new([
-											PortfolioMessage::LoadFontData { font: new_font.clone() }.into(),
-											update_value(move |_| TaggedValue::Font(new_font.clone()), node_id, index)(&()),
-										]),
-									}
-								}
-							})
-							.on_commit({
-								// Use the new value from the user selection
-								let font_family = family.name.clone();
-
-								// Use the previous style selection and extract its weight and italic properties, then find the closest style in the new family
-								let FontCatalogStyle { weight, italic, .. } = FontCatalogStyle::from_named_style(&font.font_style, "");
-								let font_style = family.closest_style(weight, italic).to_named_style();
-
-								move |_| {
-									// Intentionally drop `font_style_to_restore` on commit so the committed style becomes the new basis
-									// for subsequent family switches. Preserving the original style intent is hover-only behavior.
-									let new_font = Font::new(font_family.clone(), font_style.clone());
-
-									DeferMessage::AfterGraphRun {
-										messages: vec![update_value(move |_| TaggedValue::Font(new_font.clone()), node_id, index)(&()), commit_value(&())],
-									}
-									.into()
-								}
+								.into()
 							})
 					})
 					.collect::<Vec<_>>(),
@@ -914,24 +889,11 @@ pub fn font_inputs(parameter_widgets_info: ParameterWidgetsInfo) -> (Vec<WidgetI
 					.map(|family| {
 						let build_entry = |style: &FontCatalogStyle| {
 							let font_style = style.to_named_style();
+							let font_family = font.font_family.clone();
+							let new_font = Font::new(font_family, font_style.clone());
 							MenuListEntry::new(font_style.clone())
-								.label(font_style.clone())
-								.on_update({
-									let font_family = font.font_family.clone();
-									let font_style = font_style.clone();
-
-									move |_| {
-										// Keep the existing family
-										let new_font = Font::new(font_family.clone(), font_style.clone());
-
-										Message::Batched {
-											messages: Box::new([
-												PortfolioMessage::LoadFontData { font: new_font.clone() }.into(),
-												update_value(move |_| TaggedValue::Font(new_font.clone()), node_id, index)(&()),
-											]),
-										}
-									}
-								})
+								.label(font_style)
+								.on_update(move |_| DocumentMessage::Resource(ResourceMessage::SetFont { node_id, font: new_font.clone() }).into())
 								.on_commit(commit_value)
 						};
 

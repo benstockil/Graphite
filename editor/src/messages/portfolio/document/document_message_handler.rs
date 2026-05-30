@@ -21,7 +21,7 @@ use crate::messages::portfolio::document::properties_panel::properties_panel_mes
 use crate::messages::portfolio::document::utility_types::document_metadata::{DocumentMetadata, LayerNodeIdentifier};
 use crate::messages::portfolio::document::utility_types::misc::{AlignAggregate, AlignAxis, FlipAxis, PTZ};
 use crate::messages::portfolio::document::utility_types::network_interface::{FlowType, InputConnector, NodeTemplate, OutputConnector};
-use crate::messages::portfolio::utility_types::{CachedData, PanelType};
+use crate::messages::portfolio::utility_types::PanelType;
 use crate::messages::prelude::*;
 use crate::messages::tool::common_functionality::graph_modification_utils::{self, get_blend_mode, get_fill, get_opacity};
 use crate::messages::tool::tool_messages::select_tool::SelectToolPointerKeys;
@@ -282,7 +282,7 @@ impl MessageHandler<DocumentMessage, DocumentMessageContext<'_>> for DocumentMes
 				graph_operation_message_handler.process_message(message, responses, context);
 			}
 			DocumentMessage::Resource(message) => {
-				let context = ResourceMessageContext {};
+				let context = ResourceMessageContext { document_id, fonts };
 				self.resources.process_message(message, responses, context);
 			}
 			DocumentMessage::AlignSelectedLayers { axis, aggregate } => {
@@ -2660,21 +2660,11 @@ impl DocumentMessageHandler {
 		}
 	}
 
-	/// Loads all of the fonts in the document.
+	/// Kick off resource resolution for every unresolved id in this document's registry. The per-document
+	/// [`ResourceMessageHandler`] walks each source list (Embedded/Url/Font) and either resolves locally via the
+	/// fonts handler's cache or asks the frontend to fetch a URL.
 	pub fn load_layer_resources(&self, responses: &mut VecDeque<Message>) {
-		let mut fonts_to_load = HashSet::new();
-
-		for (_, node, _) in self.document_network().recursive_nodes() {
-			for input in &node.inputs {
-				if let Some(TaggedValue::Font(font)) = input.as_value() {
-					fonts_to_load.insert(font.clone());
-				}
-			}
-		}
-
-		for font in fonts_to_load {
-			responses.add(PortfolioMessage::LoadFontData { font });
-		}
+		responses.add(DocumentMessage::Resource(ResourceMessage::Resolve));
 	}
 
 	pub fn update_document_widgets(&self, responses: &mut VecDeque<Message>, animation_is_playing: bool, time: Duration) {

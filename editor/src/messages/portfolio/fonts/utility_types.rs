@@ -1,3 +1,5 @@
+use graphene_std::text::Font;
+
 // TODO: Should this be a BTreeMap instead?
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FontCatalog(pub Vec<FontCatalogFamily>);
@@ -16,6 +18,14 @@ impl FontCatalog {
 		}
 
 		found_style
+	}
+
+	/// Look up the download URL for a font's family/style by snapping to the closest catalog style.
+	pub fn cached_url(&self, family: &str, style: Option<&str>) -> Option<String> {
+		let catalog_family = self.0.iter().find(|catalog_family| catalog_family.name == family)?;
+		let style_name = style.unwrap_or("Regular (400)");
+		let FontCatalogStyle { weight, italic, .. } = FontCatalogStyle::from_named_style(style_name, "");
+		Some(catalog_family.closest_style(weight, italic).url.clone())
 	}
 }
 
@@ -38,5 +48,39 @@ impl FontCatalogFamily {
 			.min_by_key(|(distance, _)| *distance)
 			.map(|(_, style)| style)
 			.unwrap_or(&self.styles[0])
+	}
+}
+
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FontCatalogStyle {
+	pub weight: u32,
+	pub italic: bool,
+	pub url: String,
+}
+
+impl FontCatalogStyle {
+	pub fn to_named_style(&self) -> String {
+		let weight = self.weight;
+		let italic = self.italic;
+
+		let named_weight = Font::named_weight(weight);
+		let maybe_italic = if italic { " Italic" } else { "" };
+
+		format!("{named_weight}{maybe_italic} ({weight})")
+	}
+
+	pub fn from_named_style(named_style: &str, url: impl Into<String>) -> FontCatalogStyle {
+		let weight = named_style.split_terminator(['(', ')']).next_back().and_then(|x| x.parse::<u32>().ok()).unwrap_or(400);
+		let italic = named_style.contains("Italic (");
+		FontCatalogStyle { weight, italic, url: url.into() }
+	}
+
+	/// Get the URL for the stylesheet for loading a font preview for this style of the given family name, subsetted to only the letters in the family name.
+	pub fn preview_url(&self, family: impl Into<String>) -> String {
+		let name = family.into().replace(' ', "+");
+		let italic = if self.italic { "ital," } else { "" };
+		let weight = self.weight;
+		format!("https://fonts.googleapis.com/css2?display=swap&family={name}:{italic}wght@{weight}&text={name}")
 	}
 }

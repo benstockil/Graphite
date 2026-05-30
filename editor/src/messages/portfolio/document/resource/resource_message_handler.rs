@@ -3,7 +3,10 @@ use crate::messages::prelude::*;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use graph_craft::application_io::resource::{DataSource, LoadResource, Resource, ResourceHash, ResourceId, ResourceRegistry};
-use graphene_std::text::Font;
+use graph_craft::document::value::TaggedValue;
+
+/// Index of the font-resource input on the text node (after the primary `()` and the text string).
+pub const TEXT_FONT_INPUT_INDEX: usize = 2;
 
 #[derive(ExtractField)]
 pub struct ResourceMessageContext<'a> {
@@ -15,11 +18,20 @@ pub struct ResourceMessageContext<'a> {
 pub struct ResourceMessageHandler {
 	pub registry: ResourceRegistry,
 	pub embedded: EmbeddedResources,
-	pending_resolves: HashMap<ResourceId, usize>,
+	/// Per-id state for [`ResourceMessage::ResolveStep`]: `(next_source_index, last_attempted_source_index)`.
+	/// The "last attempted" index is used by [`ResourceMessage::Resolved`] to learn which `DataSource` produced
+	/// the bytes so a font hash can be reported back to [`FontsMessage::ResourceResolved`].
+	pending_resolves: HashMap<ResourceId, ResolveProgress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+struct ResolveProgress {
+	next: usize,
+	last_attempted: Option<usize>,
 }
 
 #[message_handler_data]
-impl MessageHandler<ResourceMessage, ResourceMessageContext> for ResourceMessageHandler {
+impl MessageHandler<ResourceMessage, ResourceMessageContext<'_>> for ResourceMessageHandler {
 	fn process_message(&mut self, message: ResourceMessage, responses: &mut VecDeque<Message>, context: ResourceMessageContext) {
 		let ResourceMessageContext { document_id, fonts } = context;
 
@@ -29,66 +41,101 @@ impl MessageHandler<ResourceMessage, ResourceMessageContext> for ResourceMessage
 				self.registry.push_source_back(&resource_id, DataSource::Embedded);
 				self.registry.resolve(&resource_id, hash);
 				responses.add(ResourceStorageMessage::Store { data });
+				// Auto-Resolve hook: other ids may now be resolvable indirectly (sibling ids sharing the same hash via font equality).
+				responses.add(ResourceMessage::Resolve);
+			}
+			ResourceMessage::SetFont { node_id, font } => {
+				// Build the DataSource normalized through the catalog when possible.
+				let style = fonts.font_catalog.find_font_style_in_catalog(&font);
+				let style_name = style.map(|style| style.to_named_style()).unwrap_or_else(|| font.font_style.clone());
+				let resource_id = ResourceId::new();
+				self.registry.push_source_back(
+					&resource_id,
+					DataSource::Font {
+						family: font.font_family.clone(),
+						style: Some(style_name.clone()),
+					},
+				);
+				// Defer the input swap to a NodeGraph operation so the network interface mutation runs inside the document handler.
+				responses.add(NodeGraphMessage::SetInputValue {
+					node_id,
+					input_index: TEXT_FONT_INPUT_INDEX,
+					value: TaggedValue::Resource(resource_id),
+				});
+				// Auto-Resolve hook: the new unresolved id needs to be picked up.
+				responses.add(ResourceMessage::Resolve);
 			}
 			ResourceMessage::Resolve => {
-				for info in self.registry.unresolved() {
-					self.pending_resolves.entry(info.id).or_default();
-					responses.add(ResourceMessage::ResolveStep { resource_id: info.id });
+				let unresolved_ids: Vec<ResourceId> = self.registry.unresolved().map(|info| info.id).collect();
+				for id in unresolved_ids {
+					self.pending_resolves.entry(id).or_default();
+					responses.add(ResourceMessage::ResolveStep { resource_id: id });
 				}
 			}
 			ResourceMessage::ResolveStep { resource_id } => {
-				if let Some(count) = self.pending_resolves.get_mut(&resource_id) {
-					if let Some(info) = self.registry.info(&resource_id) {
-						if let Some(source) = info.sources.get(*count) {
-							match source {
-								DataSource::Embedded => {
-									log::error!("Resource {resource_id} is embedded but failed to resolve");
-								}
-								DataSource::Url(url) => {
-									responses.add(FrontendMessage::TriggerResolveResource {
-										document_id,
-										resource_id,
-										url: url.to_string(),
-									});
-								}
-								DataSource::Font { family, style } => {
-									if let Some(font_hash) = fonts.cached_hash(family, style) {
-										self.registry.resolve(&resource_id, font_hash.clone());
-									} else if let Some(url) = fonts.cached_url(family, style) {
-										responses.add(FrontendMessage::TriggerResolveResource { document_id, resource_id, url });
-									} else {
-										responses.add(FrontendMessage::TriggerFontCatalogLoad);
-										responses.add(ResourceMessage::ResolveStep { resource_id });
-										return;
-									}
-								}
-							}
-							*count += 1;
-						} else {
-							log::error!("Failed to resolve resource {resource_id}, no more sources to try");
+				let Some(progress) = self.pending_resolves.get_mut(&resource_id) else { return };
+				let Some(info) = self.registry.info(&resource_id) else {
+					log::error!("ResolveStep for {resource_id}: no registry entry");
+					self.pending_resolves.remove(&resource_id);
+					return;
+				};
+				let source_index = progress.next;
+				let Some(source) = info.sources.get(source_index).cloned() else {
+					log::error!("ResolveStep for {resource_id}: no more sources to try");
+					self.pending_resolves.remove(&resource_id);
+					return;
+				};
+				progress.last_attempted = Some(source_index);
+
+				match source {
+					DataSource::Embedded => {
+						log::error!("Resource {resource_id} is embedded but failed to resolve before reaching ResolveStep");
+						progress.next += 1;
+					}
+					DataSource::Url(url) => {
+						responses.add(FrontendMessage::TriggerResolveResource {
+							document_id,
+							resource_id,
+							url: url.to_string(),
+						});
+						progress.next += 1;
+					}
+					DataSource::Font { family, style } => {
+						if let Some(hash) = fonts.cached_hash(&family, style.as_deref()) {
+							self.registry.resolve(&resource_id, hash);
+							self.pending_resolves.remove(&resource_id);
+							return;
 						}
-					} else {
-						log::error!("Failed to resolve resource {resource_id}, no info found");
+						if let Some(url) = fonts.cached_url(&family, style.as_deref()) {
+							responses.add(FrontendMessage::TriggerResolveResource { document_id, resource_id, url });
+							progress.next += 1;
+							return;
+						}
+						// Catalog hasn't loaded yet: ask the frontend to load it and try this id again afterwards.
+						responses.add(FrontendMessage::TriggerFontCatalogLoad);
+						responses.add(ResourceMessage::ResolveStep { resource_id });
 					}
 				}
 			}
 			ResourceMessage::Resolved { resource_id, data } => {
 				let hash = ResourceHash::from(data.as_ref());
+				let attempted = self.pending_resolves.remove(&resource_id).and_then(|progress| progress.last_attempted);
+				let font_source = attempted
+					.and_then(|index| self.registry.info(&resource_id).and_then(|info| info.sources.get(index).cloned()))
+					.and_then(|source| match source {
+						DataSource::Font { family, style } => Some((family, style)),
+						_ => None,
+					});
+
 				self.registry.resolve(&resource_id, hash);
-				if let Some(count) = self.pending_resolves.remove(&resource_id) {
-					if let Some(info) = self.registry.info(&resource_id) {
-						if let Some(source) = info.sources.get(count) {
-							if let DataSource::Font { family, style } = source {
-								responses.add(FontsMessage::FontResourceResolved {
-									family: family.clone(),
-									style: style.clone(),
-									hash,
-								});
-							}
-						}
-					}
-				}
 				responses.add(ResourceStorageMessage::Store { data });
+
+				if let Some((family, style)) = font_source {
+					responses.add(FontsMessage::ResourceResolved { family, style, hash });
+				}
+
+				// Auto-Resolve hook: other ids might now resolve via the freshly learnt font hash.
+				responses.add(ResourceMessage::Resolve);
 			}
 		}
 	}

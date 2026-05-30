@@ -4,9 +4,11 @@ use super::utility_types::{DockingSplitDirection, PanelGroupId, PanelType};
 use crate::messages::frontend::utility_types::{ExportBounds, FileType, PersistedState};
 use crate::messages::portfolio::document::utility_types::clipboards::Clipboard;
 use crate::messages::prelude::*;
+use graph_craft::application_io::resource::ResourceId;
 use graphene_std::Color;
 use graphene_std::raster::Image;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[impl_message(Message, Portfolio)]
 #[derive(PartialEq, Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -53,6 +55,13 @@ pub enum PortfolioMessage {
 	GarbageCollectResources,
 	LoadDocumentResources {
 		document_id: DocumentId,
+	},
+	/// Inbound from the frontend (via `editor_wrapper::on_resource_resolved`): a requested resource's bytes are
+	/// now available — forward to the right document's `ResourceMessageHandler::Resolved`.
+	ResourceResolved {
+		document_id: DocumentId,
+		resource_id: ResourceId,
+		data: Arc<[u8]>,
 	},
 	LoadPersistedState {
 		state: PersistedState,
