@@ -13,7 +13,7 @@ use document_container::archive::Archive;
 use document_container::backends::folder::FolderBackend;
 use document_container::{AnyContainer, AsyncContainer, ByteHolder, ContainerError};
 use graph_storage::{CommitError, CrdtError, Delta, HotOp, NodeMetadataSource, PeerId, Registry, Rev, Session, TimeStamp};
-use graphene_resource::ResourceHash;
+use graphene_resource::{LoadResource, Resource, ResourceFuture, ResourceHash, ResourceStorage};
 
 pub mod codec;
 pub mod export;
@@ -301,15 +301,15 @@ impl<L: Layout> Gdd<L> {
 		self.working.read(&self.layout.resource_path(hash)).await
 	}
 
-	pub async fn add_resource(&mut self, hash: ResourceHash, bytes: &[u8]) -> Result<(), ContainerError> {
+	pub async fn add_resource(&self, hash: ResourceHash, bytes: &[u8]) -> Result<(), ContainerError> {
 		self.working.write(&self.layout.resource_path(&hash), bytes).await
 	}
 
 	/// Add a resource by copying from `src` rather than buffering its bytes. Folder backends use
 	/// `fs::copy` (CoW on supported filesystems); other backends fall back to read-then-write.
-	pub async fn add_resource_from_path(&mut self, hash: ResourceHash, src: &Path) -> Result<(), ContainerError> {
+	pub async fn add_resource_from_path(&self, hash: ResourceHash, src: &Path) -> Result<(), ContainerError> {
 		let dest_path = self.layout.resource_path(&hash);
-		if let AnyContainer::Folder(folder) = &mut self.working {
+		if let AnyContainer::Folder(folder) = &self.working {
 			let full = folder.root().join(&dest_path);
 			if let Some(parent) = full.parent() {
 				std::fs::create_dir_all(parent).map_err(ContainerError::Io)?;
@@ -325,7 +325,7 @@ impl<L: Layout> Gdd<L> {
 		self.working.exists(&self.layout.resource_path(hash)).await
 	}
 
-	pub async fn remove_resource(&mut self, hash: &ResourceHash) -> Result<(), ContainerError> {
+	pub async fn remove_resource(&self, hash: &ResourceHash) -> Result<(), ContainerError> {
 		self.working.remove(&self.layout.resource_path(hash)).await
 	}
 
@@ -421,6 +421,44 @@ impl<L: Layout> Gdd<L> {
 		}
 
 		Ok(())
+	}
+}
+
+impl<L: Layout + Send + Sync> LoadResource for Gdd<L> {
+	fn load(&self, hash: ResourceHash) -> ResourceFuture<'_> {
+		Box::pin(async move {
+			let bytes = self.working.read(&self.layout.resource_path(&hash)).await.ok()?;
+			Some(Resource::new(bytes))
+		})
+	}
+}
+
+impl<L: Layout + Send + Sync> ResourceStorage for Gdd<L> {
+	fn store(&self, data: &[u8]) -> ResourceHash {
+		let hash = ResourceHash::from(data);
+		self.working.store_non_blocking(&self.layout.resource_path(&hash), data);
+		hash
+	}
+
+	fn contains(&self, hash: &ResourceHash) -> bool {
+		self.working.exists_non_blocking(&self.layout.resource_path(hash))
+	}
+
+	fn garbage_collect(&self, used: &[ResourceHash]) {
+		let kept: std::collections::HashSet<&ResourceHash> = used.iter().collect();
+		let hashes = match futures::executor::block_on(self.resource_hashes()) {
+			Ok(hashes) => hashes,
+			Err(error) => {
+				log::error!("Failed to list resources during garbage_collect: {error}");
+				return;
+			}
+		};
+		for hash in hashes {
+			if kept.contains(&hash) {
+				continue;
+			}
+			self.working.remove_non_blocking(&self.layout.resource_path(&hash));
+		}
 	}
 }
 

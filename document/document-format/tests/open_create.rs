@@ -274,7 +274,7 @@ fn resource_round_trip_add_read_remove() {
 	use graphene_resource::ResourceHash;
 
 	futures::executor::block_on(async {
-		let mut gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(99), 0xCAFE, "ed".into(), "std".into())
+		let gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(99), 0xCAFE, "ed".into(), "std".into())
 			.await
 			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
 
@@ -301,7 +301,7 @@ fn resource_survives_reopen() {
 	use graphene_resource::ResourceHash;
 
 	futures::executor::block_on(async {
-		let mut gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(7), 0xC0DE, "ed".into(), "std".into())
+		let gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(7), 0xC0DE, "ed".into(), "std".into())
 			.await
 			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
 
@@ -327,7 +327,7 @@ fn resource_from_path_uses_fs_copy_on_folder_backend() {
 		// Need a folder-backed working copy to exercise the fs::copy path.
 		let working_dir = tempfile::tempdir().unwrap();
 		let working = AnyContainer::Folder(FolderBackend::create(working_dir.path()).unwrap());
-		let mut gdd = Gdd::<GddV1>::create_in(working, GddV1, PeerId(1), 0xAB, "ed".into(), "std".into())
+		let gdd = Gdd::<GddV1>::create_in(working, GddV1, PeerId(1), 0xAB, "ed".into(), "std".into())
 			.await
 			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
 
@@ -353,7 +353,7 @@ fn export_carries_resources() {
 	use graphene_resource::ResourceHash;
 
 	futures::executor::block_on(async {
-		let mut gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(2), 0xBC, "ed".into(), "std".into())
+		let gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(2), 0xBC, "ed".into(), "std".into())
 			.await
 			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
 

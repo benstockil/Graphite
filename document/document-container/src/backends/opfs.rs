@@ -2,16 +2,32 @@
 
 use crate::{AsyncContainer, ByteHolder, ContainerError, Result};
 use js_sys::Uint8Array;
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
 	Blob, DomException, FileSystemCreateWritableOptions, FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetDirectoryOptions, FileSystemGetFileOptions, FileSystemWritableFileStream,
 	WritableStream,
 };
 
+enum Mutation {
+	Write { path: String, bytes: Vec<u8> },
+	Delete { path: String },
+}
+
+struct Inner {
+	directory: FileSystemDirectoryHandle,
+	/// Tracks paths currently believed to be on disk (post-pending-writes). Lets `exists_non_blocking`
+	/// answer synchronously since OPFS has no sync existence API.
+	on_disk: HashSet<String>,
+	queue: VecDeque<Mutation>,
+	worker_active: bool,
+}
+
 pub struct OpfsBackend {
-	root: FileSystemDirectoryHandle,
+	inner: Arc<Mutex<Inner>>,
 }
 
 // Safety: only built for browser wasm where JS handles never leave the main thread.
@@ -21,45 +37,121 @@ unsafe impl Sync for OpfsBackend {}
 impl OpfsBackend {
 	/// Open (or create) `directory_name` under the OPFS root.
 	pub async fn open(directory_name: &str) -> Result<Self> {
-		let root = open_directory(directory_name).await.map_err(js_err)?;
-		Ok(Self { root })
+		let directory = open_directory(directory_name).await.map_err(js_err)?;
+		let on_disk = enumerate_paths(&directory, "").await.map_err(js_err)?;
+		Ok(Self {
+			inner: Arc::new(Mutex::new(Inner {
+				directory,
+				on_disk,
+				queue: VecDeque::new(),
+				worker_active: false,
+			})),
+		})
+	}
+
+	fn directory(&self) -> FileSystemDirectoryHandle {
+		self.inner.lock().unwrap().directory.clone()
 	}
 }
 
 impl AsyncContainer for OpfsBackend {
 	async fn read(&self, path: &str) -> Result<ByteHolder> {
-		let bytes = read_file(&self.root, path).await.map_err(js_err)?;
+		let bytes = read_file(&self.directory(), path).await.map_err(js_err)?;
 		Ok(ByteHolder::Owned(bytes))
 	}
 
-	async fn write(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
-		write_file(&self.root, path, bytes).await.map_err(js_err)
+	async fn write(&self, path: &str, bytes: &[u8]) -> Result<()> {
+		write_file(&self.directory(), path, bytes).await.map_err(js_err)?;
+		self.inner.lock().unwrap().on_disk.insert(path.to_string());
+		Ok(())
 	}
 
-	async fn append(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
-		append_file(&self.root, path, bytes).await.map_err(js_err)
+	async fn append(&self, path: &str, bytes: &[u8]) -> Result<()> {
+		append_file(&self.directory(), path, bytes).await.map_err(js_err)?;
+		self.inner.lock().unwrap().on_disk.insert(path.to_string());
+		Ok(())
 	}
 
-	async fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()> {
+	async fn write_sized(&self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()> {
 		let mut buffer = vec![0; size];
 		fill(&mut buffer)?;
-		write_file(&self.root, path, &buffer).await.map_err(js_err)
+		write_file(&self.directory(), path, &buffer).await.map_err(js_err)?;
+		self.inner.lock().unwrap().on_disk.insert(path.to_string());
+		Ok(())
 	}
 
 	async fn list(&self, prefix: &str) -> Result<Vec<String>> {
-		list_entries(&self.root, prefix, EntryKind::File).await.map_err(js_err)
+		list_entries(&self.directory(), prefix, EntryKind::File).await.map_err(js_err)
 	}
 
 	async fn list_dirs(&self, prefix: &str) -> Result<Vec<String>> {
-		list_entries(&self.root, prefix, EntryKind::Directory).await.map_err(js_err)
+		list_entries(&self.directory(), prefix, EntryKind::Directory).await.map_err(js_err)
 	}
 
 	async fn exists(&self, path: &str) -> bool {
-		file_exists(&self.root, path).await
+		file_exists(&self.directory(), path).await
 	}
 
-	async fn remove(&mut self, path: &str) -> Result<()> {
-		remove_file(&self.root, path).await.map_err(js_err)
+	async fn remove(&self, path: &str) -> Result<()> {
+		remove_file(&self.directory(), path).await.map_err(js_err)?;
+		self.inner.lock().unwrap().on_disk.remove(path);
+		Ok(())
+	}
+
+	fn store_non_blocking(&self, path: &str, bytes: &[u8]) {
+		let mut guard = self.inner.lock().unwrap();
+		guard.on_disk.insert(path.to_string());
+		guard.queue.push_back(Mutation::Write {
+			path: path.to_string(),
+			bytes: bytes.to_vec(),
+		});
+		kick_worker(&self.inner, &mut guard);
+	}
+
+	fn remove_non_blocking(&self, path: &str) {
+		let mut guard = self.inner.lock().unwrap();
+		guard.on_disk.remove(path);
+		guard.queue.push_back(Mutation::Delete { path: path.to_string() });
+		kick_worker(&self.inner, &mut guard);
+	}
+
+	fn exists_non_blocking(&self, path: &str) -> bool {
+		self.inner.lock().unwrap().on_disk.contains(path)
+	}
+}
+
+fn kick_worker(inner: &Arc<Mutex<Inner>>, guard: &mut Inner) {
+	if guard.worker_active {
+		return;
+	}
+	guard.worker_active = true;
+	let inner = inner.clone();
+	spawn_local(drain_queue(inner));
+}
+
+async fn drain_queue(inner: Arc<Mutex<Inner>>) {
+	loop {
+		let (directory, mutation) = {
+			let mut guard = inner.lock().unwrap();
+			let Some(mutation) = guard.queue.pop_front() else {
+				guard.worker_active = false;
+				return;
+			};
+			(guard.directory.clone(), mutation)
+		};
+
+		match mutation {
+			Mutation::Write { path, bytes } => {
+				if let Err(error) = write_file(&directory, &path, &bytes).await {
+					log::error!("OPFS background write for {path} failed: {error:?}");
+				}
+			}
+			Mutation::Delete { path } => {
+				if let Err(error) = remove_file(&directory, &path).await {
+					log::error!("OPFS background delete for {path} failed: {error:?}");
+				}
+			}
+		}
 	}
 }
 
@@ -213,6 +305,24 @@ async fn list_entries(root: &FileSystemDirectoryHandle, prefix: &str, want: Entr
 		results.push(format!("{prefix_with_slash}{name}"));
 	}
 	Ok(results)
+}
+
+/// Walk every file under `prefix` (recursively) and collect their full container paths.
+/// Used at open time to populate the in-memory tracking set.
+async fn enumerate_paths(root: &FileSystemDirectoryHandle, prefix: &str) -> std::result::Result<HashSet<String>, JsValue> {
+	let mut paths = HashSet::new();
+	let mut to_visit = vec![prefix.to_string()];
+
+	while let Some(current_prefix) = to_visit.pop() {
+		for file in list_entries(root, &current_prefix, EntryKind::File).await? {
+			paths.insert(file);
+		}
+		for dir in list_entries(root, &current_prefix, EntryKind::Directory).await? {
+			to_visit.push(dir);
+		}
+	}
+
+	Ok(paths)
 }
 
 fn is_not_found(error: &JsValue) -> bool {

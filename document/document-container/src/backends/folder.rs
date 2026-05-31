@@ -69,7 +69,7 @@ impl Container for FolderBackend {
 		Ok(ByteHolder::Mmapped(MmappedBytes::new(file)))
 	}
 
-	fn write(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+	fn write(&self, path: &str, bytes: &[u8]) -> Result<()> {
 		let full = self.resolve(path)?;
 		if let Some(parent) = full.parent() {
 			fs::create_dir_all(parent)?;
@@ -78,7 +78,7 @@ impl Container for FolderBackend {
 		Ok(())
 	}
 
-	fn append(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+	fn append(&self, path: &str, bytes: &[u8]) -> Result<()> {
 		let full = self.resolve(path)?;
 		if let Some(parent) = full.parent() {
 			fs::create_dir_all(parent)?;
@@ -88,7 +88,7 @@ impl Container for FolderBackend {
 		Ok(())
 	}
 
-	fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()> {
+	fn write_sized(&self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()> {
 		if size == 0 {
 			return self.write(path, &[]);
 		}
@@ -124,7 +124,7 @@ impl Container for FolderBackend {
 		}
 	}
 
-	fn remove(&mut self, path: &str) -> Result<()> {
+	fn remove(&self, path: &str) -> Result<()> {
 		let full = self.resolve(path)?;
 		if !full.is_file() {
 			return Err(ContainerError::NotFound(path.to_string()));

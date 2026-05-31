@@ -61,6 +61,12 @@ impl ByteHolder {
 	}
 }
 
+impl AsRef<[u8]> for ByteHolder {
+	fn as_ref(&self) -> &[u8] {
+		self.as_slice()
+	}
+}
+
 impl std::fmt::Debug for ByteHolder {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
@@ -153,16 +159,16 @@ pub trait Container {
 	fn read(&self, path: &str) -> Result<ByteHolder>;
 
 	/// Write `bytes` at `path`, creating intermediate directories as needed.
-	fn write(&mut self, path: &str, bytes: &[u8]) -> Result<()>;
+	fn write(&self, path: &str, bytes: &[u8]) -> Result<()>;
 
 	/// Append `bytes` to the file at `path`, creating it (and any intermediate directories)
 	/// if it does not yet exist. Equivalent to `write` on a fresh path.
-	fn append(&mut self, path: &str, bytes: &[u8]) -> Result<()>;
+	fn append(&self, path: &str, bytes: &[u8]) -> Result<()>;
 
 	/// Write `size` bytes whose contents are produced by `fill`.
 	/// The default implementation allocates and forwards to [`Container::write`];
 	/// backends that can mmap a writable region may override to fill in place.
-	fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()> {
+	fn write_sized(&self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()> {
 		let mut buffer = vec![0; size];
 		fill(&mut buffer)?;
 		self.write(path, &buffer)
@@ -182,7 +188,7 @@ pub trait Container {
 	fn exists(&self, path: &str) -> bool;
 
 	/// Remove the file at `path`. Errors if the path does not exist or names a directory.
-	fn remove(&mut self, path: &str) -> Result<()>;
+	fn remove(&self, path: &str) -> Result<()>;
 }
 
 /// Asynchronous virtual filesystem of named byte payloads. Mirrors [`Container`].
@@ -194,11 +200,11 @@ pub trait Container {
 pub trait AsyncContainer {
 	async fn read(&self, path: &str) -> Result<ByteHolder>;
 
-	async fn write(&mut self, path: &str, bytes: &[u8]) -> Result<()>;
+	async fn write(&self, path: &str, bytes: &[u8]) -> Result<()>;
 
-	async fn append(&mut self, path: &str, bytes: &[u8]) -> Result<()>;
+	async fn append(&self, path: &str, bytes: &[u8]) -> Result<()>;
 
-	async fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()>;
+	async fn write_sized(&self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()>;
 
 	async fn list(&self, prefix: &str) -> Result<Vec<String>>;
 
@@ -206,7 +212,20 @@ pub trait AsyncContainer {
 
 	async fn exists(&self, path: &str) -> bool;
 
-	async fn remove(&mut self, path: &str) -> Result<()>;
+	async fn remove(&self, path: &str) -> Result<()>;
+
+	/// Non-blocking fire-and-forget write. Returns immediately. On backends with sync I/O
+	/// (folder, memory) the write completes durably before return. On OPFS the write is
+	/// queued to a background task and errors are logged rather than propagated.
+	fn store_non_blocking(&self, path: &str, bytes: &[u8]);
+
+	/// Non-blocking fire-and-forget remove. Same semantics as [`store_non_blocking`](Self::store_non_blocking).
+	fn remove_non_blocking(&self, path: &str);
+
+	/// Non-blocking existence check. On OPFS this reads from an in-memory tracking set
+	/// populated by `store_non_blocking` / `remove_non_blocking` since the underlying OPFS
+	/// API is async only.
+	fn exists_non_blocking(&self, path: &str) -> bool;
 }
 
 impl<C: Container + ?Sized> AsyncContainer for C {
@@ -214,15 +233,15 @@ impl<C: Container + ?Sized> AsyncContainer for C {
 		Container::read(self, path)
 	}
 
-	async fn write(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+	async fn write(&self, path: &str, bytes: &[u8]) -> Result<()> {
 		Container::write(self, path, bytes)
 	}
 
-	async fn append(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+	async fn append(&self, path: &str, bytes: &[u8]) -> Result<()> {
 		Container::append(self, path, bytes)
 	}
 
-	async fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()> {
+	async fn write_sized(&self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()> {
 		Container::write_sized(self, path, size, fill)
 	}
 
@@ -238,8 +257,24 @@ impl<C: Container + ?Sized> AsyncContainer for C {
 		Container::exists(self, path)
 	}
 
-	async fn remove(&mut self, path: &str) -> Result<()> {
+	async fn remove(&self, path: &str) -> Result<()> {
 		Container::remove(self, path)
+	}
+
+	fn store_non_blocking(&self, path: &str, bytes: &[u8]) {
+		if let Err(error) = Container::write(self, path, bytes) {
+			log::error!("store_non_blocking({path}) failed: {error}");
+		}
+	}
+
+	fn remove_non_blocking(&self, path: &str) {
+		if let Err(error) = Container::remove(self, path) {
+			log::error!("remove_non_blocking({path}) failed: {error}");
+		}
+	}
+
+	fn exists_non_blocking(&self, path: &str) -> bool {
+		Container::exists(self, path)
 	}
 }
 
@@ -267,7 +302,7 @@ impl AsyncContainer for AnyContainer {
 		}
 	}
 
-	async fn write(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+	async fn write(&self, path: &str, bytes: &[u8]) -> Result<()> {
 		match self {
 			Self::Memory(backend) => AsyncContainer::write(backend, path, bytes).await,
 			#[cfg(not(target_family = "wasm"))]
@@ -277,7 +312,7 @@ impl AsyncContainer for AnyContainer {
 		}
 	}
 
-	async fn append(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+	async fn append(&self, path: &str, bytes: &[u8]) -> Result<()> {
 		match self {
 			Self::Memory(backend) => AsyncContainer::append(backend, path, bytes).await,
 			#[cfg(not(target_family = "wasm"))]
@@ -287,7 +322,7 @@ impl AsyncContainer for AnyContainer {
 		}
 	}
 
-	async fn write_sized(&mut self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()> {
+	async fn write_sized(&self, path: &str, size: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()> {
 		match self {
 			Self::Memory(backend) => AsyncContainer::write_sized(backend, path, size, fill).await,
 			#[cfg(not(target_family = "wasm"))]
@@ -327,13 +362,43 @@ impl AsyncContainer for AnyContainer {
 		}
 	}
 
-	async fn remove(&mut self, path: &str) -> Result<()> {
+	async fn remove(&self, path: &str) -> Result<()> {
 		match self {
 			Self::Memory(backend) => AsyncContainer::remove(backend, path).await,
 			#[cfg(not(target_family = "wasm"))]
 			Self::Folder(backend) => AsyncContainer::remove(backend, path).await,
 			#[cfg(target_family = "wasm")]
 			Self::Opfs(backend) => AsyncContainer::remove(backend, path).await,
+		}
+	}
+
+	fn store_non_blocking(&self, path: &str, bytes: &[u8]) {
+		match self {
+			Self::Memory(backend) => AsyncContainer::store_non_blocking(backend, path, bytes),
+			#[cfg(not(target_family = "wasm"))]
+			Self::Folder(backend) => AsyncContainer::store_non_blocking(backend, path, bytes),
+			#[cfg(target_family = "wasm")]
+			Self::Opfs(backend) => AsyncContainer::store_non_blocking(backend, path, bytes),
+		}
+	}
+
+	fn remove_non_blocking(&self, path: &str) {
+		match self {
+			Self::Memory(backend) => AsyncContainer::remove_non_blocking(backend, path),
+			#[cfg(not(target_family = "wasm"))]
+			Self::Folder(backend) => AsyncContainer::remove_non_blocking(backend, path),
+			#[cfg(target_family = "wasm")]
+			Self::Opfs(backend) => AsyncContainer::remove_non_blocking(backend, path),
+		}
+	}
+
+	fn exists_non_blocking(&self, path: &str) -> bool {
+		match self {
+			Self::Memory(backend) => AsyncContainer::exists_non_blocking(backend, path),
+			#[cfg(not(target_family = "wasm"))]
+			Self::Folder(backend) => AsyncContainer::exists_non_blocking(backend, path),
+			#[cfg(target_family = "wasm")]
+			Self::Opfs(backend) => AsyncContainer::exists_non_blocking(backend, path),
 		}
 	}
 }
