@@ -52,7 +52,6 @@ use std::time::Duration;
 pub struct DocumentMessageContext<'a> {
 	pub document_id: DocumentId,
 	pub ipp: &'a InputPreprocessorMessageHandler,
-	pub fonts: &'a FontsMessageHandler,
 	pub executor: &'a mut NodeGraphExecutor,
 	pub current_tool: &'a ToolType,
 	pub preferences: &'a PreferencesMessageHandler,
@@ -61,6 +60,7 @@ pub struct DocumentMessageContext<'a> {
 	pub properties_panel_open: bool,
 	pub viewport: &'a ViewportMessageHandler,
 	pub resource_storage: &'a ResourceStorageMessageHandler,
+	pub fonts: &'a FontsMessageHandler,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, ExtractField)]
@@ -198,7 +198,6 @@ impl MessageHandler<DocumentMessage, DocumentMessageContext<'_>> for DocumentMes
 		let DocumentMessageContext {
 			document_id,
 			ipp,
-			fonts,
 			executor,
 			viewport,
 			current_tool,
@@ -207,6 +206,7 @@ impl MessageHandler<DocumentMessage, DocumentMessageContext<'_>> for DocumentMes
 			layers_panel_open,
 			properties_panel_open,
 			resource_storage,
+			fonts,
 		} = context;
 
 		match message {
@@ -936,7 +936,7 @@ impl MessageHandler<DocumentMessage, DocumentMessageContext<'_>> for DocumentMes
 
 				responses.add(FrontendMessage::Await {
 					future: async move {
-						document.resources.garbage_collect(document.used_resources(false).as_ref());
+						document.resources.collect_garbage(document.used_resources(false).as_ref());
 						document.resources.embed_resources(resources_load_handle).await;
 
 						let content = document.serialize_document().into_bytes().into();
@@ -2661,13 +2661,6 @@ impl DocumentMessageHandler {
 		}
 	}
 
-	/// Kick off resource resolution for every unresolved id in this document's registry. The per-document
-	/// [`ResourceMessageHandler`] walks each source list (Embedded/Url/Font) and either resolves locally via the
-	/// fonts handler's cache or asks the frontend to fetch a URL.
-	pub fn load_layer_resources(&self, responses: &mut VecDeque<Message>) {
-		responses.add(DocumentMessage::Resource(ResourceMessage::Resolve));
-	}
-
 	pub fn update_document_widgets(&self, responses: &mut VecDeque<Message>, animation_is_playing: bool, time: Duration) {
 		let mut snapping_state = self.snapping_state.clone();
 		let mut snapping_state2 = self.snapping_state.clone();
@@ -3463,7 +3456,7 @@ impl DocumentMessageHandler {
 
 	pub fn garbage_collect_resources(&mut self) {
 		let used_resources = self.used_resources(true);
-		self.resources.garbage_collect(&used_resources);
+		self.resources.collect_garbage(&used_resources);
 	}
 
 	pub fn used_resources(&self, include_history: bool) -> Box<[ResourceId]> {

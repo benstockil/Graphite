@@ -41,7 +41,8 @@ export function createFontsManager(subscriptions: SubscriptionsRouter, editor: E
 		}
 	});
 
-	// Generic URL resolver — the editor decides what the URL maps to (font / image / ...) and just hands one to us.
+	// Generic URL resolver
+	// TODO(keavon): This is currently only used for fonts, but it could be used for other resources and thus should be moved to a more sesible location
 	subscriptions.subscribeFrontendMessage("TriggerResolveResource", async (data) => {
 		try {
 			if (!data.url) throw new Error("No URL provided for resource resolution");

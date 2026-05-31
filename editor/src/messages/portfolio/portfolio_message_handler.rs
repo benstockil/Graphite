@@ -121,22 +121,6 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 				let context = FontsMessageContext { resource_storage };
 				self.fonts.process_message(message, responses, context);
 			}
-			PortfolioMessage::ResourceResolved { document_id, resource_id, data } => {
-				if let Some(document) = self.documents.get_mut(&document_id) {
-					let context = ResourceMessageContext { document_id, fonts: &self.fonts };
-					document.resources.process_message(ResourceMessage::Resolved { resource_id, data }, responses, context);
-				} else {
-					log::warn!("Resource resolved for unknown document {document_id:?}");
-				}
-			}
-			PortfolioMessage::ResolveAllResources => {
-				for document_id in self.document_ids.iter().copied().collect::<Vec<_>>() {
-					if let Some(document) = self.documents.get_mut(&document_id) {
-						let context = ResourceMessageContext { document_id, fonts: &self.fonts };
-						document.resources.process_message(ResourceMessage::Resolve, responses, context);
-					}
-				}
-			}
 
 			// Messages
 			PortfolioMessage::Init => {
@@ -428,15 +412,21 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 					used: Vec::from_iter(used_resources).into_boxed_slice(),
 				});
 			}
-			PortfolioMessage::LoadDocumentResources { document_id } => {
-				if self.fonts.font_catalog.0.is_empty() {
+			PortfolioMessage::ResolveResources => {
+				for document_id in self.document_ids.iter().copied().collect::<Vec<_>>() {
+					responses.add(PortfolioMessage::ResolveDocumentResources { document_id });
+				}
+			}
+			PortfolioMessage::ResolveDocumentResources { document_id } => {
+				if self.fonts.font_catalog.is_empty() {
 					responses.add_front(FrontendMessage::TriggerFontCatalogLoad);
 					return;
 				}
 
-				if let Some(document) = self.documents.get_mut(&document_id) {
-					document.load_layer_resources(responses);
-				}
+				responses.add(PortfolioMessage::DocumentPassMessage {
+					document_id,
+					message: DocumentMessage::Resource(ResourceMessage::Resolve),
+				});
 			}
 			PortfolioMessage::LoadPersistedState { state } => {
 				if let Some(layout) = state.workspace_layout {
@@ -1087,7 +1077,6 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 								added_nodes = true;
 							}
 
-							document.load_layer_resources(responses);
 							let new_ids: HashMap<_, _> = entry.nodes.iter().map(|(id, _)| (*id, NodeId::new())).collect();
 							let layer = LayerNodeIdentifier::new_unchecked(new_ids[&NodeId(0)]);
 							all_new_ids.extend(new_ids.values().cloned());
@@ -1572,7 +1561,7 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 				};
 				if !document.is_loaded {
 					document.is_loaded = true;
-					responses.add(PortfolioMessage::LoadDocumentResources { document_id });
+					responses.add(PortfolioMessage::ResolveDocumentResources { document_id });
 					responses.add(PortfolioMessage::UpdateDocumentWidgets);
 					responses.add(PropertiesPanelMessage::Clear);
 				}

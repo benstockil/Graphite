@@ -19,7 +19,6 @@ thread_local! {
 pub struct TextContext {
 	font_context: FontContext,
 	layout_context: LayoutContext<()>,
-	/// Cached font metadata keyed by the underlying font blob's pointer so identical bytes hit one cache slot.
 	font_info_cache: HashMap<usize, (FamilyId, FontInfo)>,
 }
 

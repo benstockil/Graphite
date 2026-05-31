@@ -62,9 +62,6 @@ where
 }
 
 /// Calculates the bounding box of the layer's text, based on the settings for max width and height specified in the typesetting config.
-///
-/// When the font hasn't been loaded yet, falls back to the embedded fallback blob (via [`FontsMessageHandler::get_blob_or_queue_load`])
-/// and queues a load so the next call returns a tighter box once the bytes arrive.
 pub fn text_bounding_box(layer: LayerNodeIdentifier, document: &DocumentMessageHandler, fonts: &FontsMessageHandler, responses: &mut VecDeque<Message>) -> Quad {
 	// Use the `editor:text_frame` attribute if available (handles multi-item glyphs and the 'Index Elements' node)
 	if let Some(&frame) = document.metadata().text_frames.get(&layer) {

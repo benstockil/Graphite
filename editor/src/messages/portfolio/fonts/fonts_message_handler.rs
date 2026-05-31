@@ -3,23 +3,16 @@ use crate::messages::portfolio::fonts::utility_types::FontCatalog;
 use crate::messages::prelude::*;
 use graph_craft::application_io::resource::{DataSource, Resource, ResourceHash, ResourceId};
 use graphene_std::text::{Blob, Font};
-use std::sync::Arc;
 
 #[derive(ExtractField)]
 pub struct FontsMessageContext<'a> {
 	pub resource_storage: &'a ResourceStorageMessageHandler,
 }
 
-/// Central font index: catalog + content-addressed cache of font bytes used for editor-side measurement
-/// and the editable-textbox. Document rendering still goes through the per-document resource registry; the
-/// fonts handler only learns about a font's hash when [`FontsMessage::ResourceResolved`] is dispatched by
-/// the per-document [`ResourceMessageHandler`].
 #[derive(Debug, Default, ExtractField)]
 pub struct FontsMessageHandler {
 	pub font_catalog: FontCatalog,
-	/// `Font → ResourceHash` learned each time a font-sourced resource resolves in any document.
 	font_hashes: HashMap<Font, ResourceHash>,
-	/// Lazy `ResourceHash → bytes` cache; filled on demand by the `Await`-backed `Load` path.
 	font_data: HashMap<ResourceHash, Resource>,
 }
 
@@ -31,10 +24,7 @@ impl MessageHandler<FontsMessage, FontsMessageContext<'_>> for FontsMessageHandl
 		match message {
 			FontsMessage::CatalogLoaded { catalog } => {
 				self.font_catalog = catalog;
-
-				// Any `ResolveStep` that gave up because the catalog wasn't loaded yet can now run; rebroadcast
-				// `Resolve` so every document re-walks its unresolved ids with URLs available.
-				responses.add(PortfolioMessage::ResolveAllResources);
+				responses.add(PortfolioMessage::ResolveResources);
 			}
 			FontsMessage::ResourceResolved { family, style, hash } => {
 				let font = font_from_pair(&family, style.as_deref());
@@ -47,35 +37,28 @@ impl MessageHandler<FontsMessage, FontsMessageContext<'_>> for FontsMessageHandl
 					return;
 				};
 				if self.font_data.contains_key(&hash) {
-					if let Some(response) = response {
-						responses.add(*response);
-					}
+					responses.add(*response);
 					return;
 				}
 				let loader = resource_storage.resources();
 				responses.add(FrontendMessage::Await {
 					future: async move {
-						let data = loader.load(hash).await.map(|resource| {
-							let bytes: Arc<[u8]> = Arc::from(resource.as_ref());
-							bytes
-						});
-						match data {
-							Some(data) => FontsMessage::Cached { hash, data, response }.into(),
+						let resource = loader.load(hash).await;
+						match resource {
+							Some(resource) => Message::Batched {
+								messages: Box::new([FontsMessage::Cached { hash, resource }.into(), *response]),
+							},
 							None => {
 								log::warn!("Storage missing data for font hash {hash}");
-								// If `response` was requested, still fire it so callers don't deadlock; otherwise no-op.
-								response.map(|r| *r).unwrap_or(Message::NoOp)
+								*response
 							}
 						}
 					}
 					.into(),
 				});
 			}
-			FontsMessage::Cached { hash, data, response } => {
-				self.font_data.insert(hash, Resource::new(data.to_vec()));
-				if let Some(response) = response {
-					responses.add(*response);
-				}
+			FontsMessage::Cached { hash, resource } => {
+				self.font_data.insert(hash, resource);
 			}
 		}
 	}
@@ -84,18 +67,14 @@ impl MessageHandler<FontsMessage, FontsMessageContext<'_>> for FontsMessageHandl
 }
 
 impl FontsMessageHandler {
-	/// The content hash recorded for a font's family/style, if any document has loaded it.
 	pub fn cached_hash(&self, family: &str, style: Option<&str>) -> Option<ResourceHash> {
 		self.font_hashes.get(&font_from_pair(family, style)).copied()
 	}
 
-	/// The download URL for a font's family/style according to the catalog.
 	pub fn cached_url(&self, family: &str, style: Option<&str>) -> Option<String> {
-		self.font_catalog.cached_url(family, style)
+		self.font_catalog.download_url(family, style)
 	}
 
-	/// Returns the cached font blob if loaded; otherwise queues a [`FontsMessage::Load`] (when the hash is
-	/// known) and returns the embedded fallback so measurement degrades gracefully instead of failing.
 	pub fn get_blob_or_queue_load(&self, font: &Font, responses: &mut VecDeque<Message>) -> Blob<u8> {
 		let style = Some(font.font_style.as_str());
 		if let Some(hash) = self.font_hashes.get(font) {
@@ -105,14 +84,12 @@ impl FontsMessageHandler {
 			responses.add(FontsMessage::Load {
 				family: font.font_family.clone(),
 				style: style.map(str::to_string),
-				response: None,
+				response: Message::NoOp.into(),
 			});
 		}
 		FALLBACK_FONT_BLOB.clone()
 	}
 
-	/// Read the [`Font`] recorded for a resource id in the given document registry (its first
-	/// `DataSource::Font` source). Used by the font picker to display the current selection.
 	pub fn id_font(&self, resources: &ResourceMessageHandler, resource_id: ResourceId) -> Option<Font> {
 		let info = resources.registry.info(&resource_id)?;
 		info.sources.iter().find_map(|source| match source {
@@ -121,15 +98,10 @@ impl FontsMessageHandler {
 		})
 	}
 
-	/// Every content hash this handler has learned about (from both the lazy byte cache and the `Font → hash`
-	/// index), so they survive `PortfolioMessage::GarbageCollectResources`. Without this, a font that was
-	/// resolved earlier in the session would be GC'd from storage as soon as no live document referenced it,
-	/// even though we still need its hash for the next picker action.
 	pub fn used_resources(&self) -> impl Iterator<Item = ResourceHash> + '_ {
 		self.font_hashes.values().copied().chain(self.font_data.keys().copied())
 	}
 
-	/// Snap a requested font to the closest style present in the catalog.
 	fn normalize(&self, font: Font) -> Font {
 		match self.font_catalog.find_font_style_in_catalog(&font) {
 			Some(style) => Font::new(font.font_family, style.to_named_style()),
@@ -138,6 +110,7 @@ impl FontsMessageHandler {
 	}
 }
 
+// TODO: Remove
 fn font_from_pair(family: &str, style: Option<&str>) -> Font {
 	Font::new(family.to_string(), style.unwrap_or("Regular (400)").to_string())
 }

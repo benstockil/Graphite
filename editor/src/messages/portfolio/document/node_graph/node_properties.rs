@@ -12,6 +12,7 @@ use crate::messages::tool::common_functionality::graph_modification_utils;
 use choice::enum_choice;
 use dyn_any::DynAny;
 use glam::{DAffine2, DVec2};
+use graph_craft::application_io::resource::ResourceId;
 use graph_craft::document::value::TaggedValue;
 use graph_craft::document::{DocumentNode, DocumentNodeImplementation, NodeId, NodeInput};
 use graph_craft::{Type, concrete};
@@ -51,28 +52,6 @@ pub fn update_value<T>(value: impl Fn(&T) -> TaggedValue + 'static + Send + Sync
 
 pub fn commit_value<T>(_: &T) -> Message {
 	DocumentMessage::AddTransaction.into()
-}
-
-/// Mint a fresh `ResourceId`, register the `DataSource::Font` against it via [`ResourceMessage::AddFont`],
-/// then wire it into a text node's font input.
-///
-/// **Order matters**: `AddFont` is dispatched first so that by the time `SetInputValue` fires its
-/// follow-up `RunDocumentGraph`, the registry already knows about the id. Otherwise the preprocessor
-/// would see an unresolved `Resource(id)` and fail with `ResourceNotFound`, and (when the font is already
-/// cached in `font_hashes`) no further `RunDocumentGraph` would re-fire to recover.
-pub fn assign_font_message(node_id: NodeId, font: Font) -> Message {
-	let resource_id = graph_craft::application_io::resource::ResourceId::new();
-	Message::Batched {
-		messages: Box::new([
-			DocumentMessage::Resource(ResourceMessage::AddFont { resource_id, font }).into(),
-			NodeGraphMessage::SetInputValue {
-				node_id,
-				input_index: graphene_std::text::text::FontInput::INDEX,
-				value: TaggedValue::Resource(resource_id),
-			}
-			.into(),
-		]),
-	}
 }
 
 pub fn expose_widget(node_id: NodeId, index: usize, data_type: FrontendGraphDataType, exposed: bool) -> WidgetInstance {
@@ -844,6 +823,21 @@ pub fn array_of_number_widget(parameter_widgets_info: ParameterWidgetsInfo, text
 }
 
 pub fn font_inputs(parameter_widgets_info: ParameterWidgetsInfo) -> (Vec<WidgetInstance>, Option<Vec<WidgetInstance>>) {
+	pub fn assign_font_message(node_id: NodeId, font: Font) -> Message {
+		let resource_id = ResourceId::new();
+		Message::Batched {
+			messages: Box::new([
+				DocumentMessage::Resource(ResourceMessage::AddFont { resource_id, font }).into(),
+				NodeGraphMessage::SetInputValue {
+					node_id,
+					input_index: graphene_std::text::text::FontInput::INDEX,
+					value: TaggedValue::Resource(resource_id),
+				}
+				.into(),
+			]),
+		}
+	}
+
 	let ParameterWidgetsInfo {
 		document_node,
 		node_id,
@@ -863,17 +857,12 @@ pub fn font_inputs(parameter_widgets_info: ParameterWidgetsInfo) -> (Vec<WidgetI
 	};
 
 	if let Some(TaggedValue::Resource(resource_id)) = input.as_non_exposed_value() {
-		// The font's family/style live in the resource's `DataSource::Font`. The picker mints a fresh `ResourceId`,
-		// wires it into the text node's font input, and registers the `DataSource::Font` for that id via
-		// `ResourceMessage::AddFont`. `NodePropertiesContext` doesn't carry the registry, so the "currently selected"
-		// dropdown labels fall back to the default font for now.
 		let font = fonts.id_font(resources, *resource_id).unwrap_or_default();
 		first_widgets.extend_from_slice(&[
 			Separator::new(SeparatorStyle::Unrelated).widget_instance(),
 			DropdownInput::new(vec![
 				fonts
 					.font_catalog
-					.0
 					.iter()
 					.map(|family| {
 						let FontCatalogStyle { weight, italic, .. } = FontCatalogStyle::from_named_style(&font.font_style, "");
@@ -892,7 +881,7 @@ pub fn font_inputs(parameter_widgets_info: ParameterWidgetsInfo) -> (Vec<WidgetI
 					})
 					.collect::<Vec<_>>(),
 			])
-			.selected_index(fonts.font_catalog.0.iter().position(|family| family.name == font.font_family).map(|i| i as u32))
+			.selected_index(fonts.font_catalog.iter().position(|family| family.name == font.font_family).map(|i| i as u32))
 			.virtual_scrolling(true)
 			.widget_instance(),
 		]);
@@ -904,7 +893,6 @@ pub fn font_inputs(parameter_widgets_info: ParameterWidgetsInfo) -> (Vec<WidgetI
 			DropdownInput::new({
 				fonts
 					.font_catalog
-					.0
 					.iter()
 					.find(|family| family.name == font.font_family)
 					.map(|family| {
@@ -929,7 +917,6 @@ pub fn font_inputs(parameter_widgets_info: ParameterWidgetsInfo) -> (Vec<WidgetI
 			.selected_index(
 				fonts
 					.font_catalog
-					.0
 					.iter()
 					.find(|family| family.name == font.font_family)
 					.and_then(|family| {

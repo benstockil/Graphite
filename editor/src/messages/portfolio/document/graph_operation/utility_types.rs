@@ -249,9 +249,6 @@ impl<'a> ModifyInputsContext<'a> {
 	}
 
 	pub fn insert_text(&mut self, text: String, font: Font, typesetting: TypesettingConfig, layer: LayerNodeIdentifier) {
-		// Mint the font resource id up front so the inserted node already has the right `Resource(id)` value, and
-		// hand the same id to `ResourceMessage::AddFont` to register its `DataSource::Font` in the document's
-		// registry (which kicks off `Resolve`). Input 0 is `None` so the node uses its default primary `()` value.
 		let font_resource_id = ResourceId::new();
 		let text = resolve_proto_node_type(graphene_std::text::text::IDENTIFIER)
 			.expect("Text node does not exist")
@@ -281,12 +278,7 @@ impl<'a> ModifyInputsContext<'a> {
 		self.network_interface.insert_node(text_id, text, &[]);
 		self.network_interface.move_node_to_chain_start(&text_id, layer, &[], self.import);
 
-		// Register the font's `DataSource` for the resource id we just wired into the text node. `AddFont` queues
-		// `Resolve`, so the bytes start fetching (or resolve immediately from `font_hashes` if already known).
-		self.responses.add(DocumentMessage::Resource(ResourceMessage::AddFont {
-			resource_id: font_resource_id,
-			font,
-		}));
+		self.responses.add(DocumentMessage::Resource(ResourceMessage::AddFont { resource_id: font_resource_id, font }));
 
 		let transform_id = NodeId::new();
 		self.network_interface.insert_node(transform_id, transform, &[]);

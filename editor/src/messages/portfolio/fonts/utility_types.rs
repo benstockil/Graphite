@@ -2,7 +2,7 @@ use graphene_std::text::Font;
 
 // TODO: Should this be a BTreeMap instead?
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct FontCatalog(pub Vec<FontCatalogFamily>);
+pub struct FontCatalog(Vec<FontCatalogFamily>);
 
 impl FontCatalog {
 	pub fn find_font_style_in_catalog(&self, font: &Font) -> Option<FontCatalogStyle> {
@@ -20,12 +20,25 @@ impl FontCatalog {
 		found_style
 	}
 
-	/// Look up the download URL for a font's family/style by snapping to the closest catalog style.
-	pub fn cached_url(&self, family: &str, style: Option<&str>) -> Option<String> {
+	pub fn download_url(&self, family: &str, style: Option<&str>) -> Option<String> {
 		let catalog_family = self.0.iter().find(|catalog_family| catalog_family.name == family)?;
 		let style_name = style.unwrap_or("Regular (400)");
 		let FontCatalogStyle { weight, italic, .. } = FontCatalogStyle::from_named_style(style_name, "");
 		Some(catalog_family.closest_style(weight, italic).url.clone())
+	}
+
+	pub fn iter(&self) -> impl Iterator<Item = &FontCatalogFamily> {
+		self.0.iter()
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.0.is_empty()
+	}
+}
+
+impl From<Vec<FontCatalogFamily>> for FontCatalog {
+	fn from(value: Vec<FontCatalogFamily>) -> Self {
+		Self(value)
 	}
 }
 

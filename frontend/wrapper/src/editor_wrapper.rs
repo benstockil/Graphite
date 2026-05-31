@@ -658,16 +658,18 @@ impl EditorWrapper {
 	/// The font catalog has been loaded
 	#[wasm_bindgen(js_name = onFontCatalogLoad)]
 	pub fn on_font_catalog_load(&self, catalog: Vec<FontCatalogFamily>) {
-		self.dispatch(FontsMessage::CatalogLoaded { catalog: FontCatalog(catalog) });
+		self.dispatch(FontsMessage::CatalogLoaded { catalog: FontCatalog::from(catalog) });
 	}
 
 	/// A requested resource has been resolved by the frontend.
 	#[wasm_bindgen(js_name = onResourceResolved)]
 	pub fn on_resource_resolved(&self, document_id: u64, resource_id: u64, data: Vec<u8>) -> Result<(), JsValue> {
-		self.dispatch(PortfolioMessage::ResourceResolved {
+		self.dispatch(PortfolioMessage::DocumentPassMessage {
 			document_id: DocumentId(document_id),
-			resource_id: resource_id.into(),
-			data: std::sync::Arc::from(data),
+			message: DocumentMessage::Resource(ResourceMessage::Resolved {
+				resource_id: resource_id.into(),
+				data: std::sync::Arc::from(data),
+			}),
 		});
 
 		Ok(())

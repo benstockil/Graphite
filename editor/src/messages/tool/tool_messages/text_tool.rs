@@ -17,6 +17,7 @@ use crate::messages::tool::common_functionality::snapping::{self, SnapCandidateP
 use crate::messages::tool::common_functionality::transformation_cage::*;
 use crate::messages::tool::common_functionality::utility_functions::text_bounding_box;
 use crate::messages::tool::utility_types::ToolRefreshOptions;
+use graph_craft::application_io::resource::ResourceId;
 use graph_craft::document::value::TaggedValue;
 use graph_craft::document::{NodeId, NodeInput};
 use graphene_std::choice_type::ChoiceTypeStatic;
@@ -105,22 +106,30 @@ impl ToolMetadata for TextTool {
 }
 
 fn create_text_widgets(tool: &TextTool, font_catalog: &FontCatalog, document: &DocumentMessageHandler) -> Vec<WidgetInstance> {
-	// If a single text layer is selected, the font/style menus assign the font on that layer: mint a fresh `ResourceId`,
-	// wire it into the text node's font input via `SetInputValue`, and register the `DataSource::Font` for that id via
-	// `ResourceMessage::AddFont` (which kicks off `Resolve`). Otherwise the menus only update the control bar option
-	// for the next created text.
 	let text_node_id = can_edit_selected(document).and_then(|layer| graph_modification_utils::get_text_id(layer, &document.network_interface));
 
-	let apply_font = move |new_font: Font| -> Message {
+	let apply_font = move |font: Font| -> Message {
 		match text_node_id {
-			Some(node_id) => crate::messages::portfolio::document::node_graph::node_properties::assign_font_message(node_id, new_font),
+			Some(node_id) => {
+				let resource_id = ResourceId::new();
+				Message::Batched {
+					messages: Box::new([
+						DocumentMessage::Resource(ResourceMessage::AddFont { resource_id, font }).into(),
+						NodeGraphMessage::SetInputValue {
+							node_id,
+							input_index: graphene_std::text::text::FontInput::INDEX,
+							value: TaggedValue::Resource(resource_id),
+						}
+						.into(),
+					]),
+				}
+			}
 			None => TextToolMessage::UpdateOptions {
-				options: TextOptionsUpdate::Font { font: new_font },
+				options: TextOptionsUpdate::Font { font },
 			}
 			.into(),
 		}
 	};
-	let preview_font = move |new_font: Font| -> Message { apply_font(new_font) };
 	let commit_font = move |new_font: Font| -> Message {
 		match text_node_id {
 			Some(_) => DeferMessage::AfterGraphRun {
@@ -133,7 +142,6 @@ fn create_text_widgets(tool: &TextTool, font_catalog: &FontCatalog, document: &D
 
 	let font = DropdownInput::new(vec![
 		font_catalog
-			.0
 			.iter()
 			.map(|family| {
 				let current_font = &tool.options.font;
@@ -144,18 +152,17 @@ fn create_text_widgets(tool: &TextTool, font_catalog: &FontCatalog, document: &D
 				MenuListEntry::new(family.name.clone())
 					.label(family.name.clone())
 					.font(family.closest_style(400, false).preview_url(&family.name))
-					.on_update(move |_| preview_font(new_font.clone()))
+					.on_update(move |_| apply_font(new_font.clone()))
 					.on_commit(move |_| commit_font(commit_only_font.clone()))
 			})
 			.collect::<Vec<_>>(),
 	])
-	.selected_index(font_catalog.0.iter().position(|family| family.name == tool.options.font.font_family).map(|i| i as u32))
+	.selected_index(font_catalog.iter().position(|family| family.name == tool.options.font.font_family).map(|i| i as u32))
 	.virtual_scrolling(true)
 	.widget_instance();
 
 	let style = DropdownInput::new({
 		font_catalog
-			.0
 			.iter()
 			.find(|family| family.name == tool.options.font.font_family)
 			.map(|family| {
@@ -167,7 +174,7 @@ fn create_text_widgets(tool: &TextTool, font_catalog: &FontCatalog, document: &D
 
 					MenuListEntry::new(font_style.clone())
 						.label(font_style)
-						.on_update(move |_| preview_font(new_font.clone()))
+						.on_update(move |_| apply_font(new_font.clone()))
 						.on_commit(move |_| commit_font(new_font_for_commit.clone()))
 				};
 
@@ -181,7 +188,6 @@ fn create_text_widgets(tool: &TextTool, font_catalog: &FontCatalog, document: &D
 	})
 	.selected_index(
 		font_catalog
-			.0
 			.iter()
 			.find(|family| family.name == tool.options.font.font_family)
 			.and_then(|family| {
@@ -283,6 +289,15 @@ impl<'a> MessageHandler<ToolMessage, &mut ToolActionMessageContext<'a>> for Text
 		if matches!(&message, ToolMessage::Text(TextToolMessage::Abort)) && self.fsm_state == TextToolFsmState::Ready {
 			self.options.fill.fill_choice = Some(solid(context.global_tool_data.primary_color));
 		}
+
+		// Ensure the font is loaded as early as possible
+		responses.add(FontsMessage::Load {
+			family: self.options.font.font_family.clone(),
+			style: Some(self.options.font.font_style.clone()),
+			response: Box::new(Message::Batched {
+				messages: Box::new([NodeGraphMessage::RunDocumentGraph.into(), TextToolMessage::RefreshEditingFontData.into()]),
+			}),
+		});
 
 		let options = match message {
 			ToolMessage::Text(TextToolMessage::UpdateOptions { options }) => options,
@@ -544,7 +559,6 @@ impl TextToolData {
 	}
 
 	fn new_text(&mut self, document: &DocumentMessageHandler, editing_text: EditingText, fonts: &FontsMessageHandler, responses: &mut VecDeque<Message>) {
-		// Create new text
 		self.new_text = String::new();
 		responses.add(DocumentMessage::AddTransaction);
 
@@ -553,7 +567,7 @@ impl TextToolData {
 		responses.add(FontsMessage::Load {
 			family: editing_text.font.font_family.clone(),
 			style: Some(editing_text.font.font_style.clone()),
-			response: None,
+			response: Box::new(NodeGraphMessage::RunDocumentGraph.into()),
 		});
 		responses.add(GraphOperationMessage::NewTextLayer {
 			id: self.layer.to_node(),
@@ -594,7 +608,6 @@ impl TextToolData {
 
 	fn check_click(document: &DocumentMessageHandler, input: &InputPreprocessorMessageHandler, fonts: &FontsMessageHandler, responses: &mut VecDeque<Message>) -> Option<LayerNodeIdentifier> {
 		let mouse = DVec2::new(input.mouse.position.x, input.mouse.position.y);
-		// Resolve all candidate bboxes up front because `text_bounding_box` needs to queue follow-up `Load` messages.
 		let layers: Vec<LayerNodeIdentifier> = document.metadata().all_layers().filter(|&layer| document.metadata().is_text_layer(layer)).collect();
 		for layer in layers {
 			let transformed_quad = document.metadata().transform_to_viewport(layer) * text_bounding_box(layer, document, fonts, responses);

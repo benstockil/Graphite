@@ -13,6 +13,10 @@ impl Resource {
 	pub fn new<T: AsRef<[u8]> + Send + Sync + 'static>(data: T) -> Self {
 		Self { inner: Arc::new(data) }
 	}
+
+	pub fn empty() -> Self {
+		Self::new([])
+	}
 }
 
 impl From<&Resource> for Arc<dyn AsRef<[u8]> + Send + Sync> {

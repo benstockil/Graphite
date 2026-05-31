@@ -431,8 +431,7 @@ pub fn get_grid_id(layer: LayerNodeIdentifier, network_interface: &NodeNetworkIn
 	NodeGraphLayer::new(layer, network_interface).upstream_node_id_from_name(&DefinitionIdentifier::ProtoNode(graphene_std::vector::generator_nodes::grid::IDENTIFIER))
 }
 
-/// Gets properties from the Text node. Resolves the font selection by reading the resource id from the node's
-/// font input and consulting the document's registry via the fonts handler.
+/// Gets properties from the Text node. Resolves the font selection by reading the resource id and lookup via the fonts message handler.
 pub fn get_text<'a>(
 	layer: LayerNodeIdentifier,
 	network_interface: &'a NodeNetworkInterface,
@@ -444,7 +443,6 @@ pub fn get_text<'a>(
 	let Some(TaggedValue::String(text)) = &inputs[graphene_std::text::text::TextInput::INDEX].as_value() else {
 		return None;
 	};
-	// The font input is a `Resource(id)`; look up the recorded family/style in the document's registry.
 	let font = match &inputs[graphene_std::text::text::FontInput::INDEX].as_value() {
 		Some(TaggedValue::Resource(resource_id)) => fonts.id_font(resources, *resource_id).unwrap_or_default(),
 		_ => Font::default(),
