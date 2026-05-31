@@ -78,11 +78,7 @@ const FRONTEND_UPDATE_MESSAGES: &[MessageDiscriminant] = &[
 	MessageDiscriminant::Frontend(FrontendMessageDiscriminant::UpdateDocumentLayerStructure),
 ];
 // FrontendMessages that should be sent immediately
-const IMMEDIATE_FRONTEND_MESSAGES: &[FrontendMessageDiscriminant] = &[
-	FrontendMessageDiscriminant::Await,
-	FrontendMessageDiscriminant::TriggerResolveResource,
-	FrontendMessageDiscriminant::TriggerFontCatalogLoad,
-];
+const IMMEDIATE_FRONTEND_MESSAGES: &[FrontendMessageDiscriminant] = &[FrontendMessageDiscriminant::TriggerResolveResource, FrontendMessageDiscriminant::TriggerFontCatalogLoad];
 const DEBUG_MESSAGE_BLOCK_LIST: &[MessageDiscriminant] = &[
 	MessageDiscriminant::Broadcast(BroadcastMessageDiscriminant::TriggerEvent(EventMessageDiscriminant::AnimationFrame)),
 	MessageDiscriminant::Animation(AnimationMessageDiscriminant::IncrementFrameCounter),

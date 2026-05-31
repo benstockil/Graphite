@@ -290,15 +290,6 @@ impl<'a> MessageHandler<ToolMessage, &mut ToolActionMessageContext<'a>> for Text
 			self.options.fill.fill_choice = Some(solid(context.global_tool_data.primary_color));
 		}
 
-		// Ensure the font is loaded as early as possible
-		responses.add(FontsMessage::Load {
-			family: self.options.font.font_family.clone(),
-			style: Some(self.options.font.font_style.clone()),
-			response: Box::new(Message::Batched {
-				messages: Box::new([NodeGraphMessage::RunDocumentGraph.into(), TextToolMessage::RefreshEditingFontData.into()]),
-			}),
-		});
-
 		let options = match message {
 			ToolMessage::Text(TextToolMessage::UpdateOptions { options }) => options,
 			ToolMessage::Text(TextToolMessage::SelectionChanged) => {
