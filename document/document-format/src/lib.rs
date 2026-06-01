@@ -7,9 +7,14 @@
 //! See `notes/disk-container-format.md` for the design rationale.
 
 use std::collections::HashMap;
+// `Path`, `Archive`, and `FolderBackend` are only used by the native-only path-based open/create
+// and filesystem export, so they're gated off wasm to avoid unused-import warnings.
+#[cfg(not(target_family = "wasm"))]
 use std::path::Path;
 
+#[cfg(not(target_family = "wasm"))]
 use document_container::archive::Archive;
+#[cfg(not(target_family = "wasm"))]
 use document_container::backends::folder::FolderBackend;
 use document_container::{AnyContainer, AsyncContainer, ByteHolder, ContainerError};
 use graph_storage::{CommitError, CrdtError, Delta, HotOp, NodeMetadataSource, PeerId, Registry, Rev, Session, TimeStamp};
@@ -60,6 +65,9 @@ pub struct Gdd<L: Layout = GddV1> {
 	manifest: Manifest,
 }
 
+/// Native folder-backed convenience constructors. On wasm the editor builds an OPFS-backed
+/// `AnyContainer` itself and uses [`Gdd::open_in`] / [`Gdd::create_in`] directly.
+#[cfg(not(target_family = "wasm"))]
 impl<L: Layout + Default> Gdd<L> {
 	/// Open an existing working copy at `path`. Validates the manifest, materializes the session
 	/// from `registry.bin` (fast path) or by replaying `history.jsonl` (slow path), then applies
@@ -296,8 +304,10 @@ impl<L: Layout> Gdd<L> {
 		self.working.store_non_blocking(&self.layout.resource_path(&hash), bytes)
 	}
 
-	/// Add a resource by copying from `src` rather than buffering its bytes. Folder backends use
-	/// `fs::copy` (CoW on supported filesystems); other backends fall back to read-then-write.
+	/// Add a resource by copying from a filesystem `src` rather than buffering its bytes. Folder
+	/// backends use `fs::copy` (CoW on supported filesystems); other backends fall back to
+	/// read-then-write. Native-only: there is no filesystem source path on wasm.
+	#[cfg(not(target_family = "wasm"))]
 	pub fn add_resource_from_path(&self, hash: ResourceHash, src: &Path) -> Result<(), ContainerError> {
 		let dest_path = self.layout.resource_path(&hash);
 		if let AnyContainer::Folder(folder) = &self.working {
@@ -342,7 +352,9 @@ impl<L: Layout> Gdd<L> {
 	/// Build a self-contained export of the working copy: re-encodes typed payloads with the
 	/// chosen codec, omits session/hot-log (peer-local + ephemeral), copies resources straight
 	/// through, then materializes as a folder, zip, or xz archive at `dest`. Does not mutate
-	/// `self` and does not buffer the full export — resources stream end-to-end.
+	/// `self` and does not buffer the full export — resources stream end-to-end. Native-only:
+	/// export writes to a filesystem path.
+	#[cfg(not(target_family = "wasm"))]
 	pub async fn export(&self, dest: &Path, format: ExportFormat, options: ExportOptions) -> Result<(), ExportError> {
 		options.validate().map_err(ExportError::InvalidOptions)?;
 
@@ -382,6 +394,7 @@ impl<L: Layout> Gdd<L> {
 	/// sink only ever sees one payload's bytes at a time. The exported manifest's codec map is
 	/// rewritten to `codec` so it stays authoritative for the re-encoded payloads; the manifest
 	/// itself is always JSON.
+	#[cfg(not(target_family = "wasm"))]
 	async fn stream_entries(&self, codec: Codec, options: ExportOptions, sink: &mut dyn ExportSink) -> Result<(), ExportError> {
 		use document_container::AsyncContainer;
 
@@ -423,6 +436,10 @@ impl<L: Layout> Gdd<L> {
 	}
 }
 
+// `Gdd` serves resource bytes to the runtime only in the native standalone/export use case (the
+// editor injects the global cache instead). On wasm, OPFS reads are non-`Send` and `block_on`
+// deadlocks the JS event loop, so these impls are native-only.
+#[cfg(not(target_family = "wasm"))]
 impl<L: Layout + Send + Sync> LoadResource for Gdd<L> {
 	fn load(&self, hash: ResourceHash) -> ResourceFuture<'_> {
 		Box::pin(async move {
@@ -432,6 +449,7 @@ impl<L: Layout + Send + Sync> LoadResource for Gdd<L> {
 	}
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl<L: Layout + Send + Sync> ResourceStorage for Gdd<L> {
 	fn store(&self, data: &[u8]) -> ResourceHash {
 		let hash = ResourceHash::from(data);
@@ -466,7 +484,9 @@ impl<L: Layout + Send + Sync> ResourceStorage for Gdd<L> {
 }
 
 /// Abstraction over the sink an export streams entries into. Lets a single async loop drive
-/// folder writes, zip writes, and xz writes without duplicating the entry sequence.
+/// folder writes, zip writes, and xz writes without duplicating the entry sequence. Export is
+/// native-only (it targets a filesystem path), so the whole sink machinery is gated off wasm.
+#[cfg(not(target_family = "wasm"))]
 trait ExportSink {
 	fn write_entry(&mut self, path: &str, bytes: &[u8]) -> Result<(), ExportError>;
 
@@ -479,10 +499,12 @@ trait ExportSink {
 	}
 }
 
+#[cfg(not(target_family = "wasm"))]
 struct FolderSink<'a> {
 	folder: &'a mut document_container::backends::folder::FolderBackend,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl ExportSink for FolderSink<'_> {
 	fn write_entry(&mut self, path: &str, bytes: &[u8]) -> Result<(), ExportError> {
 		document_container::Container::write(self.folder, path, bytes)?;
@@ -500,6 +522,7 @@ impl ExportSink for FolderSink<'_> {
 	}
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl<W: std::io::Write + std::io::Seek> ExportSink for document_container::archive::ZipWriter<W> {
 	fn write_entry(&mut self, path: &str, bytes: &[u8]) -> Result<(), ExportError> {
 		use document_container::archive::ArchiveWriter;
@@ -508,6 +531,7 @@ impl<W: std::io::Write + std::io::Seek> ExportSink for document_container::archi
 	}
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl<W: std::io::Write + std::io::Seek> ExportSink for document_container::archive::XzWriter<W> {
 	fn write_entry(&mut self, path: &str, bytes: &[u8]) -> Result<(), ExportError> {
 		use document_container::archive::ArchiveWriter;

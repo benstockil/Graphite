@@ -3,10 +3,19 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use graphene_std::WasmNotSend;
 
 use crate::messages::prelude::*;
 
+// Native spawns onto a multi-thread tokio runtime, so the boxed future must be `Send`. Wasm uses
+// `spawn_local` on the single JS thread, where `Send` is unavailable (OPFS/`JsFuture` are `!Send`)
+// and unnecessary. `WasmNotSend` (`Send` on native, no-op on wasm) expresses the input bound on
+// `MessageFuture::new`; the stored trait-object alias still needs a `cfg` split because `Send` is
+// an auto trait usable in a `dyn` bound while `WasmNotSend` is not.
+#[cfg(not(target_family = "wasm"))]
 type InnerMessageFuture = Pin<Box<dyn Future<Output = Message> + Send + 'static>>;
+#[cfg(target_family = "wasm")]
+type InnerMessageFuture = Pin<Box<dyn Future<Output = Message> + 'static>>;
 
 /// Invoked by the spawner after a result is sent, to wake the platform event loop.
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
@@ -23,7 +32,7 @@ pub struct MessageFuture {
 }
 
 impl MessageFuture {
-	pub fn new(future: impl Future<Output = Message> + Send + 'static) -> Self {
+	pub fn new(future: impl Future<Output = Message> + WasmNotSend + 'static) -> Self {
 		Self {
 			inner: Arc::new(Mutex::new(Some(Box::pin(future)))),
 		}
