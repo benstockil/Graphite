@@ -49,6 +49,27 @@ impl Registry {
 		let network = convert_network(self, ROOT_NETWORK, &[], &mut node_metadata, &mut network_metadata)?;
 		Ok((network, node_metadata.expect("seeded above"), network_metadata.expect("seeded above")))
 	}
+
+	/// Rebuild the runtime [`ResourceRegistry`](graphene_resource::ResourceRegistry) from the stored
+	/// `resources`. Each entry's source chain is restored in priority order (the `BTreeMap` already
+	/// iterates sorted) with bodies decoded from their type-erased `serde_json::Value` form back to
+	/// `DataSource`; the resolved hash, if any, is restored last. Inverse of `convert_resources` in
+	/// `from_runtime`.
+	pub fn to_resource_registry(&self) -> Result<graphene_resource::ResourceRegistry, ConversionError> {
+		let mut registry = graphene_resource::ResourceRegistry::new();
+
+		for (id, entry) in &self.resources {
+			for source in entry.sources.values() {
+				let decoded: graphene_resource::DataSource = serde_json::from_value(source.source.clone()).map_err(|error| ConversionError::DeserializationError(error.to_string()))?;
+				registry.push_source_back(id, decoded);
+			}
+			if let Some(hash) = entry.hash {
+				registry.resolve(id, hash);
+			}
+		}
+
+		Ok(registry)
+	}
 }
 
 /// Converts a single network. Recurses through `Implementation::Network` owning nodes.

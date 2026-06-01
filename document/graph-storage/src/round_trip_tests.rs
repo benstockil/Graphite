@@ -503,3 +503,35 @@ fn resources_round_trip_through_from_runtime() {
 	// All source keys carry the document peer.
 	assert!(entry.sources.keys().all(|key| key.peer == PeerId(7)), "source keys scoped to the document peer");
 }
+
+/// Full resource round-trip: a runtime `ResourceRegistry` converted into storage and back is equal
+/// to the original (source chains in order, resolved hashes preserved).
+#[test]
+fn resource_registry_round_trips_runtime_to_storage_to_runtime() {
+	use graphene_resource::{DataSource, ResourceHash, ResourceId, ResourceRegistry};
+
+	let network = NodeNetwork::default();
+
+	let mut original = ResourceRegistry::new();
+
+	// A resolved resource with a two-entry fallback chain.
+	let image = ResourceId::new();
+	original.push_source_back(&image, DataSource::Embedded);
+	original.push_source_back(&image, DataSource::Url("https://example.com/img.png".parse().unwrap()));
+	original.resolve(&image, ResourceHash::from(&b"image bytes"[..]));
+
+	// An unresolved resource (sources but no hash yet).
+	let font = ResourceId::new();
+	original.push_source_back(
+		&font,
+		DataSource::Font {
+			family: "Inter".into(),
+			style: Some("Bold".into()),
+		},
+	);
+
+	let registry = Registry::from_runtime_with_metadata(&network, &crate::NoMetadata, &original, PeerId(3)).expect("from_runtime failed");
+	let restored = registry.to_resource_registry().expect("to_resource_registry failed");
+
+	assert_eq!(restored, original, "resource registry did not survive the storage round-trip");
+}

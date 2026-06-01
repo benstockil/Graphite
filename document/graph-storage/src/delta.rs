@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{AttributeDelta, ExportSlot, NetworkId, Node, NodeId, NodeInput, Registry, RegistryDelta, TimeStamp};
+use crate::{AttributeDelta, ExportSlot, NetworkId, Node, NodeId, NodeInput, Registry, RegistryDelta, ResourceEntry, ResourceId, TimeStamp};
 
 /// Minimal set of deltas to transform `from` into `to`.
 ///
@@ -98,7 +98,57 @@ pub fn compute_deltas(from: &Registry, to: &Registry) -> Vec<RegistryDelta> {
 		}
 	}
 
+	compute_resource_deltas(from, to, &mut deltas);
+
 	deltas
+}
+
+/// Diff the resource store, emitting whole-entry add/remove for resources that appear or vanish and
+/// fine-grained hash/source ops for resources present in both. Value-only: per-entry and per-source
+/// timestamps are derived by the caller, so an unchanged resource emits nothing.
+fn compute_resource_deltas(from: &Registry, to: &Registry, deltas: &mut Vec<RegistryDelta>) {
+	let from_ids: HashSet<ResourceId> = from.resources.keys().copied().collect();
+	let to_ids: HashSet<ResourceId> = to.resources.keys().copied().collect();
+
+	for &id in from_ids.difference(&to_ids) {
+		deltas.push(RegistryDelta::RemoveResource {
+			id,
+			snapshot: from.resources[&id].clone(),
+		});
+	}
+
+	for &id in to_ids.difference(&from_ids) {
+		deltas.push(RegistryDelta::AddResource { id, entry: to.resources[&id].clone() });
+	}
+
+	for &id in from_ids.intersection(&to_ids) {
+		diff_resource_entry(id, &from.resources[&id], &to.resources[&id], deltas);
+	}
+}
+
+/// Per-entry diff for a resource present in both registries: hash change, then source chain
+/// additions/changes/removals.
+fn diff_resource_entry(id: ResourceId, from: &ResourceEntry, to: &ResourceEntry, deltas: &mut Vec<RegistryDelta>) {
+	if from.hash != to.hash {
+		deltas.push(RegistryDelta::SetResourceHash { id, hash: to.hash });
+	}
+
+	for key in from.sources.keys() {
+		if !to.sources.contains_key(key) {
+			deltas.push(RegistryDelta::RemoveSource { id, key: *key });
+		}
+	}
+
+	// Compare source bodies only; the per-source timestamp is derived from the diff, not part of it.
+	for (key, to_source) in &to.sources {
+		if from.sources.get(key).is_none_or(|from_source| from_source.source != to_source.source) {
+			deltas.push(RegistryDelta::AddSource {
+				id,
+				key: *key,
+				source: to_source.source.clone(),
+			});
+		}
+	}
 }
 
 fn nodes_have_same_implementation(a: &Node, b: &Node) -> bool {

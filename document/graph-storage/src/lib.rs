@@ -869,7 +869,7 @@ pub enum RegistryDelta {
 	},
 	/// LWW on a resource's resolved content hash. Creates the resource entry if absent.
 	/// Concurrent resolves agree by construction (the hash is content-derived), so LWW is safe.
-	RegisterResource {
+	SetResourceHash {
 		id: ResourceId,
 		hash: Option<ResourceHash>,
 	},
@@ -885,6 +885,18 @@ pub enum RegistryDelta {
 	RemoveSource {
 		id: ResourceId,
 		key: SourceKey,
+	},
+	/// Register a whole resource entry at once. Overwrites any existing entry for `id`; the reverse
+	/// of `RemoveResource`, the way `AddNetwork` pairs with `RemoveNetwork`.
+	AddResource {
+		id: ResourceId,
+		entry: ResourceEntry,
+	},
+	/// Remove a whole resource entry. `snapshot` lets the reverse `AddResource` rebuild in O(1)
+	/// without walking history, mirroring `RemoveNetwork`.
+	RemoveResource {
+		id: ResourceId,
+		snapshot: ResourceEntry,
 	},
 }
 
@@ -1077,7 +1089,7 @@ impl Document {
 					self.registry.peer_users.insert(peer, user);
 				}
 			},
-			RegistryDelta::RegisterResource { id, hash } => {
+			RegistryDelta::SetResourceHash { id, hash } => {
 				let entry = self.registry.resources.entry(id).or_default();
 				if timestamp > entry.hash_timestamp {
 					entry.hash = hash;
@@ -1104,6 +1116,12 @@ impl Document {
 						entry.sources.remove(&key);
 					}
 				}
+			}
+			RegistryDelta::AddResource { id, entry } => {
+				self.registry.resources.insert(id, entry);
+			}
+			RegistryDelta::RemoveResource { id, .. } => {
+				self.registry.resources.remove(&id);
 			}
 		}
 		Ok(())
@@ -1175,7 +1193,7 @@ impl Document {
 			// Registrations are append-only and not user-undoable; reverse is the same op,
 			// which applies as a no-op on the already-registered PeerId.
 			&RegistryDelta::RegisterPeer { peer, user } => RegistryDelta::RegisterPeer { peer, user },
-			&RegistryDelta::RegisterResource { id, .. } => RegistryDelta::RegisterResource {
+			&RegistryDelta::SetResourceHash { id, .. } => RegistryDelta::SetResourceHash {
 				id,
 				hash: self.registry.resources.get(&id).and_then(|entry| entry.hash),
 			},
@@ -1198,6 +1216,19 @@ impl Document {
 				// Nothing to restore; reverse is a no-op removal.
 				None => RegistryDelta::RemoveSource { id, key },
 			},
+			&RegistryDelta::AddResource { id, .. } => match self.registry.resources.get(&id) {
+				// Overwrote an existing entry: undo restores it.
+				Some(existing) => RegistryDelta::AddResource { id, entry: existing.clone() },
+				// Created a new entry: undo removes what this op added (snapshot is empty since there was nothing prior).
+				None => RegistryDelta::RemoveResource {
+					id,
+					snapshot: ResourceEntry::default(),
+				},
+			},
+			&RegistryDelta::RemoveResource { id, .. } => {
+				let snapshot = self.registry.resources.get(&id).cloned().unwrap_or_default();
+				RegistryDelta::AddResource { id, entry: snapshot }
+			}
 		})
 	}
 

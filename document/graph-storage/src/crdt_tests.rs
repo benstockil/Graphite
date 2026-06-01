@@ -345,7 +345,7 @@ fn same_source_key_is_last_writer_wins() {
 	assert_eq!(entry.sources.get(&key).unwrap().source, serde_json::json!("new"));
 }
 
-/// RegisterResource is LWW on the hash; a later resolve wins, an earlier one is ignored.
+/// SetResourceHash is LWW on the hash; a later resolve wins, an earlier one is ignored.
 #[test]
 fn register_resource_hash_is_last_writer_wins() {
 	let mut document = fresh_document(PeerId(1));
@@ -353,11 +353,11 @@ fn register_resource_hash_is_last_writer_wins() {
 	let hash_a = ResourceHash::from(&b"alpha"[..]);
 	let hash_b = ResourceHash::from(&b"beta"[..]);
 
-	document.apply_op(RD::RegisterResource { id, hash: Some(hash_a) }, ts(5, 1), false).unwrap();
-	document.apply_op(RD::RegisterResource { id, hash: Some(hash_b) }, ts(2, 1), false).unwrap();
+	document.apply_op(RD::SetResourceHash { id, hash: Some(hash_a) }, ts(5, 1), false).unwrap();
+	document.apply_op(RD::SetResourceHash { id, hash: Some(hash_b) }, ts(2, 1), false).unwrap();
 	assert_eq!(document.registry.resources.get(&id).unwrap().hash, Some(hash_a), "earlier resolve must not clobber later one");
 
-	document.apply_op(RD::RegisterResource { id, hash: Some(hash_b) }, ts(9, 1), false).unwrap();
+	document.apply_op(RD::SetResourceHash { id, hash: Some(hash_b) }, ts(9, 1), false).unwrap();
 	assert_eq!(document.registry.resources.get(&id).unwrap().hash, Some(hash_b), "later resolve wins");
 }
 
@@ -433,4 +433,99 @@ fn add_source_reverse_depends_on_prior_state() {
 		RD::AddSource { source, .. } => assert_eq!(source, serde_json::json!("existing"), "reverse restores prior body"),
 		other => panic!("expected AddSource reverse, got {other:?}"),
 	}
+}
+
+// --- compute_deltas resource diffing ---
+
+use crate::{ResourceEntry, ResourceStore, SourceValue};
+
+fn entry_with_source(priority: f64, peer: u64, body: serde_json::Value, hash: Option<ResourceHash>) -> ResourceEntry {
+	let mut sources = std::collections::BTreeMap::new();
+	sources.insert(source_key(priority, peer), SourceValue { source: body, timestamp: ts(1, peer) });
+	ResourceEntry {
+		sources,
+		hash,
+		hash_timestamp: ts(1, peer),
+	}
+}
+
+fn registry_with_resources(resources: ResourceStore) -> crate::Registry {
+	crate::Registry { resources, ..Default::default() }
+}
+
+/// An unchanged resource store produces zero deltas, even when timestamps differ (value-only diff).
+#[test]
+fn compute_deltas_ignores_unchanged_resources() {
+	let id = ResourceId::new();
+	let hash = ResourceHash::from(&b"img"[..]);
+
+	let mut from = ResourceStore::new();
+	from.insert(id, entry_with_source(0.0, 1, serde_json::json!("embedded"), Some(hash)));
+	// Same value, different timestamps: must not count as a change.
+	let mut to = ResourceStore::new();
+	let mut to_entry = entry_with_source(0.0, 1, serde_json::json!("embedded"), Some(hash));
+	to_entry.hash_timestamp = ts(99, 2);
+	to_entry.sources.values_mut().for_each(|v| v.timestamp = ts(99, 2));
+	to.insert(id, to_entry);
+
+	let deltas = crate::delta::compute_deltas(&registry_with_resources(from), &registry_with_resources(to));
+	assert!(deltas.is_empty(), "unchanged resource (value-equal) produced deltas: {deltas:?}");
+}
+
+/// Adding, changing, and removing resources each produce the matching delta, and applying the diff
+/// transforms `from` into a registry value-equal to `to`.
+#[test]
+fn compute_deltas_diffs_resources_and_round_trips() {
+	let kept = ResourceId::new();
+	let removed = ResourceId::new();
+	let added = ResourceId::new();
+	let hash_old = ResourceHash::from(&b"old"[..]);
+	let hash_new = ResourceHash::from(&b"new"[..]);
+
+	let mut from = ResourceStore::new();
+	from.insert(kept, entry_with_source(0.0, 1, serde_json::json!("embedded"), Some(hash_old)));
+	from.insert(removed, entry_with_source(0.0, 1, serde_json::json!("gone"), None));
+
+	let mut to = ResourceStore::new();
+	// `kept`: hash changes and a second source is added.
+	let mut kept_entry = entry_with_source(0.0, 1, serde_json::json!("embedded"), Some(hash_new));
+	kept_entry.sources.insert(
+		source_key(1.0, 1),
+		SourceValue {
+			source: serde_json::json!("url"),
+			timestamp: ts(1, 1),
+		},
+	);
+	to.insert(kept, kept_entry);
+	// `added`: brand new resource.
+	to.insert(added, entry_with_source(0.0, 1, serde_json::json!("fresh"), None));
+
+	let deltas = crate::delta::compute_deltas(&registry_with_resources(from.clone()), &registry_with_resources(to.clone()));
+
+	// A brand-new resource is a single whole-entry AddResource, never a fan-out of per-source ops.
+	let added_deltas: Vec<_> = deltas.iter().filter(|d| matches!(d, RD::AddResource { id, .. } if *id == added)).collect();
+	assert_eq!(added_deltas.len(), 1, "adding a resource should produce exactly one AddResource delta, got {added_deltas:?}");
+	assert!(
+		!deltas.iter().any(|d| matches!(d, RD::AddSource { id, .. } | RD::SetResourceHash { id, .. } if *id == added)),
+		"a brand-new resource must not emit per-source or hash ops"
+	);
+	// The removed resource is a single whole-entry RemoveResource.
+	assert_eq!(
+		deltas.iter().filter(|d| matches!(d, RD::RemoveResource { id, .. } if *id == removed)).count(),
+		1,
+		"removing a resource should produce exactly one RemoveResource delta"
+	);
+
+	// Apply the diff to a document seeded with `from`, then check it matches `to` by value.
+	let mut document = fresh_document(PeerId(1));
+	document.registry = registry_with_resources(from);
+	for op in deltas {
+		let timestamp = document.clock.tick();
+		document.apply_op(op, timestamp, false).expect("apply resource delta");
+	}
+
+	assert!(
+		document.registry.value_equal(&registry_with_resources(to)),
+		"applying the resource diff did not reproduce the target registry"
+	);
 }
