@@ -122,7 +122,7 @@ impl MessageHandler<FutureMessage, FutureMessageContext> for FutureMessageHandle
 
 #[cfg(not(target_family = "wasm"))]
 fn default_spawner() -> Arc<dyn MessageSpawner> {
-	Arc::new(TokioSpawner::default())
+	Arc::new(TokioSpawner)
 }
 
 #[cfg(target_family = "wasm")]
@@ -145,7 +145,6 @@ static EDITOR_ASYNC_RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std:
 });
 
 #[cfg(not(target_family = "wasm"))]
-#[derive(Default)]
 struct TokioSpawner;
 
 #[cfg(not(target_family = "wasm"))]

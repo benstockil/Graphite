@@ -295,16 +295,19 @@ impl Session {
 
 	/// Diff the current registry against a fresh conversion of `network`, then commit each emitted
 	/// op as its own `Delta` on the local chain. One `clock.tick()` per op (strictly causal within
-	/// a commit). Returns the new `Rev`s in commit order, empty if nothing changed.
+	/// a commit). Returns the new `Rev`s in commit order (empty if nothing changed) plus the
+	/// proto-node declaration bytes the conversion extracted, keyed by content hash, for the caller
+	/// to persist into its byte store (`graph-storage` itself is byte-unaware).
 	pub fn commit_from_runtime<M: NodeMetadataSource>(
 		&mut self,
 		network: &graph_craft::document::NodeNetwork,
 		metadata: &M,
 		resources: &graphene_resource::ResourceRegistry,
-	) -> Result<Vec<Rev>, CommitError> {
-		let target = Registry::from_runtime_with_metadata(network, metadata, resources, self.document.peer)?;
-		let ops = crate::delta::compute_deltas(&self.document.registry, &target);
-		Ok(self.commit_ops(ops, false)?)
+	) -> Result<(Vec<Rev>, HashMap<ResourceHash, Vec<u8>>), CommitError> {
+		let conversion = Registry::convert_from_runtime(network, metadata, resources, self.document.peer)?;
+		let ops = crate::delta::compute_deltas(&self.document.registry, &conversion.registry);
+		let revs = self.commit_ops(ops, false)?;
+		Ok((revs, conversion.declaration_bytes))
 	}
 
 	/// Wrap each op as a `Delta`, apply it, and chain it onto the local history. One tick per op.

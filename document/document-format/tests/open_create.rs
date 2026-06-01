@@ -405,3 +405,56 @@ fn persist_path_writes_at_manifest_declared_codec_paths() {
 		assert!(reopened.registry().networks.contains_key(&ROOT_NETWORK));
 	});
 }
+
+/// Complete declaration round-trip through the byte store: committing a runtime network with a
+/// proto-node persists its `ProtoNode` content into a `ResourceStorage`, and resolving declarations
+/// back through that store reconstructs the proto-node identifier in `to_runtime`. This is the
+/// editor-shaped path (declaration bytes live in the resource store, not the Gdd container).
+#[test]
+fn declarations_round_trip_through_byte_store() {
+	use graph_craft::application_io::resource::HashMapResourceStorage;
+	use graph_craft::document::{DocumentNode, DocumentNodeImplementation, NodeInput, NodeNetwork};
+	use graph_craft::{ProtoNodeIdentifier, concrete};
+	use graph_storage::NoMetadata;
+	use graphene_resource::ResourceRegistry;
+
+	const PROTO: &str = "graphene_core::ops::identity::IdentityNode";
+
+	futures::executor::block_on(async {
+		let network = NodeNetwork {
+			exports: vec![NodeInput::node(core_types::uuid::NodeId(0), 0)],
+			nodes: [(
+				core_types::uuid::NodeId(0),
+				DocumentNode {
+					inputs: vec![NodeInput::import(concrete!(u32), 0)],
+					implementation: DocumentNodeImplementation::ProtoNode(ProtoNodeIdentifier::new(PROTO)),
+					..Default::default()
+				},
+			)]
+			.into_iter()
+			.collect(),
+			..Default::default()
+		};
+
+		let mut gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(1), 0xAB, "ed".into(), "std".into())
+			.await
+			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
+
+		// Commit: declaration bytes flow into the byte store, not the Gdd container.
+		let byte_store = HashMapResourceStorage::new();
+		gdd.commit_from_runtime(&network, &NoMetadata, &ResourceRegistry::new(), &byte_store)
+			.unwrap_or_else(|error| panic!("commit_from_runtime failed: {error:?}"));
+
+		// Resolve declarations back through the store and convert to a runtime network.
+		let declarations = gdd.declarations(&byte_store).await;
+		assert_eq!(declarations.len(), 1, "expected one proto-node declaration resolved from the byte store");
+
+		let (converted, _entries) = gdd.registry().to_runtime_with_metadata(&declarations).unwrap_or_else(|error| panic!("to_runtime failed: {error:?}"));
+
+		let node = converted.nodes.values().next().expect("converted network has the node");
+		match &node.implementation {
+			DocumentNodeImplementation::ProtoNode(identifier) => assert_eq!(identifier.as_str(), PROTO, "proto-node identifier survived the byte-store round-trip"),
+			other => panic!("expected a ProtoNode implementation, got {other:?}"),
+		}
+	});
+}

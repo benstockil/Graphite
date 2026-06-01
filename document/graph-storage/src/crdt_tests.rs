@@ -111,10 +111,10 @@ fn commit_from_runtime_is_idempotent_for_unchanged_network() {
 	let network = tiny_network();
 
 	let resources = graphene_resource::ResourceRegistry::new();
-	let first = session.commit_from_runtime(&network, &NoMetadata, &resources).expect("first commit failed");
+	let (first, _) = session.commit_from_runtime(&network, &NoMetadata, &resources).expect("first commit failed");
 	assert!(!first.is_empty(), "first commit should produce at least one delta for the initial network");
 
-	let second = session.commit_from_runtime(&network, &NoMetadata, &resources).expect("second commit failed");
+	let (second, _) = session.commit_from_runtime(&network, &NoMetadata, &resources).expect("second commit failed");
 	assert_eq!(second.len(), 0, "second commit of unchanged network produced {} spurious deltas: {:?}", second.len(), second);
 }
 

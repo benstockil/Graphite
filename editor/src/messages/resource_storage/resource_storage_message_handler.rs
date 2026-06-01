@@ -28,6 +28,12 @@ impl ResourceStorageMessageHandler {
 			inner: self.storage.clone().expect("Resource storage not initialized"),
 		})
 	}
+
+	/// The backing store as a `&dyn ResourceStorage`, for write paths (e.g. persisting declaration
+	/// bytes on commit). `None` before initialization.
+	pub fn storage(&self) -> Option<&dyn ResourceStorage> {
+		self.storage.as_deref()
+	}
 }
 
 impl std::fmt::Debug for ResourceStorageMessageHandler {

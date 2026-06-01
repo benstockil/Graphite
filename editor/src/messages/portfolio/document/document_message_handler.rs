@@ -1806,14 +1806,15 @@ impl DocumentMessageHandler {
 	/// Commit the runtime network into the document's `Gdd` working copy at autosave boundaries.
 	/// No-op while the working copy is still unmounted (its container is built asynchronously on
 	/// document open); the mount picks up the current runtime state once it attaches.
-	pub fn commit_storage_snapshot(&mut self) {
+	/// Proto-node declaration bytes are persisted into `byte_store` (the app-global resource cache).
+	pub fn commit_storage_snapshot(&mut self, byte_store: &dyn graph_craft::application_io::resource::ResourceStorage) {
 		use crate::messages::portfolio::document::utility_types::network_interface::storage_metadata::StorageMetadataView;
 
 		let Some(storage) = &mut self.storage else { return };
 
 		let network = self.network_interface.document_network().clone();
 		let view = StorageMetadataView::new(&self.network_interface);
-		if let Err(error) = storage.commit_from_runtime(&network, &view, &self.resources.registry) {
+		if let Err(error) = storage.commit_from_runtime(&network, &view, &self.resources.registry, byte_store) {
 			log::error!("Storage snapshot commit failed: {error}");
 			return;
 		}

@@ -213,12 +213,54 @@ impl<L: Layout> Gdd<L> {
 		network: &graph_craft::document::NodeNetwork,
 		metadata: &M,
 		resources: &graphene_resource::ResourceRegistry,
+		byte_store: &dyn ResourceStorage,
 	) -> Result<Vec<Rev>, CommitError> {
-		let revs = self.session.commit_from_runtime(network, metadata, resources)?;
+		let (revs, declaration_bytes) = self.session.commit_from_runtime(network, metadata, resources)?;
 		if let Err(error) = self.persist_committed_deltas(&revs) {
 			log::error!("Failed to persist committed deltas to working copy: {error}");
 		}
+		// Persist proto-node declaration content to the byte store (the global cache in the editor,
+		// the working-copy container for standalone export). Content-addressed, so re-storing
+		// identical bytes on every commit is an idempotent no-op.
+		for bytes in declaration_bytes.values() {
+			byte_store.store(bytes);
+		}
 		Ok(revs)
+	}
+
+	/// Resolve the proto-node declarations referenced by the registry into a [`graph_storage::Declarations`]
+	/// map, loading each `ProtoNode`'s bytes from `byte_store` (the global cache in the editor, the
+	/// working-copy container for standalone). Only resources referenced by `Implementation::ProtoNode`
+	/// are visited, so image/font resources are skipped. Cold-path (open / `to_runtime`); async
+	/// because resource loads are.
+	pub async fn declarations(&self, byte_store: &dyn LoadResource) -> graph_storage::Declarations {
+		use graph_storage::Implementation;
+
+		let registry = self.session.registry();
+		let mut declarations = graph_storage::Declarations::new();
+
+		for node in registry.node_instances.values() {
+			let Implementation::ProtoNode(id) = node.implementation() else { continue };
+			if declarations.contains_key(id) {
+				continue;
+			}
+			let Some(hash) = registry.resources.get(id).and_then(|entry| entry.hash) else {
+				log::error!("Declaration resource {id} has no resolved hash; cannot load ProtoNode");
+				continue;
+			};
+			let Some(resource) = byte_store.load(hash).await else {
+				log::error!("Declaration bytes for {id} (hash {hash}) missing from byte store");
+				continue;
+			};
+			match postcard::from_bytes::<graph_storage::ProtoNode>(resource.as_ref()) {
+				Ok(proto) => {
+					declarations.insert(*id, proto);
+				}
+				Err(error) => log::error!("Failed to deserialize ProtoNode for {id}: {error}"),
+			}
+		}
+
+		declarations
 	}
 
 	/// Apply a hot op from the broadcast stream, appending one frame to the hot log.

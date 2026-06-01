@@ -209,8 +209,9 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 				responses.add(PortfolioMessage::GarbageCollectResources);
 			}
 			PortfolioMessage::AutoSaveDocument { document_id } => {
-				let Some(document) = self.document_mut(document_id) else { return };
-				document.commit_storage_snapshot();
+				let Some(byte_store) = resource_storage.storage() else { return };
+				let Some(document) = self.documents.get_mut(&document_id) else { return };
+				document.commit_storage_snapshot(byte_store);
 				responses.add(PersistentStateMessage::WriteDocument {
 					document_id,
 					document: document.serialize_document(),
@@ -393,7 +394,9 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 				// Capture the current runtime state into the freshly-mounted working copy. Edits made
 				// during the mount window were skipped by `commit_storage_snapshot` (no-op while
 				// unmounted), so this initial commit brings the working copy up to date.
-				document.commit_storage_snapshot();
+				if let Some(byte_store) = resource_storage.storage() {
+					document.commit_storage_snapshot(byte_store);
+				}
 			}
 			PortfolioMessage::DestroyAllDocuments => {
 				// Empty the list of internal document data
