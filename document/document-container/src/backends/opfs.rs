@@ -178,13 +178,20 @@ fn js_err(error: JsValue) -> ContainerError {
 	ContainerError::Backend(format!("{error:?}"))
 }
 
-async fn open_directory(directory_name: &str) -> std::result::Result<FileSystemDirectoryHandle, JsValue> {
+/// Resolve `directory_path` (a `/`-separated relative path) under the OPFS root, creating each
+/// segment. OPFS rejects directory names containing `/`, so a multi-segment path like
+/// `documents/<id>` must be descended one segment at a time rather than passed whole.
+async fn open_directory(directory_path: &str) -> std::result::Result<FileSystemDirectoryHandle, JsValue> {
 	let storage = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?.navigator().storage();
-	let root: FileSystemDirectoryHandle = JsFuture::from(storage.get_directory()).await?.dyn_into()?;
+	let mut current: FileSystemDirectoryHandle = JsFuture::from(storage.get_directory()).await?.dyn_into()?;
 
-	let options = FileSystemGetDirectoryOptions::new();
-	options.set_create(true);
-	JsFuture::from(root.get_directory_handle_with_options(directory_name, &options)).await?.dyn_into()
+	for segment in directory_path.split('/').filter(|segment| !segment.is_empty()) {
+		let options = FileSystemGetDirectoryOptions::new();
+		options.set_create(true);
+		current = JsFuture::from(current.get_directory_handle_with_options(segment, &options)).await?.dyn_into()?;
+	}
+
+	Ok(current)
 }
 
 /// Descend the `/`-separated path against `root` and return the directory handle plus the final segment.
