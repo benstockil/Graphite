@@ -1,6 +1,8 @@
 #![expect(unused, reason = "WIP: the Document API surface is still being wired in")]
+use std::collections::BTreeMap;
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
+pub use graphene_resource::{ResourceHash, ResourceId};
 use serde::{Deserialize, Serialize};
 
 pub mod delta;
@@ -74,6 +76,9 @@ pub struct Registry {
 	/// Append-only mapping from per-device `PeerId` to per-human `UserId`.
 	/// Registered by each device's first contribution via `RegistryDelta::RegisterPeer`.
 	pub peer_users: HashMap<PeerId, UserId>,
+	/// Content-addressable resources (images, fonts, eventually proto-node declarations) referenced
+	/// by `ResourceId`. See [`ResourceStore`].
+	pub resources: ResourceStore,
 	pub attributes: Attributes,
 }
 
@@ -93,6 +98,9 @@ impl Registry {
 			return false;
 		}
 		if self.peer_users != other.peer_users {
+			return false;
+		}
+		if !resources_value_equal(&self.resources, &other.resources) {
 			return false;
 		}
 		if !attributes_value_equal(&self.attributes, &other.attributes) {
@@ -160,6 +168,24 @@ fn attributes_value_equal(a: &Attributes, b: &Attributes) -> bool {
 	a.iter().all(|(key, value)| b.get(key).is_some_and(|other| value.value == other.value))
 }
 
+/// Value-level resource comparison: same resolved hashes and same source chains (keyed by
+/// `SourceKey`, comparing source bodies), ignoring LWW timestamps. Mirrors `attributes_value_equal`.
+fn resources_value_equal(a: &ResourceStore, b: &ResourceStore) -> bool {
+	if a.len() != b.len() {
+		return false;
+	}
+	a.iter().all(|(id, entry)| {
+		b.get(id).is_some_and(|other| {
+			entry.hash == other.hash
+				&& entry.sources.len() == other.sources.len()
+				&& entry
+					.sources
+					.iter()
+					.all(|(key, value)| other.sources.get(key).is_some_and(|other_value| value.source == other_value.source))
+		})
+	})
+}
+
 /// Stable identity for any timestamped slot in a `Registry`. Used by `order_consistent`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum TimestampKey {
@@ -169,6 +195,8 @@ enum TimestampKey {
 	NetworkExport(NetworkId, usize),
 	NetworkAttribute(NetworkId, String),
 	DocumentAttribute(String),
+	ResourceHash(ResourceId),
+	ResourceSource(ResourceId, SourceKey),
 }
 
 fn collect_timestamps(registry: &Registry) -> HashMap<TimestampKey, TimeStamp> {
@@ -196,6 +224,12 @@ fn collect_timestamps(registry: &Registry) -> HashMap<TimestampKey, TimeStamp> {
 	}
 	for (key, value) in &registry.attributes {
 		out.insert(TimestampKey::DocumentAttribute(key.clone()), value.timestamp);
+	}
+	for (id, entry) in &registry.resources {
+		out.insert(TimestampKey::ResourceHash(*id), entry.hash_timestamp);
+		for (source_key, source_value) in &entry.sources {
+			out.insert(TimestampKey::ResourceSource(*id, *source_key), source_value.timestamp);
+		}
 	}
 	out
 }
@@ -268,8 +302,13 @@ impl Session {
 	/// Diff the current registry against a fresh conversion of `network`, then commit each emitted
 	/// op as its own `Delta` on the local chain. One `clock.tick()` per op (strictly causal within
 	/// a commit). Returns the new `Rev`s in commit order, empty if nothing changed.
-	pub fn commit_from_runtime<M: NodeMetadataSource>(&mut self, network: &graph_craft::document::NodeNetwork, metadata: &M) -> Result<Vec<Rev>, CommitError> {
-		let target = Registry::from_runtime_with_metadata(network, metadata, self.document.peer)?;
+	pub fn commit_from_runtime<M: NodeMetadataSource>(
+		&mut self,
+		network: &graph_craft::document::NodeNetwork,
+		metadata: &M,
+		resources: &graphene_resource::ResourceRegistry,
+	) -> Result<Vec<Rev>, CommitError> {
+		let target = Registry::from_runtime_with_metadata(network, metadata, resources, self.document.peer)?;
 		let ops = crate::delta::compute_deltas(&self.document.registry, &target);
 		Ok(self.commit_ops(ops, false)?)
 	}
@@ -545,6 +584,68 @@ impl AttributesRead for Attributes {
 	}
 }
 
+/// Fractional priority for ordering a resource's source chain. New sources are inserted by picking
+/// a value strictly between two neighbors, so concurrent insertions elsewhere never collide; an
+/// exact tie between two peers inserting at the same gap is broken by `PeerId` in [`SourceKey`].
+/// `f64` precision is ample for the short fallback chains resources carry in practice.
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Priority(pub f64);
+
+impl Eq for Priority {}
+
+impl Ord for Priority {
+	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+		// Source priorities are always finite values we mint ourselves; `total_cmp` gives a total
+		// order regardless, so a stray NaN sorts deterministically rather than panicking.
+		self.0.total_cmp(&other.0)
+	}
+}
+
+impl PartialOrd for Priority {
+	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+impl std::hash::Hash for Priority {
+	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+		// Hash the bit pattern, consistent with the `total_cmp`-based `Eq`.
+		self.0.to_bits().hash(state);
+	}
+}
+
+/// Ordering key for an entry in a resource's source chain: fractional `priority`, with `peer` as
+/// the tiebreak so concurrent insertions at the same priority converge deterministically.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SourceKey {
+	pub priority: Priority,
+	pub peer: PeerId,
+}
+
+/// One entry in a resource's source chain. The `source` body is type-erased (`serde_json::Value`)
+/// so the on-disk `DataSource` shape can evolve through migrations without the storage layer
+/// committing to a Rust enum; `timestamp` drives LWW on re-setting this same entry.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SourceValue {
+	pub source: serde_json::Value,
+	pub timestamp: TimeStamp,
+}
+
+/// A single content-addressable resource: an ordered, conflict-mergeable chain of fallback sources
+/// plus the resolved content hash. The source chain is an add-wins ordered set (concurrent
+/// additions all survive); the hash is last-writer-wins (concurrent resolves of the same logical
+/// resource agree by construction, since the hash is content-derived).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResourceEntry {
+	pub sources: BTreeMap<SourceKey, SourceValue>,
+	pub hash: Option<ResourceHash>,
+	pub hash_timestamp: TimeStamp,
+}
+
+/// All resources referenced by the document, keyed by stable per-document [`ResourceId`]. Replicates
+/// through the normal CmRDT path; bytes live in content-addressed storage keyed by [`ResourceHash`].
+pub type ResourceStore = HashMap<ResourceId, ResourceEntry>;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Node {
 	implementation: Implementation,
@@ -766,6 +867,25 @@ pub enum RegistryDelta {
 		peer: PeerId,
 		user: UserId,
 	},
+	/// LWW on a resource's resolved content hash. Creates the resource entry if absent.
+	/// Concurrent resolves agree by construction (the hash is content-derived), so LWW is safe.
+	RegisterResource {
+		id: ResourceId,
+		hash: Option<ResourceHash>,
+	},
+	/// Add (or LWW-overwrite) one entry in a resource's source fallback chain. The source body is
+	/// type-erased; `key` carries the fractional priority + peer that order it. Add-wins: concurrent
+	/// adds at distinct keys all survive. Creates the resource entry if absent.
+	AddSource {
+		id: ResourceId,
+		key: SourceKey,
+		source: serde_json::Value,
+	},
+	/// Remove one entry from a resource's source chain. LWW against the entry's timestamp.
+	RemoveSource {
+		id: ResourceId,
+		key: SourceKey,
+	},
 }
 
 /// `value: None` means remove. The timestamp comes from the wrapping `Delta`.
@@ -957,6 +1077,34 @@ impl Document {
 					self.registry.peer_users.insert(peer, user);
 				}
 			},
+			RegistryDelta::RegisterResource { id, hash } => {
+				let entry = self.registry.resources.entry(id).or_default();
+				if timestamp > entry.hash_timestamp {
+					entry.hash = hash;
+					entry.hash_timestamp = timestamp;
+				}
+			}
+			RegistryDelta::AddSource { id, key, source } => {
+				let entry = self.registry.resources.entry(id).or_default();
+				match entry.sources.entry(key) {
+					std::collections::btree_map::Entry::Occupied(mut occupied) => {
+						if timestamp > occupied.get().timestamp {
+							occupied.insert(SourceValue { source, timestamp });
+						}
+					}
+					std::collections::btree_map::Entry::Vacant(vacant) => {
+						vacant.insert(SourceValue { source, timestamp });
+					}
+				}
+			}
+			RegistryDelta::RemoveSource { id, key } => {
+				if let Some(entry) = self.registry.resources.get_mut(&id) {
+					let should_remove = entry.sources.get(&key).is_some_and(|existing| timestamp > existing.timestamp);
+					if should_remove {
+						entry.sources.remove(&key);
+					}
+				}
+			}
 		}
 		Ok(())
 	}
@@ -1027,6 +1175,29 @@ impl Document {
 			// Registrations are append-only and not user-undoable; reverse is the same op,
 			// which applies as a no-op on the already-registered PeerId.
 			&RegistryDelta::RegisterPeer { peer, user } => RegistryDelta::RegisterPeer { peer, user },
+			&RegistryDelta::RegisterResource { id, .. } => RegistryDelta::RegisterResource {
+				id,
+				hash: self.registry.resources.get(&id).and_then(|entry| entry.hash),
+			},
+			&RegistryDelta::AddSource { id, key, .. } => match self.registry.resources.get(&id).and_then(|entry| entry.sources.get(&key)) {
+				// The slot already held a source: undo restores it.
+				Some(existing) => RegistryDelta::AddSource {
+					id,
+					key,
+					source: existing.source.clone(),
+				},
+				// The slot was empty: undo removes what this op added.
+				None => RegistryDelta::RemoveSource { id, key },
+			},
+			&RegistryDelta::RemoveSource { id, key } => match self.registry.resources.get(&id).and_then(|entry| entry.sources.get(&key)) {
+				Some(existing) => RegistryDelta::AddSource {
+					id,
+					key,
+					source: existing.source.clone(),
+				},
+				// Nothing to restore; reverse is a no-op removal.
+				None => RegistryDelta::RemoveSource { id, key },
+			},
 		})
 	}
 

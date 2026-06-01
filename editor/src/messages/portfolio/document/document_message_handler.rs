@@ -1813,7 +1813,7 @@ impl DocumentMessageHandler {
 
 		let network = self.network_interface.document_network().clone();
 		let view = StorageMetadataView::new(&self.network_interface);
-		if let Err(error) = storage.commit_from_runtime(&network, &view) {
+		if let Err(error) = storage.commit_from_runtime(&network, &view, &self.resources.registry) {
 			log::error!("Storage snapshot commit failed: {error}");
 			return;
 		}
@@ -1833,7 +1833,7 @@ impl DocumentMessageHandler {
 		let Some(storage) = &self.storage else { return };
 		let peer = storage.session().peer();
 
-		let target = match graph_storage::Registry::from_runtime_with_metadata(network, view, peer) {
+		let target = match graph_storage::Registry::from_runtime_with_metadata(network, view, &self.resources.registry, peer) {
 			Ok(target) => target,
 			Err(error) => {
 				log::error!("Storage round-trip verification: from_runtime failed: {error}");

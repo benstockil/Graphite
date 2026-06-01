@@ -348,7 +348,8 @@ mod tests {
 
 		let network = interface.document_network().clone();
 
-		let registry = Registry::from_runtime_with_metadata(&network, &source, PeerId(0)).expect("from_runtime_with_metadata failed");
+		let registry =
+			Registry::from_runtime_with_metadata(&network, &source, &graph_craft::application_io::resource::ResourceRegistry::default(), PeerId(0)).expect("from_runtime_with_metadata failed");
 
 		let (_converted_network, entries) = registry.to_runtime_with_metadata().expect("to_runtime_with_metadata failed");
 
@@ -475,7 +476,8 @@ mod tests {
 		let original_view = StorageMetadataView::new(original);
 
 		let network = original.document_network().clone();
-		let registry = Registry::from_runtime_with_metadata(&network, &original_view, PeerId(0)).expect("from_runtime_with_metadata failed");
+		let registry =
+			Registry::from_runtime_with_metadata(&network, &original_view, &graph_craft::application_io::resource::ResourceRegistry::default(), PeerId(0)).expect("from_runtime_with_metadata failed");
 		let (rebuilt_network, node_entries, network_entries) = registry.to_runtime_with_full_metadata().expect("to_runtime_with_full_metadata failed");
 
 		let rebuilt = build_interface_from_storage(rebuilt_network, node_entries, network_entries).expect("build_interface_from_storage failed");

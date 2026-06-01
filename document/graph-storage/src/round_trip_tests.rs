@@ -445,7 +445,7 @@ fn test_ui_metadata_round_trip() {
 		},
 	);
 
-	let registry = Registry::from_runtime_with_metadata(&network, &metadata, PeerId(0)).expect("Failed to convert to Registry with metadata");
+	let registry = Registry::from_runtime_with_metadata(&network, &metadata, &graphene_resource::ResourceRegistry::new(), PeerId(0)).expect("Failed to convert to Registry with metadata");
 
 	let (converted, entries) = registry.to_runtime_with_metadata().expect("Failed to convert Registry back with metadata");
 
@@ -472,4 +472,34 @@ fn test_ui_metadata_round_trip() {
 	let nested_layer = lookup.get(&(vec![NodeId(0)], NodeId(10))).expect("entry for nested layer-in-stack missing");
 	assert_eq!(nested_layer.position, Some(Position::Stack(7)));
 	assert!(nested_layer.is_layer);
+}
+
+/// A runtime `ResourceRegistry` (source chain + resolved hash) survives conversion into the storage
+/// `Registry`: source bodies are preserved in priority order and the hash carries through.
+#[test]
+fn resources_round_trip_through_from_runtime() {
+	use graphene_resource::{DataSource, ResourceHash, ResourceId, ResourceRegistry};
+
+	let network = NodeNetwork::default();
+
+	let mut resources = ResourceRegistry::new();
+	let id = ResourceId::new();
+	// Two sources in chain order: an embedded fallback then a URL.
+	resources.push_source_back(&id, DataSource::Embedded);
+	resources.push_source_back(&id, DataSource::Url("https://example.com/img.png".parse().unwrap()));
+	let hash = ResourceHash::from(&b"image bytes"[..]);
+	resources.resolve(&id, hash);
+
+	let registry = Registry::from_runtime_with_metadata(&network, &crate::NoMetadata, &resources, PeerId(7)).expect("from_runtime failed");
+
+	let entry = registry.resources.get(&id).expect("resource entry present in storage registry");
+	assert_eq!(entry.hash, Some(hash), "resolved hash carried through");
+	assert_eq!(entry.sources.len(), 2, "both sources carried through");
+
+	// BTreeMap iterates in priority (chain) order; decode bodies back to DataSource to compare.
+	let decoded: Vec<DataSource> = entry.sources.values().map(|v| serde_json::from_value(v.source.clone()).expect("source body decodes")).collect();
+	assert_eq!(decoded, vec![DataSource::Embedded, DataSource::Url("https://example.com/img.png".parse().unwrap())]);
+
+	// All source keys carry the document peer.
+	assert!(entry.sources.keys().all(|key| key.peer == PeerId(7)), "source keys scoped to the document peer");
 }

@@ -110,10 +110,11 @@ fn commit_from_runtime_is_idempotent_for_unchanged_network() {
 	let mut session = Session::with_peer(PeerId(1));
 	let network = tiny_network();
 
-	let first = session.commit_from_runtime(&network, &NoMetadata).expect("first commit failed");
+	let resources = graphene_resource::ResourceRegistry::new();
+	let first = session.commit_from_runtime(&network, &NoMetadata, &resources).expect("first commit failed");
 	assert!(!first.is_empty(), "first commit should produce at least one delta for the initial network");
 
-	let second = session.commit_from_runtime(&network, &NoMetadata).expect("second commit failed");
+	let second = session.commit_from_runtime(&network, &NoMetadata, &resources).expect("second commit failed");
 	assert_eq!(second.len(), 0, "second commit of unchanged network produced {} spurious deltas: {:?}", second.len(), second);
 }
 
@@ -243,4 +244,193 @@ fn apply_op_advances_clock_even_when_op_errors() {
 	let _ = document.apply_op(failing_op, observed, false);
 
 	assert!(document.clock.counter >= observed.counter, "clock should advance on observation even when the op errors");
+}
+
+// --- Resource CRDT semantics ---
+
+use crate::{Priority, RegistryDelta as RD, ResourceHash, ResourceId, SourceKey};
+
+fn source_key(priority: f64, peer: u64) -> SourceKey {
+	SourceKey {
+		priority: Priority(priority),
+		peer: PeerId(peer),
+	}
+}
+
+fn ts(counter: u64, peer: u64) -> TimeStamp {
+	TimeStamp { counter, peer: PeerId(peer) }
+}
+
+/// Two peers concurrently add a source to the same resource at distinct priorities. Both survive
+/// (add-wins union), ordered by priority.
+#[test]
+fn concurrent_source_adds_at_distinct_priorities_both_survive() {
+	let mut document = fresh_document(PeerId(1));
+	let id = ResourceId::new();
+
+	document
+		.apply_op(
+			RD::AddSource {
+				id,
+				key: source_key(0.5, 1),
+				source: serde_json::json!("embedded"),
+			},
+			ts(1, 1),
+			false,
+		)
+		.unwrap();
+	document
+		.apply_op(
+			RD::AddSource {
+				id,
+				key: source_key(0.75, 2),
+				source: serde_json::json!("url"),
+			},
+			ts(1, 2),
+			false,
+		)
+		.unwrap();
+
+	let entry = document.registry.resources.get(&id).expect("resource entry exists");
+	assert_eq!(entry.sources.len(), 2, "both concurrent additions survive");
+	// BTreeMap iteration is in priority order.
+	let bodies: Vec<_> = entry.sources.values().map(|v| v.source.clone()).collect();
+	assert_eq!(bodies, vec![serde_json::json!("embedded"), serde_json::json!("url")]);
+}
+
+/// Re-adding the same source key is LWW on its timestamp: a later write wins, an earlier one is ignored.
+#[test]
+fn same_source_key_is_last_writer_wins() {
+	let mut document = fresh_document(PeerId(1));
+	let id = ResourceId::new();
+	let key = source_key(0.5, 1);
+
+	document
+		.apply_op(
+			RD::AddSource {
+				id,
+				key,
+				source: serde_json::json!("old"),
+			},
+			ts(5, 1),
+			false,
+		)
+		.unwrap();
+	// Earlier timestamp: ignored.
+	document
+		.apply_op(
+			RD::AddSource {
+				id,
+				key,
+				source: serde_json::json!("stale"),
+			},
+			ts(2, 1),
+			false,
+		)
+		.unwrap();
+	// Later timestamp: wins.
+	document
+		.apply_op(
+			RD::AddSource {
+				id,
+				key,
+				source: serde_json::json!("new"),
+			},
+			ts(9, 1),
+			false,
+		)
+		.unwrap();
+
+	let entry = document.registry.resources.get(&id).unwrap();
+	assert_eq!(entry.sources.get(&key).unwrap().source, serde_json::json!("new"));
+}
+
+/// RegisterResource is LWW on the hash; a later resolve wins, an earlier one is ignored.
+#[test]
+fn register_resource_hash_is_last_writer_wins() {
+	let mut document = fresh_document(PeerId(1));
+	let id = ResourceId::new();
+	let hash_a = ResourceHash::from(&b"alpha"[..]);
+	let hash_b = ResourceHash::from(&b"beta"[..]);
+
+	document.apply_op(RD::RegisterResource { id, hash: Some(hash_a) }, ts(5, 1), false).unwrap();
+	document.apply_op(RD::RegisterResource { id, hash: Some(hash_b) }, ts(2, 1), false).unwrap();
+	assert_eq!(document.registry.resources.get(&id).unwrap().hash, Some(hash_a), "earlier resolve must not clobber later one");
+
+	document.apply_op(RD::RegisterResource { id, hash: Some(hash_b) }, ts(9, 1), false).unwrap();
+	assert_eq!(document.registry.resources.get(&id).unwrap().hash, Some(hash_b), "later resolve wins");
+}
+
+/// The reverse delta of a RemoveSource restores the prior source body, and applying op-then-reverse
+/// round-trips the source chain.
+#[test]
+fn remove_source_reverse_restores_prior() {
+	let mut document = fresh_document(PeerId(1));
+	let id = ResourceId::new();
+	let key = source_key(0.5, 1);
+
+	commit_op(
+		&mut document,
+		RD::AddSource {
+			id,
+			key,
+			source: serde_json::json!("kept"),
+		},
+	);
+
+	// Compute the reverse while the body is still present, then apply the removal.
+	let reverse = document.compute_reverse_delta(&RD::RemoveSource { id, key }).unwrap();
+	match &reverse {
+		RD::AddSource { source, .. } => assert_eq!(*source, serde_json::json!("kept"), "reverse of removal re-adds the body"),
+		other => panic!("expected AddSource reverse, got {other:?}"),
+	}
+
+	document.apply_op(RD::RemoveSource { id, key }, ts(5, 1), false).unwrap();
+	assert!(document.registry.resources.get(&id).unwrap().sources.is_empty(), "source removed");
+
+	// Applying the reverse restores the chain.
+	document.apply_op(reverse, ts(6, 1), false).unwrap();
+	assert_eq!(document.registry.resources.get(&id).unwrap().sources.get(&key).unwrap().source, serde_json::json!("kept"));
+}
+
+/// AddSource on a fresh slot reverses to a RemoveSource; on an occupied slot it restores the prior body.
+#[test]
+fn add_source_reverse_depends_on_prior_state() {
+	let mut document = fresh_document(PeerId(1));
+	let id = ResourceId::new();
+	let key = source_key(0.5, 1);
+
+	// Fresh slot: reverse removes.
+	let reverse_fresh = document
+		.compute_reverse_delta(&RD::AddSource {
+			id,
+			key,
+			source: serde_json::json!("first"),
+		})
+		.unwrap();
+	assert!(matches!(reverse_fresh, RD::RemoveSource { .. }), "reverse of add-to-empty is remove, got {reverse_fresh:?}");
+
+	// Occupy the slot, then reverse of a new add restores the existing body.
+	document
+		.apply_op(
+			RD::AddSource {
+				id,
+				key,
+				source: serde_json::json!("existing"),
+			},
+			ts(1, 1),
+			false,
+		)
+		.unwrap();
+	let reverse_overwrite = document
+		.compute_reverse_delta(&RD::AddSource {
+			id,
+			key,
+			source: serde_json::json!("overwrite"),
+		})
+		.unwrap();
+	match reverse_overwrite {
+		RD::AddSource { source, .. } => assert_eq!(source, serde_json::json!("existing"), "reverse restores prior body"),
+		other => panic!("expected AddSource reverse, got {other:?}"),
+	}
 }

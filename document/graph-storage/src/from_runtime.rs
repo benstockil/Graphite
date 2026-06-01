@@ -67,12 +67,12 @@ impl TryFrom<&NodeNetwork> for Registry {
 	/// Test/utility entry point: scopes IDs under `PeerId(0)`. Real editor conversions go through
 	/// `from_runtime_with_metadata` and pass the document's actual peer.
 	fn try_from(node_network: &NodeNetwork) -> Result<Self, Self::Error> {
-		Registry::from_runtime_with_metadata(node_network, &NoMetadata, PeerId(0))
+		Registry::from_runtime_with_metadata(node_network, &NoMetadata, &graphene_resource::ResourceRegistry::new(), PeerId(0))
 	}
 }
 
 impl Registry {
-	pub fn from_runtime_with_metadata<M: NodeMetadataSource>(node_network: &NodeNetwork, metadata: &M, peer: PeerId) -> Result<Self, ConversionError> {
+	pub fn from_runtime_with_metadata<M: NodeMetadataSource>(node_network: &NodeNetwork, metadata: &M, resources: &graphene_resource::ResourceRegistry, peer: PeerId) -> Result<Self, ConversionError> {
 		let mut registry = Registry::default();
 		let mut ctx = ConversionContext {
 			next_network_id: ROOT_NETWORK + 1,
@@ -83,9 +83,44 @@ impl Registry {
 		};
 
 		convert_network(node_network, ROOT_NETWORK, None, &[], &mut registry, &mut ctx)?;
+		convert_resources(resources, peer, &mut registry)?;
 
 		Ok(registry)
 	}
+}
+
+/// Snapshot the runtime [`ResourceRegistry`](graphene_resource::ResourceRegistry) into the storage
+/// [`ResourceStore`](crate::ResourceStore). Each source's chain position becomes a fractional
+/// [`Priority`](crate::Priority) (index-as-priority preserves order); the `DataSource` body is
+/// stored type-erased as `serde_json::Value` so its on-disk shape can migrate freely. All
+/// timestamps are `ORIGIN`, since this is a bootstrap snapshot, not an edit.
+fn convert_resources(resources: &graphene_resource::ResourceRegistry, peer: PeerId, registry: &mut Registry) -> Result<(), ConversionError> {
+	for id in resources.ids() {
+		let Some(info) = resources.info(&id) else { continue };
+
+		let mut entry = crate::ResourceEntry {
+			hash: info.hash.copied(),
+			hash_timestamp: TimeStamp::ORIGIN,
+			..Default::default()
+		};
+		for (position, source) in info.sources.iter().enumerate() {
+			let key = crate::SourceKey {
+				priority: crate::Priority(position as f64),
+				peer,
+			};
+			let body = serde_json::to_value(source).map_err(|error| ConversionError::SerializationError(error.to_string()))?;
+			entry.sources.insert(
+				key,
+				crate::SourceValue {
+					source: body,
+					timestamp: TimeStamp::ORIGIN,
+				},
+			);
+		}
+
+		registry.resources.insert(id, entry);
+	}
+	Ok(())
 }
 
 struct ConversionContext<'m, M: NodeMetadataSource + ?Sized> {

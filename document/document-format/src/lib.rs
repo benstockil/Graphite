@@ -200,8 +200,13 @@ impl<L: Layout> Gdd<L> {
 	/// Interim API: forwards to `Session::commit_from_runtime`, which itself is a shim that diffs
 	/// the runtime against a freshly-converted `Registry`. The long-term replacement will take
 	/// runtime deltas directly. This wrapper goes away when that lands.
-	pub fn commit_from_runtime<M: NodeMetadataSource>(&mut self, network: &graph_craft::document::NodeNetwork, metadata: &M) -> Result<Vec<Rev>, CommitError> {
-		let revs = self.session.commit_from_runtime(network, metadata)?;
+	pub fn commit_from_runtime<M: NodeMetadataSource>(
+		&mut self,
+		network: &graph_craft::document::NodeNetwork,
+		metadata: &M,
+		resources: &graphene_resource::ResourceRegistry,
+	) -> Result<Vec<Rev>, CommitError> {
+		let revs = self.session.commit_from_runtime(network, metadata, resources)?;
 		if let Err(error) = self.persist_committed_deltas(&revs) {
 			log::error!("Failed to persist committed deltas to working copy: {error}");
 		}
