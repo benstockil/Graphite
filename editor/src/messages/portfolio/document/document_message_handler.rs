@@ -1833,23 +1833,31 @@ impl DocumentMessageHandler {
 		let Some(storage) = &self.storage else { return };
 		let peer = storage.session().peer();
 
-		let target = match graph_storage::Registry::from_runtime_with_metadata(network, view, &self.resources.registry, peer) {
-			Ok(target) => target,
+		let conversion = match graph_storage::Registry::convert_from_runtime(network, view, &self.resources.registry, peer) {
+			Ok(conversion) => conversion,
 			Err(error) => {
 				log::error!("Storage round-trip verification: from_runtime failed: {error}");
 				return;
 			}
 		};
+		let target = &conversion.registry;
+		let declarations = match conversion.declarations() {
+			Ok(declarations) => declarations,
+			Err(error) => {
+				log::error!("Storage round-trip verification: declaration rebuild failed: {error}");
+				return;
+			}
+		};
 
 		let stored = storage.registry();
-		if !stored.value_equal(&target) {
-			log::error!("Storage round-trip: registry value drift after commit\n{}", diff_registries(stored, &target));
+		if !stored.value_equal(target) {
+			log::error!("Storage round-trip: registry value drift after commit\n{}", diff_registries(stored, target));
 		}
-		if !stored.order_consistent(&target) {
+		if !stored.order_consistent(target) {
 			log::error!("Storage round-trip: timestamp order inconsistent between stored and target");
 		}
 
-		let round_tripped = match stored.to_runtime_with_metadata() {
+		let round_tripped = match stored.to_runtime_with_metadata(&declarations) {
 			Ok((network, _entries)) => network,
 			Err(error) => {
 				log::error!("Storage round-trip verification: to_runtime failed: {error}");
@@ -3609,17 +3617,17 @@ fn diff_registries(stored: &graph_storage::Registry, target: &graph_storage::Reg
 		}
 	}
 
-	let stored_decls: std::collections::BTreeSet<_> = stored.declaration_ids().collect();
-	let target_decls: std::collections::BTreeSet<_> = target.declaration_ids().collect();
-	let missing_decls: Vec<_> = target_decls.difference(&stored_decls).collect();
-	let extra_decls: Vec<_> = stored_decls.difference(&target_decls).collect();
-	if !missing_decls.is_empty() || !extra_decls.is_empty() {
-		let _ = writeln!(out, "  node_declarations: stored={} target={}", stored_decls.len(), target_decls.len());
-		if !missing_decls.is_empty() {
-			let _ = writeln!(out, "    missing from stored: {missing_decls:?}");
+	let stored_resources: std::collections::BTreeSet<_> = stored.resources.keys().copied().collect();
+	let target_resources: std::collections::BTreeSet<_> = target.resources.keys().copied().collect();
+	let missing_resources: Vec<_> = target_resources.difference(&stored_resources).collect();
+	let extra_resources: Vec<_> = stored_resources.difference(&target_resources).collect();
+	if !missing_resources.is_empty() || !extra_resources.is_empty() {
+		let _ = writeln!(out, "  resources: stored={} target={}", stored_resources.len(), target_resources.len());
+		if !missing_resources.is_empty() {
+			let _ = writeln!(out, "    missing from stored: {missing_resources:?}");
 		}
-		if !extra_decls.is_empty() {
-			let _ = writeln!(out, "    extra in stored:     {extra_decls:?}");
+		if !extra_resources.is_empty() {
+			let _ = writeln!(out, "    extra in stored:     {extra_resources:?}");
 		}
 	}
 

@@ -348,10 +348,11 @@ mod tests {
 
 		let network = interface.document_network().clone();
 
-		let registry =
-			Registry::from_runtime_with_metadata(&network, &source, &graph_craft::application_io::resource::ResourceRegistry::default(), PeerId(0)).expect("from_runtime_with_metadata failed");
+		let conversion = Registry::convert_from_runtime(&network, &source, &Default::default(), PeerId(0)).expect("convert_from_runtime failed");
+		let declarations = conversion.declarations().expect("rebuild declarations");
+		let registry = conversion.registry;
 
-		let (_converted_network, entries) = registry.to_runtime_with_metadata().expect("to_runtime_with_metadata failed");
+		let (_converted_network, entries) = registry.to_runtime_with_metadata(&declarations).expect("to_runtime_with_metadata failed");
 
 		// Index emitted entries by their (network_path, local_id) address.
 		let entries_by_address: HashMap<(Vec<NodeId>, NodeId), &graph_storage::NodeMetadataEntry> = entries.iter().map(|e| ((e.network_path.clone(), e.local_id), e)).collect();
@@ -476,9 +477,10 @@ mod tests {
 		let original_view = StorageMetadataView::new(original);
 
 		let network = original.document_network().clone();
-		let registry =
-			Registry::from_runtime_with_metadata(&network, &original_view, &graph_craft::application_io::resource::ResourceRegistry::default(), PeerId(0)).expect("from_runtime_with_metadata failed");
-		let (rebuilt_network, node_entries, network_entries) = registry.to_runtime_with_full_metadata().expect("to_runtime_with_full_metadata failed");
+		let conversion = Registry::convert_from_runtime(&network, &original_view, &Default::default(), PeerId(0)).expect("convert_from_runtime failed");
+		let declarations = conversion.declarations().expect("rebuild declarations");
+		let registry = conversion.registry;
+		let (rebuilt_network, node_entries, network_entries) = registry.to_runtime_with_full_metadata(&declarations).expect("to_runtime_with_full_metadata failed");
 
 		let rebuilt = build_interface_from_storage(rebuilt_network, node_entries, network_entries).expect("build_interface_from_storage failed");
 		let rebuilt_view = StorageMetadataView::new(&rebuilt);

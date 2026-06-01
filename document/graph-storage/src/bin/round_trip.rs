@@ -32,14 +32,19 @@ fn run() -> Result<(), String> {
 	let original_network: NodeNetwork = serde_json::from_value(doc["network_interface"]["network"].clone()).map_err(|e| format!("Error deserializing NodeNetwork: {e}"))?;
 	println!("Original network: {} nodes", original_network.nodes.len());
 
-	let registry = Registry::try_from(&original_network).map_err(|e| format!("Error converting to Registry: {e}"))?;
+	// No byte store here: keep the extracted declaration bytes in hand and rebuild the `Declarations`
+	// map from them so the back-conversion can resolve proto-node identifiers.
+	let conversion =
+		Registry::convert_from_runtime(&original_network, &graph_storage::NoMetadata, &Default::default(), graph_storage::PeerId(0)).map_err(|e| format!("Error converting to Registry: {e}"))?;
+	let declarations = conversion.declarations().map_err(|e| format!("Error rebuilding declarations: {e}"))?;
+	let registry = conversion.registry;
 	println!("Registry: {} node instances, {} networks", registry.node_instances.len(), registry.networks.len());
 
 	let mut node_ids: Vec<_> = registry.node_instances.keys().copied().collect();
 	node_ids.sort();
 	println!("Registry node IDs: {node_ids:?}");
 
-	let converted_network = NodeNetwork::try_from(&registry).map_err(|e| format!("Error converting back to NodeNetwork: {e}"))?;
+	let (converted_network, _entries) = registry.to_runtime_with_metadata(&declarations).map_err(|e| format!("Error converting back to NodeNetwork: {e}"))?;
 	println!("Converted network: {} nodes", converted_network.nodes.len());
 
 	doc["network_interface"]["network"] = serde_json::to_value(&converted_network).map_err(|e| format!("Error serializing converted network: {e}"))?;

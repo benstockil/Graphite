@@ -11,7 +11,10 @@ use serde::Serialize;
 
 use crate::attr::*;
 use crate::metadata_source::{NoMetadata, NodeMetadataSource};
-use crate::{AttributesExt, DeclarationId, ExportSlot, Implementation, InputSlot, Network, NetworkId, Node, NodeId, NodeInput, PeerId, Position, ProtoNode, ROOT_NETWORK, Registry, TimeStamp};
+use crate::{
+	AttributesExt, ExportSlot, Implementation, InputSlot, Network, NetworkId, Node, NodeId, NodeInput, PeerId, Position, ProtoNode, ROOT_NETWORK, Registry, ResourceHash, ResourceId, SourceKey,
+	SourceValue, TimeStamp,
+};
 
 fn map_serialization_error(key: &str) -> impl FnOnce(serde_json::Error) -> ConversionError + '_ {
 	move |e| ConversionError::SerializationError(format!("{key}: {e:?}"))
@@ -71,13 +74,51 @@ impl TryFrom<&NodeNetwork> for Registry {
 	}
 }
 
+/// A `from_runtime` conversion result: the reference-only [`Registry`] plus the proto-node
+/// declaration *bytes* it extracted, keyed by content hash. `graph-storage` doesn't own a byte
+/// store, so the caller (the `Gdd`) persists these into its content store; the registry only holds
+/// the `ResourceId`/`ResourceHash` references.
+pub struct RuntimeConversion {
+	pub registry: Registry,
+	pub declaration_bytes: HashMap<ResourceHash, Vec<u8>>,
+}
+
+impl RuntimeConversion {
+	/// Rebuild the [`Declarations`](crate::Declarations) map (`ResourceId` → [`ProtoNode`]) from the
+	/// extracted bytes, for callers that keep the bytes in hand instead of routing them through a
+	/// byte store (tests, the round-trip CLI). Editor/`Gdd` paths persist the bytes and resolve via
+	/// their byte store instead.
+	pub fn declarations(&self) -> Result<crate::Declarations, ConversionError> {
+		self.declaration_bytes
+			.iter()
+			.map(|(hash, bytes)| {
+				let proto: ProtoNode = postcard::from_bytes(bytes).map_err(|error| ConversionError::SerializationError(format!("declaration {hash}: {error}")))?;
+				Ok((ResourceId::from_hash(hash), proto))
+			})
+			.collect()
+	}
+}
+
 impl Registry {
+	/// Convenience wrapper returning only the registry (declaration bytes discarded). For callers
+	/// that don't persist a byte store — e.g. the graph-only `TryFrom` and value-comparison tests.
 	pub fn from_runtime_with_metadata<M: NodeMetadataSource>(node_network: &NodeNetwork, metadata: &M, resources: &graphene_resource::ResourceRegistry, peer: PeerId) -> Result<Self, ConversionError> {
+		Ok(Self::convert_from_runtime(node_network, metadata, resources, peer)?.registry)
+	}
+
+	/// Full conversion: returns the registry and the extracted declaration bytes for the caller to
+	/// persist. See [`RuntimeConversion`].
+	pub fn convert_from_runtime<M: NodeMetadataSource>(
+		node_network: &NodeNetwork,
+		metadata: &M,
+		resources: &graphene_resource::ResourceRegistry,
+		peer: PeerId,
+	) -> Result<RuntimeConversion, ConversionError> {
 		let mut registry = Registry::default();
 		let mut ctx = ConversionContext {
 			next_network_id: ROOT_NETWORK + 1,
-			next_decl_id: 0,
-			proto_node_map: HashMap::new(),
+			declaration_ids: HashMap::new(),
+			declaration_bytes: HashMap::new(),
 			metadata,
 			peer,
 		};
@@ -85,7 +126,10 @@ impl Registry {
 		convert_network(node_network, ROOT_NETWORK, None, &[], &mut registry, &mut ctx)?;
 		convert_resources(resources, peer, &mut registry)?;
 
-		Ok(registry)
+		Ok(RuntimeConversion {
+			registry,
+			declaration_bytes: ctx.declaration_bytes,
+		})
 	}
 }
 
@@ -123,10 +167,33 @@ fn convert_resources(resources: &graphene_resource::ResourceRegistry, peer: Peer
 	Ok(())
 }
 
+/// Register a proto-node declaration as a content-addressed resource: a single `DataSource::Embedded`
+/// source resolved to `hash`. The bytes themselves are persisted by the caller's byte store.
+fn register_declaration_resource(registry: &mut Registry, id: ResourceId, hash: ResourceHash, peer: PeerId) {
+	let mut entry = crate::ResourceEntry {
+		hash: Some(hash),
+		hash_timestamp: TimeStamp::ORIGIN,
+		..Default::default()
+	};
+	let embedded = serde_json::to_value(graphene_resource::DataSource::Embedded).expect("DataSource::Embedded serializes");
+	entry.sources.insert(
+		SourceKey { priority: crate::Priority(0.), peer },
+		SourceValue {
+			source: embedded,
+			timestamp: TimeStamp::ORIGIN,
+		},
+	);
+	registry.resources.insert(id, entry);
+}
+
 struct ConversionContext<'m, M: NodeMetadataSource + ?Sized> {
 	next_network_id: NetworkId,
-	next_decl_id: DeclarationId,
-	proto_node_map: HashMap<String, DeclarationId>,
+	/// Cache from proto-node identifier to its derived `ResourceId`, so repeated proto-nodes reuse
+	/// one id without re-serializing. (Identical content hashes to the same id anyway; this just
+	/// skips the work.)
+	declaration_ids: HashMap<String, ResourceId>,
+	/// Extracted declaration content keyed by hash, handed back for the caller's byte store.
+	declaration_bytes: HashMap<ResourceHash, Vec<u8>>,
 	metadata: &'m M,
 	peer: PeerId,
 }
@@ -377,21 +444,29 @@ fn convert_implementation<M: NodeMetadataSource + ?Sized>(
 	Ok(match implementation {
 		DocumentNodeImplementation::ProtoNode(identifier) => {
 			let identifier_str = identifier.as_str().to_string();
-			let decl_id = ctx.proto_node_map.entry(identifier_str.clone()).or_insert_with(|| {
-				let decl_id = ctx.next_decl_id;
-				ctx.next_decl_id += 1;
-				registry.node_declarations.insert(
-					decl_id,
-					ProtoNode {
-						identifier: identifier_str,
-						code: None,
-						wasm: None,
-						attributes: Default::default(),
-					},
-				);
-				decl_id
-			});
-			Implementation::ProtoNode(*decl_id)
+
+			// Reuse a previously-converted proto-node's id; identical content hashes to the same id
+			// anyway, so this only skips re-serializing.
+			if let Some(id) = ctx.declaration_ids.get(&identifier_str) {
+				return Ok(Implementation::ProtoNode(*id));
+			}
+
+			let proto = ProtoNode {
+				identifier: identifier_str.clone(),
+				code: None,
+				wasm: None,
+				attributes: Default::default(),
+			};
+			// Content-address the declaration: serialize, hash, derive a deterministic id.
+			let bytes = postcard::to_stdvec(&proto).map_err(|error| ConversionError::SerializationError(format!("proto-node {identifier_str}: {error}")))?;
+			let hash = ResourceHash::from(bytes.as_slice());
+			let id = ResourceId::from_hash(&hash);
+
+			register_declaration_resource(registry, id, hash, ctx.peer);
+			ctx.declaration_bytes.insert(hash, bytes);
+			ctx.declaration_ids.insert(identifier_str, id);
+
+			Implementation::ProtoNode(id)
 		}
 		DocumentNodeImplementation::Network(nested_network) => {
 			let nested_network_id = ctx.next_network_id;

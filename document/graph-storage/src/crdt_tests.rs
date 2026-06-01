@@ -177,7 +177,7 @@ fn add_node_resurrects_owning_network() {
 	);
 
 	let node = Node {
-		implementation: Implementation::ProtoNode(1),
+		implementation: Implementation::ProtoNode(ResourceId::new()),
 		inputs: Vec::new(),
 		inputs_attributes: Vec::new(),
 		attributes: std::collections::HashMap::new(),
@@ -211,7 +211,7 @@ fn concurrent_resurrection_via_revert_is_idempotent() {
 		},
 	);
 	let node = Node {
-		implementation: Implementation::ProtoNode(1),
+		implementation: Implementation::ProtoNode(ResourceId::new()),
 		inputs: Vec::new(),
 		inputs_attributes: Vec::new(),
 		attributes: std::collections::HashMap::new(),

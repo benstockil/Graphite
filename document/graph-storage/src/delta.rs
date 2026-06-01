@@ -185,7 +185,7 @@ fn compute_attribute_deltas(from: &crate::Attributes, to: &crate::Attributes) ->
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::{Implementation, Network, Node, ProtoNode};
+	use crate::{Implementation, Network, Node};
 
 	#[test]
 	fn test_compute_deltas_empty() {
@@ -201,7 +201,7 @@ mod tests {
 
 		let mut to = from.clone();
 		let node = Node {
-			implementation: Implementation::ProtoNode(1),
+			implementation: Implementation::ProtoNode(ResourceId::new()),
 			inputs: vec![],
 			inputs_attributes: vec![],
 			attributes: HashMap::new(),
@@ -219,7 +219,7 @@ mod tests {
 		let mut from = Registry::default();
 
 		let node = Node {
-			implementation: Implementation::ProtoNode(1),
+			implementation: Implementation::ProtoNode(ResourceId::new()),
 			inputs: vec![],
 			inputs_attributes: vec![],
 			attributes: HashMap::new(),
@@ -239,7 +239,7 @@ mod tests {
 		let mut from = Registry::default();
 
 		let mut node = Node {
-			implementation: Implementation::ProtoNode(1),
+			implementation: Implementation::ProtoNode(ResourceId::new()),
 			inputs: vec![],
 			inputs_attributes: vec![],
 			attributes: HashMap::new(),

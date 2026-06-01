@@ -10,7 +10,7 @@ use rustc_hash::FxHashMap;
 
 use crate::attr::*;
 use crate::metadata_source::{InputMetadataEntry, NetworkMetadataEntry, NodeMetadataEntry};
-use crate::{AttributesRead, DeclarationId, Implementation, NetworkId, NodeId, NodeInput, Position, ROOT_NETWORK, Registry};
+use crate::{AttributesRead, Implementation, NetworkId, NodeId, NodeInput, Position, ProtoNode, ROOT_NETWORK, Registry, ResourceId};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConversionError {
@@ -18,35 +18,30 @@ pub enum ConversionError {
 	NetworkNotFound(NetworkId),
 	#[error("Node {0} not found")]
 	NodeNotFound(NodeId),
-	#[error("ProtoNode declaration {0} not found")]
-	DeclarationNotFound(DeclarationId),
+	#[error("ProtoNode declaration {0} not found in provided declarations")]
+	DeclarationNotFound(ResourceId),
 	#[error("Deserialization error: {0}")]
 	DeserializationError(String),
 }
 
-/// Graph-only conversion (no editor metadata). Use [`Registry::to_runtime_with_metadata`] or
-/// [`Registry::to_runtime_with_full_metadata`] for editor round-trips.
-impl TryFrom<&Registry> for NodeNetwork {
-	type Error = ConversionError;
-
-	fn try_from(registry: &Registry) -> Result<Self, Self::Error> {
-		convert_network(registry, ROOT_NETWORK, &[], &mut None, &mut None)
-	}
-}
+/// Resolved proto-node declarations, keyed by the `ResourceId` that `Implementation::ProtoNode`
+/// references. The caller resolves these from its byte store (`ResourceId` → `ResourceHash` →
+/// stored `ProtoNode` bytes) before converting, since `graph-storage` holds only references.
+pub type Declarations = std::collections::HashMap<ResourceId, ProtoNode>;
 
 impl Registry {
 	/// Returns the network plus per-node metadata entries (one per node carrying any `ui::*` attribute).
-	pub fn to_runtime_with_metadata(&self) -> Result<(NodeNetwork, Vec<NodeMetadataEntry>), ConversionError> {
-		let (network, node_entries, _) = self.to_runtime_with_full_metadata()?;
+	pub fn to_runtime_with_metadata(&self, declarations: &Declarations) -> Result<(NodeNetwork, Vec<NodeMetadataEntry>), ConversionError> {
+		let (network, node_entries, _) = self.to_runtime_with_full_metadata(declarations)?;
 		Ok((network, node_entries))
 	}
 
 	/// Like `to_runtime_with_metadata` but also returns per-network entries (navigation, previewing).
 	/// Used by the editor's full-rebuild path.
-	pub fn to_runtime_with_full_metadata(&self) -> Result<(NodeNetwork, Vec<NodeMetadataEntry>, Vec<NetworkMetadataEntry>), ConversionError> {
+	pub fn to_runtime_with_full_metadata(&self, declarations: &Declarations) -> Result<(NodeNetwork, Vec<NodeMetadataEntry>, Vec<NetworkMetadataEntry>), ConversionError> {
 		let mut node_metadata = Some(Vec::new());
 		let mut network_metadata = Some(Vec::new());
-		let network = convert_network(self, ROOT_NETWORK, &[], &mut node_metadata, &mut network_metadata)?;
+		let network = convert_network(self, declarations, ROOT_NETWORK, &[], &mut node_metadata, &mut network_metadata)?;
 		Ok((network, node_metadata.expect("seeded above"), network_metadata.expect("seeded above")))
 	}
 
@@ -84,6 +79,7 @@ impl Registry {
 /// `metadata_path` is the owning-node chain naming *this* network (empty for the root).
 fn convert_network(
 	registry: &Registry,
+	declarations: &Declarations,
 	network_id: NetworkId,
 	metadata_path: &[RuntimeNodeId],
 	node_collector: &mut Option<Vec<NodeMetadataEntry>>,
@@ -112,7 +108,7 @@ fn convert_network(
 				collector.push(entry);
 			}
 
-			convert_node(registry, node, metadata_path, runtime_id, node_collector, network_collector).map(|doc_node| (runtime_id, doc_node))
+			convert_node(registry, declarations, node, metadata_path, runtime_id, node_collector, network_collector).map(|doc_node| (runtime_id, doc_node))
 		})
 		.collect::<Result<FxHashMap<_, _>, _>>()?;
 
@@ -191,6 +187,7 @@ fn extract_input_metadata(attributes: &crate::Attributes) -> InputMetadataEntry 
 
 fn convert_node(
 	registry: &Registry,
+	declarations: &Declarations,
 	node: &crate::Node,
 	metadata_path: &[RuntimeNodeId],
 	runtime_node_id: RuntimeNodeId,
@@ -208,7 +205,7 @@ fn convert_node(
 	Ok(DocumentNode {
 		inputs,
 		call_argument: node.attributes.get_or(CALL_ARGUMENT, concrete!(core_types::Context)),
-		implementation: convert_implementation(registry, &node.implementation, metadata_path, runtime_node_id, node_collector, network_collector)?,
+		implementation: convert_implementation(registry, declarations, &node.implementation, metadata_path, runtime_node_id, node_collector, network_collector)?,
 		visible: node.attributes.get_or(VISIBLE, true),
 		skip_deduplication: node.attributes.get_or(SKIP_DEDUPLICATION, false),
 		context_features: node.attributes.get_or_default(CONTEXT_FEATURES),
@@ -249,6 +246,7 @@ fn convert_input(registry: &Registry, input: &NodeInput, input_attributes: &crat
 
 fn convert_implementation(
 	registry: &Registry,
+	declarations: &Declarations,
 	implementation: &Implementation,
 	parent_metadata_path: &[RuntimeNodeId],
 	owning_runtime_id: RuntimeNodeId,
@@ -256,15 +254,15 @@ fn convert_implementation(
 	network_collector: &mut Option<Vec<NetworkMetadataEntry>>,
 ) -> Result<DocumentNodeImplementation, ConversionError> {
 	Ok(match implementation {
-		Implementation::ProtoNode(decl_id) => {
-			let proto = registry.node_declarations.get(decl_id).ok_or(ConversionError::DeclarationNotFound(*decl_id))?;
+		Implementation::ProtoNode(id) => {
+			let proto = declarations.get(id).ok_or(ConversionError::DeclarationNotFound(*id))?;
 			DocumentNodeImplementation::ProtoNode(ProtoNodeIdentifier::with_owned_string(proto.identifier.clone()))
 		}
 		Implementation::Network(net_id) => {
 			let mut child_path = Vec::with_capacity(parent_metadata_path.len() + 1);
 			child_path.extend_from_slice(parent_metadata_path);
 			child_path.push(owning_runtime_id);
-			DocumentNodeImplementation::Network(convert_network(registry, *net_id, &child_path, node_collector, network_collector)?)
+			DocumentNodeImplementation::Network(convert_network(registry, declarations, *net_id, &child_path, node_collector, network_collector)?)
 		}
 	})
 }

@@ -24,6 +24,16 @@ fn try_compile_network(network: &NodeNetwork) -> bool {
 	verify_network_compiles(network).is_ok()
 }
 
+/// Convert a runtime network to a storage `Registry`, returning the declarations alongside it.
+/// Proto-node declaration content is no longer stored in the registry (it lives in a byte store);
+/// these tests have no byte store, so they keep the extracted bytes in hand and rebuild a
+/// `Declarations` map for the back-conversion.
+fn to_registry(network: &NodeNetwork) -> (Registry, crate::Declarations) {
+	let conversion = Registry::convert_from_runtime(network, &crate::NoMetadata, &Default::default(), PeerId(0)).expect("Failed to convert NodeNetwork to Registry");
+	let declarations = conversion.declarations().expect("rebuild declarations");
+	(conversion.registry, declarations)
+}
+
 /// Creates a simple test network with two nodes:
 /// - Node 0: ConsNode that takes two u32 imports
 /// - Node 1: AddPairNode that adds the cons pair
@@ -104,10 +114,10 @@ fn test_simple_round_trip() {
 	let original_network = create_simple_network();
 
 	// Convert to Registry
-	let registry = Registry::try_from(&original_network).expect("Failed to convert NodeNetwork to Registry");
+	let (registry, declarations) = to_registry(&original_network);
 
 	// Convert back to NodeNetwork
-	let converted_network = NodeNetwork::try_from(&registry).expect("Failed to convert Registry back to NodeNetwork");
+	let (converted_network, _) = registry.to_runtime_with_metadata(&declarations).expect("Failed to convert Registry back to NodeNetwork");
 
 	// Verify structure is preserved
 	assert_eq!(converted_network.nodes.len(), original_network.nodes.len(), "Node count should be preserved");
@@ -152,10 +162,10 @@ fn test_nested_network_round_trip() {
 	let original_network = create_nested_network();
 
 	// Convert to Registry
-	let registry = Registry::try_from(&original_network).expect("Failed to convert NodeNetwork to Registry");
+	let (registry, declarations) = to_registry(&original_network);
 
 	// Convert back to NodeNetwork
-	let converted_network = NodeNetwork::try_from(&registry).expect("Failed to convert Registry back to NodeNetwork");
+	let (converted_network, _) = registry.to_runtime_with_metadata(&declarations).expect("Failed to convert Registry back to NodeNetwork");
 
 	// Verify structure is preserved
 	assert_eq!(converted_network.nodes.len(), original_network.nodes.len(), "Node count should be preserved");
@@ -178,9 +188,9 @@ fn test_nested_network_round_trip() {
 fn test_registry_structure() {
 	let network = create_simple_network();
 
-	let registry = Registry::try_from(&network).expect("Failed to convert to Registry");
+	let (registry, _declarations) = to_registry(&network);
 
-	assert!(registry.node_declarations.len() >= 2, "Should have proto node declarations");
+	assert!(registry.resources.len() >= 2, "Should have proto-node declaration resources");
 	assert!(registry.networks.len() >= 1, "Should have at least one network");
 
 	let root_network = registry.networks.get(&crate::ROOT_NETWORK).expect("Root network should exist");
@@ -250,8 +260,8 @@ fn test_metadata_preservation() {
 	};
 
 	// Convert to Registry and back
-	let registry = Registry::try_from(&network).expect("Failed to convert to Registry");
-	let converted = NodeNetwork::try_from(&registry).expect("Failed to convert back to NodeNetwork");
+	let (registry, declarations) = to_registry(&network);
+	let (converted, _) = registry.to_runtime_with_metadata(&declarations).expect("Failed to convert back to NodeNetwork");
 
 	// Verify call_argument is preserved
 	let orig_node_0 = network.nodes.get(&NodeId(0)).unwrap();
@@ -301,10 +311,12 @@ fn test_demo_artwork_round_trip() {
 		let original_network = load_network(&document_string);
 
 		// Convert to Registry
-		let registry = Registry::try_from(&original_network).unwrap_or_else(|e| panic!("Failed to convert {} to Registry: {:?}", artwork_name, e));
+		let (registry, declarations) = to_registry(&original_network);
 
 		// Convert back to NodeNetwork
-		let converted_network = NodeNetwork::try_from(&registry).unwrap_or_else(|e| panic!("Failed to convert {} back to NodeNetwork: {:?}", artwork_name, e));
+		let (converted_network, _) = registry
+			.to_runtime_with_metadata(&declarations)
+			.unwrap_or_else(|e| panic!("Failed to convert {} back to NodeNetwork: {:?}", artwork_name, e));
 
 		// Basic structural checks
 		assert_eq!(original_network.nodes.len(), converted_network.nodes.len(), "{}: Node count should be preserved", artwork_name);
@@ -445,9 +457,11 @@ fn test_ui_metadata_round_trip() {
 		},
 	);
 
-	let registry = Registry::from_runtime_with_metadata(&network, &metadata, &graphene_resource::ResourceRegistry::new(), PeerId(0)).expect("Failed to convert to Registry with metadata");
+	let conversion = Registry::convert_from_runtime(&network, &metadata, &Default::default(), PeerId(0)).expect("Failed to convert to Registry with metadata");
+	let declarations = conversion.declarations().expect("rebuild declarations");
+	let registry = conversion.registry;
 
-	let (converted, entries) = registry.to_runtime_with_metadata().expect("Failed to convert Registry back with metadata");
+	let (converted, entries) = registry.to_runtime_with_metadata(&declarations).expect("Failed to convert Registry back with metadata");
 
 	// Graph structure still round-trips.
 	assert_eq!(converted.nodes.len(), network.nodes.len());

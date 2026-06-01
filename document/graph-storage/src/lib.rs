@@ -10,7 +10,9 @@ pub mod from_runtime;
 pub mod metadata_source;
 pub mod to_runtime;
 
+pub use from_runtime::RuntimeConversion;
 pub use metadata_source::{InputMetadataEntry, NetworkMetadataEntry, NoMetadata, NodeMetadataEntry, NodeMetadataSource};
+pub use to_runtime::Declarations;
 
 #[cfg(test)]
 mod crdt_tests;
@@ -67,7 +69,6 @@ pub const ROOT_NETWORK: NetworkId = 0;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Registry {
-	node_declarations: HashMap<DeclarationId, ProtoNode>,
 	pub node_instances: HashMap<NodeId, Node>,
 	pub networks: HashMap<NetworkId, Network>,
 	/// Public library API: nodes an importing document can reference.
@@ -83,17 +84,10 @@ pub struct Registry {
 }
 
 impl Registry {
-	pub fn declaration_ids(&self) -> impl Iterator<Item = DeclarationId> + '_ {
-		self.node_declarations.keys().copied()
-	}
-
 	/// True if both registries agree on every value-bearing field, ignoring per-slot and
 	/// per-attribute timestamps. Mirrors `compute_deltas`'s value-only semantics, so unchanged
 	/// state at a stamped slot doesn't count as drift.
 	pub fn value_equal(&self, other: &Self) -> bool {
-		if self.node_declarations != other.node_declarations {
-			return false;
-		}
 		if self.exported_nodes != other.exported_nodes {
 			return false;
 		}
@@ -460,10 +454,8 @@ pub struct HotOp {
 	pub author: PeerId,
 }
 
-pub type DeclarationId = u64; // Content-based hash
 pub type NodeId = u64;
 pub type NetworkId = u64;
-type ProtoNodeId = String;
 /// Content-addressed identity for a `Delta`.
 /// 128-bit blake3 truncation: comfortable collision headroom for any plausible document lifetime
 /// without being adversarial-grade. Same delta content always produces the same `Rev`.
@@ -721,7 +713,9 @@ pub enum NodeInput {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Implementation {
-	ProtoNode(DeclarationId),
+	/// References a proto-node declaration resource (see [`ProtoNode`]); the binding to content lives
+	/// in `Registry.resources` like any other resource.
+	ProtoNode(ResourceId),
 	Network(NetworkId),
 }
 
@@ -754,12 +748,15 @@ pub struct ExportSlot {
 	pub timestamp: TimeStamp,
 }
 
+/// Content of a proto-node declaration. Stored as a content-addressed resource (serialized bytes
+/// keyed by `ResourceHash`, held by the `Gdd` byte store) and referenced from
+/// `Implementation::ProtoNode(ResourceId)`. `graph-storage` itself only holds the reference.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct ProtoNode {
-	identifier: ProtoNodeId,
-	code: Option<String>,
-	wasm: Option<Vec<u8>>,
-	attributes: Attributes,
+pub struct ProtoNode {
+	pub identifier: String,
+	pub code: Option<String>,
+	pub wasm: Option<Vec<u8>>,
+	pub attributes: Attributes,
 }
 
 /// Content-addressed delta: `id` is `blake3_128(parents, author, timestamp, delta_type)`.
