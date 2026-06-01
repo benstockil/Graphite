@@ -95,7 +95,10 @@ impl EditorWrapper {
 
 		let application_io = PlatformApplicationIo::new().await;
 		let wake = crate::helpers::async_wake_callback();
-		let editor = Editor::new(Environment { platform: Platform::Web, host }, uuid_random_seed, storage, application_io, wake);
+		// On web the working-copy root is an OPFS directory name (no real filesystem path); each
+		// document mounts under `documents/<id_hex>`.
+		let working_copy_root = Some(std::path::PathBuf::from("documents"));
+		let editor = Editor::new(Environment { platform: Platform::Web, host }, uuid_random_seed, storage, working_copy_root, application_io, wake);
 
 		if EDITOR.with(|slot| slot.lock().ok().map(|mut guard| *guard = Some(editor))).is_none() {
 			log::error!("Attempted to initialize the editor more than once");

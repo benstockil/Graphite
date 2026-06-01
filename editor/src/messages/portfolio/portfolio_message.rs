@@ -11,7 +11,8 @@ use graphene_std::text::Font;
 use std::path::PathBuf;
 
 #[impl_message(Message, Portfolio)]
-#[derive(PartialEq, Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(derivative::Derivative, serde::Serialize, serde::Deserialize)]
+#[derivative(Clone, Debug, PartialEq)]
 pub enum PortfolioMessage {
 	// Sub-messages
 	#[child]
@@ -47,6 +48,16 @@ pub enum PortfolioMessage {
 	},
 	DeleteDocument {
 		document_id: DocumentId,
+	},
+	/// Delivers an asynchronously-built `Gdd` working copy into its document. Emitted by the mount
+	/// future spawned in `load_document` once the working-copy container is ready. The payload is
+	/// not serializable and a clone carries no `Gdd` (`clone_to_none`); it only ever travels once,
+	/// from the mount future to the receiving handler.
+	DocumentStorageMounted {
+		document_id: DocumentId,
+		#[serde(skip, default)]
+		#[derivative(Debug = "ignore", PartialEq = "ignore", Clone(clone_with = "clone_to_none"))]
+		gdd: Option<document_format::Gdd<document_format::GddV1>>,
 	},
 	DestroyAllDocuments,
 	EditorPreferences,
@@ -208,4 +219,9 @@ pub enum PortfolioMessage {
 		/// New sizes for the children at that split node.
 		sizes: Vec<f64>,
 	},
+}
+
+/// Clone helper for the non-serializable `gdd` payload: a cloned mount message carries no `Gdd`.
+fn clone_to_none<T>(_: &Option<T>) -> Option<T> {
+	None
 }

@@ -74,6 +74,12 @@ pub struct PortfolioMessageHandler {
 	pub selection_mode: SelectionMode,
 	pub reset_node_definitions_on_open: bool,
 	pub workspace_panel_layout: WorkspacePanelLayout,
+	/// Parent directory that holds every document's `Gdd` working copy; a given document mounts at
+	/// `working_copy_root.join(format!("{id:x}"))`. A filesystem path on native; on web it is
+	/// converted to an OPFS directory name at the container-construction seam. `None` means no
+	/// persistent location is configured (tests, headless) — documents mount an in-memory working
+	/// copy instead, so the mount path still runs but writes nowhere durable.
+	working_copy_root: Option<PathBuf>,
 }
 
 #[message_handler_data]
@@ -377,6 +383,17 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 					};
 					responses.add(PortfolioMessage::SelectDocument { document_id });
 				}
+			}
+			PortfolioMessage::DocumentStorageMounted { document_id, gdd } => {
+				let Some(document) = self.documents.get_mut(&document_id) else {
+					// Document was closed before its working copy finished mounting; drop the `Gdd`.
+					return;
+				};
+				document.storage = gdd;
+				// Capture the current runtime state into the freshly-mounted working copy. Edits made
+				// during the mount window were skipped by `commit_storage_snapshot` (no-op while
+				// unmounted), so this initial commit brings the working copy up to date.
+				document.commit_storage_snapshot();
 			}
 			PortfolioMessage::DestroyAllDocuments => {
 				// Empty the list of internal document data
@@ -1891,6 +1908,12 @@ impl PortfolioMessageHandler {
 		Self { executor, ..Default::default() }
 	}
 
+	/// Set the parent directory under which each document's `Gdd` working copy is mounted. `None`
+	/// mounts in-memory working copies (no durable location configured).
+	pub fn set_working_copy_root(&mut self, root: Option<PathBuf>) {
+		self.working_copy_root = root;
+	}
+
 	pub fn document(&self, document_id: DocumentId) -> Option<&DocumentMessageHandler> {
 		self.documents.get(&document_id)
 	}
@@ -2036,6 +2059,32 @@ impl PortfolioMessageHandler {
 		if is_new_document {
 			responses.add(PortfolioMessage::UpdateOpenDocumentsList);
 		}
+
+		// Mount the per-document `Gdd` working copy asynchronously (its container is built off-thread).
+		// The document is already usable; the working copy attaches once the future resolves. With no
+		// configured root the working copy is in-memory, so the mount path still runs uniformly.
+		responses.add(Self::mount_document_storage(self.working_copy_root.clone(), document_id));
+	}
+
+	/// Build the `FutureMessage` that constructs (or reopens) the document's `Gdd` working copy and
+	/// delivers it back via [`PortfolioMessage::DocumentStorageMounted`]. With a configured root the
+	/// working copy lives at `<root>/<id_hex>`; without one it is in-memory.
+	fn mount_document_storage(working_copy_root: Option<std::path::PathBuf>, document_id: DocumentId) -> Message {
+		let path = working_copy_root.map(|root| root.join(format!("{:x}", document_id.0)));
+		let editor_version = crate::application::GRAPHITE_GIT_COMMIT_HASH.to_string();
+		let peer = graph_storage::PeerId(generate_uuid());
+
+		let future = async move {
+			let gdd = build_or_open_working_copy(path.as_deref(), peer, document_id.0, editor_version).await;
+			match gdd {
+				Ok(gdd) => Message::Portfolio(PortfolioMessage::DocumentStorageMounted { document_id, gdd: Some(gdd) }),
+				Err(error) => {
+					log::error!("Failed to mount document storage for {document_id:?}: {error}");
+					Message::NoOp
+				}
+			}
+		};
+		FutureMessage::Await { future: MessageFuture::new(future) }.into()
 	}
 
 	/// Returns an iterator over the open documents in order.
@@ -2199,6 +2248,52 @@ fn display_name_with_fallback(info: &DocumentInfo) -> String {
 		format!("Untitled Document ({:x})", info.id.0)
 	} else {
 		info.name.clone()
+	}
+}
+
+/// Build a document's `Gdd` working copy. With `Some(path)` it opens an existing on-disk working
+/// copy (reopen / autosave recovery) or creates a fresh one bound to `peer`, choosing the backend
+/// per platform: a folder on native, an OPFS directory on web (where `path` is the OPFS directory
+/// name). With `None` it creates a fresh in-memory working copy (tests, headless) that persists
+/// nowhere durable.
+async fn build_or_open_working_copy(
+	path: Option<&std::path::Path>,
+	peer: graph_storage::PeerId,
+	document_uuid: u64,
+	version: String,
+) -> Result<document_format::Gdd<document_format::GddV1>, document_format::OpenError> {
+	use document_container::AnyContainer;
+	use document_format::{Gdd, GddV1};
+
+	let Some(path) = path else {
+		let container = AnyContainer::Memory(document_container::backends::memory::MemoryBackend::new());
+		return Gdd::<GddV1>::create_in(container, GddV1, peer, document_uuid, version.clone(), version).await;
+	};
+
+	#[cfg(not(target_family = "wasm"))]
+	let (container, exists) = {
+		use document_container::backends::folder::FolderBackend;
+		let exists = path.join("manifest.json").is_file();
+		let backend = if exists { FolderBackend::open(path)? } else { FolderBackend::create(path)? };
+		(AnyContainer::Folder(backend), exists)
+	};
+
+	#[cfg(target_family = "wasm")]
+	let (container, exists) = {
+		use document_container::AsyncContainer;
+		use document_container::backends::opfs::OpfsBackend;
+		let directory_name = path
+			.to_str()
+			.ok_or(document_format::OpenError::Container(document_container::ContainerError::InvalidPath(path.display().to_string())))?;
+		let backend = OpfsBackend::open(directory_name).await?;
+		let exists = backend.exists("manifest.json").await;
+		(AnyContainer::Opfs(backend), exists)
+	};
+
+	if exists {
+		Gdd::<GddV1>::open_in(container, GddV1).await
+	} else {
+		Gdd::<GddV1>::create_in(container, GddV1, peer, document_uuid, version.clone(), version).await
 	}
 }
 

@@ -63,7 +63,8 @@ pub struct DocumentMessageContext<'a> {
 	pub resource_storage: &'a ResourceStorageMessageHandler,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, ExtractField)]
+#[derive(derivative::Derivative, serde::Serialize, serde::Deserialize, ExtractField)]
+#[derivative(Clone, Debug)]
 #[serde(default)]
 pub struct DocumentMessageHandler {
 	// ======================
@@ -90,12 +91,13 @@ pub struct DocumentMessageHandler {
 	/// Resources embedded in the document.
 	#[serde(default, skip_serializing_if = "ResourceMessageHandler::is_empty")]
 	pub resources: ResourceMessageHandler,
-	/// Shadow CRDT representation of the document. Populated by `commit_from_runtime` at autosave
-	/// boundaries; not persisted yet (storage history is reconstructed by replaying the runtime
-	/// state into a fresh `Session` on load). The peer identity is therefore re-minted each
-	/// session, which is the wrong long-term behaviour — see WP3 PeerId-persistence in the TODO.
-	#[serde(skip, default = "graph_storage::Session::new")]
-	pub storage: graph_storage::Session,
+	/// Per-document `Gdd` working copy: owns the CRDT `Session` and mirrors edits to disk. `None`
+	/// until the mount future built by `load_document` resolves (the working-copy container is
+	/// constructed asynchronously). Not serialized, and deliberately dropped on clone — a clone is
+	/// a throwaway (e.g. for legacy `.graphite` export) and must not own a live working-copy handle.
+	#[serde(skip, default)]
+	#[derivative(Clone(clone_with = "clone_to_none"), Debug = "ignore")]
+	pub storage: Option<document_format::Gdd<document_format::GddV1>>,
 	/// Tracks which layer occurrences are collapsed in the Layers panel, keyed by tree path.
 	#[serde(deserialize_with = "deserialize_collapsed_layers", default)]
 	pub collapsed: CollapsedLayers,
@@ -172,7 +174,7 @@ impl Default for DocumentMessageHandler {
 			// ============================================
 			network_interface: default_document_network_interface(),
 			resources: ResourceMessageHandler::default(),
-			storage: graph_storage::Session::new(),
+			storage: None,
 			collapsed: CollapsedLayers::default(),
 			commit_hash: GRAPHITE_GIT_COMMIT_HASH.to_string(),
 			document_ptz: PTZ::default(),
@@ -1801,13 +1803,17 @@ impl DocumentMessageHandler {
 		&self.selection_network_path
 	}
 
-	/// Diff the runtime network into the shadow `Session` at autosave boundaries.
+	/// Commit the runtime network into the document's `Gdd` working copy at autosave boundaries.
+	/// No-op while the working copy is still unmounted (its container is built asynchronously on
+	/// document open); the mount picks up the current runtime state once it attaches.
 	pub fn commit_storage_snapshot(&mut self) {
 		use crate::messages::portfolio::document::utility_types::network_interface::storage_metadata::StorageMetadataView;
 
+		let Some(storage) = &mut self.storage else { return };
+
 		let network = self.network_interface.document_network().clone();
 		let view = StorageMetadataView::new(&self.network_interface);
-		if let Err(error) = self.storage.commit_from_runtime(&network, &view) {
+		if let Err(error) = storage.commit_from_runtime(&network, &view) {
 			log::error!("Storage snapshot commit failed: {error}");
 			return;
 		}
@@ -1824,7 +1830,8 @@ impl DocumentMessageHandler {
 		network: &graph_craft::document::NodeNetwork,
 		view: &crate::messages::portfolio::document::utility_types::network_interface::storage_metadata::StorageMetadataView,
 	) {
-		let peer = self.storage.peer();
+		let Some(storage) = &self.storage else { return };
+		let peer = storage.session().peer();
 
 		let target = match graph_storage::Registry::from_runtime_with_metadata(network, view, peer) {
 			Ok(target) => target,
@@ -1834,7 +1841,7 @@ impl DocumentMessageHandler {
 			}
 		};
 
-		let stored = self.storage.registry();
+		let stored = storage.registry();
 		if !stored.value_equal(&target) {
 			log::error!("Storage round-trip: registry value drift after commit\n{}", diff_registries(stored, &target));
 		}
@@ -3951,6 +3958,12 @@ impl Iterator for ClickXRayIter<'_> {
 		assert!(self.parent_targets.is_empty(), "The parent targets should always be empty (since we have left all layers)");
 		None
 	}
+}
+
+/// Clone helper for the `storage` field: a cloned `DocumentMessageHandler` never carries a live
+/// working-copy handle, so the clone always starts as `None`.
+fn clone_to_none<T>(_: &Option<T>) -> Option<T> {
+	None
 }
 
 /// Deserializes `CollapsedLayers` with backwards compatibility for the old format

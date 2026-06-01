@@ -2263,6 +2263,8 @@ dependencies = [
  "bitflags 2.11.0",
  "color",
  "derivative",
+ "document-container",
+ "document-format",
  "dyn-any",
  "env_logger",
  "futures",
