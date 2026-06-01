@@ -14,6 +14,7 @@ use web_sys::{
 
 enum Mutation {
 	Write { path: String, bytes: Vec<u8> },
+	Append { path: String, bytes: Vec<u8> },
 	Delete { path: String },
 }
 
@@ -98,7 +99,7 @@ impl AsyncContainer for OpfsBackend {
 		Ok(())
 	}
 
-	fn store_non_blocking(&self, path: &str, bytes: &[u8]) {
+	fn store_non_blocking(&self, path: &str, bytes: &[u8]) -> Result<()> {
 		let mut guard = self.inner.lock().unwrap();
 		guard.on_disk.insert(path.to_string());
 		guard.queue.push_back(Mutation::Write {
@@ -106,13 +107,26 @@ impl AsyncContainer for OpfsBackend {
 			bytes: bytes.to_vec(),
 		});
 		kick_worker(&self.inner, &mut guard);
+		Ok(())
 	}
 
-	fn remove_non_blocking(&self, path: &str) {
+	fn append_non_blocking(&self, path: &str, bytes: &[u8]) -> Result<()> {
+		let mut guard = self.inner.lock().unwrap();
+		guard.on_disk.insert(path.to_string());
+		guard.queue.push_back(Mutation::Append {
+			path: path.to_string(),
+			bytes: bytes.to_vec(),
+		});
+		kick_worker(&self.inner, &mut guard);
+		Ok(())
+	}
+
+	fn remove_non_blocking(&self, path: &str) -> Result<()> {
 		let mut guard = self.inner.lock().unwrap();
 		guard.on_disk.remove(path);
 		guard.queue.push_back(Mutation::Delete { path: path.to_string() });
 		kick_worker(&self.inner, &mut guard);
+		Ok(())
 	}
 
 	fn exists_non_blocking(&self, path: &str) -> bool {
@@ -144,6 +158,11 @@ async fn drain_queue(inner: Arc<Mutex<Inner>>) {
 			Mutation::Write { path, bytes } => {
 				if let Err(error) = write_file(&directory, &path, &bytes).await {
 					log::error!("OPFS background write for {path} failed: {error:?}");
+				}
+			}
+			Mutation::Append { path, bytes } => {
+				if let Err(error) = append_file(&directory, &path, &bytes).await {
+					log::error!("OPFS background append for {path} failed: {error:?}");
 				}
 			}
 			Mutation::Delete { path } => {

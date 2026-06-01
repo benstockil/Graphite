@@ -32,12 +32,12 @@ fn create_in_round_trips_empty_document() {
 #[test]
 fn open_in_rejects_wrong_format_magic() {
 	futures::executor::block_on(async {
-		let mut container = empty_container();
+		let container = empty_container();
 		let layout = GddV1;
 
 		let mut bogus = Manifest::new(0xC0DE, PeerId(1), "ed".into(), "std".into());
 		bogus.format = "not-gdd".into();
-		io::write_single_by_basename(&mut container, layout.manifest_basename(), Codec::Json, &bogus).await.unwrap();
+		io::write_single(&container, layout.manifest_basename(), Codec::Json, &bogus).unwrap();
 
 		match Gdd::<GddV1>::open_in(container, layout).await {
 			Err(OpenError::WrongFormat { .. }) => {}
@@ -48,38 +48,13 @@ fn open_in_rejects_wrong_format_magic() {
 }
 
 #[test]
-fn open_in_picks_up_alternate_codec_for_manifest() {
-	// Create with the working-copy defaults (manifest=Json), then rewrite the manifest as JsonLines
-	// at the same basename. Open should still succeed: the basename-keyed reader picks up whichever
-	// extension exists on disk.
-	futures::executor::block_on(async {
-		let created = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(11), 0xBEEF, "ed".into(), "std".into())
-			.await
-			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
-		let (mut working, layout) = created.into_storage();
-
-		// Read the current manifest, drop the .json copy, re-emit as .jsonl.
-		let (manifest, _): (Manifest, _) = io::read_single_by_basename(&working, layout.manifest_basename()).await.unwrap();
-		use document_container::AsyncContainer;
-		working.remove(&io::path_for(layout.manifest_basename(), Codec::Json)).await.unwrap();
-		io::write_single_by_basename(&mut working, layout.manifest_basename(), Codec::JsonLines, &manifest).await.unwrap();
-
-		let reopened = match Gdd::<GddV1>::open_in(working, layout).await {
-			Ok(gdd) => gdd,
-			Err(error) => panic!("open_in failed: {error:?}"),
-		};
-		assert_eq!(reopened.session().peer(), PeerId(11));
-	});
-}
-
-#[test]
-fn read_manifest_returns_what_create_in_wrote() {
+fn manifest_returns_what_create_in_wrote() {
 	futures::executor::block_on(async {
 		let gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(13), 0xC0FFEE, "ed-1.2".into(), "std-0.7".into())
 			.await
 			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
 
-		let manifest = gdd.read_manifest().await.unwrap_or_else(|error| panic!("read_manifest failed: {error:?}"));
+		let manifest = gdd.manifest();
 		assert_eq!(manifest.peer_id, PeerId(13));
 		assert_eq!(manifest.document_uuid, 0xC0FFEE);
 		assert_eq!(manifest.editor_version, "ed-1.2");
@@ -96,12 +71,11 @@ fn update_manifest_changes_visible_after_reopen() {
 			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
 
 		gdd.update_manifest(|m| m.editor_version = "ed-NEW".into())
-			.await
 			.unwrap_or_else(|error| panic!("update_manifest failed: {error:?}"));
 
 		let (working, layout) = gdd.into_storage();
 		let reopened = Gdd::<GddV1>::open_in(working, layout).await.unwrap_or_else(|error| panic!("open_in failed: {error:?}"));
-		let manifest = reopened.read_manifest().await.unwrap();
+		let manifest = reopened.manifest();
 		assert_eq!(manifest.editor_version, "ed-NEW");
 	});
 }
@@ -123,7 +97,7 @@ fn apply_hot_op_persists_to_hot_log_and_survives_reopen() {
 			timestamp: TimeStamp { counter: 1, peer: PeerId(5) },
 			author: PeerId(5),
 		};
-		gdd.apply_hot_op(hot_op).await.unwrap_or_else(|error| panic!("apply_hot_op failed: {error:?}"));
+		gdd.apply_hot_op(hot_op).unwrap_or_else(|error| panic!("apply_hot_op failed: {error:?}"));
 
 		assert!(gdd.registry().networks.contains_key(&ROOT_NETWORK), "hot op should have created the root network in memory");
 
@@ -158,13 +132,13 @@ fn retire_moves_eligible_hot_ops_to_history_and_keeps_rest() {
 			timestamp: TimeStamp { counter: 10, peer: PeerId(5) },
 			author: PeerId(5),
 		};
-		gdd.apply_hot_op(early).await.unwrap();
-		gdd.apply_hot_op(late).await.unwrap();
+		gdd.apply_hot_op(early).unwrap();
+		gdd.apply_hot_op(late).unwrap();
 		assert_eq!(gdd.session().hot_log().len(), 2);
 
 		// Retire only up to timestamp 5 → drains the early op, leaves the late one.
 		let cutoff = TimeStamp { counter: 5, peer: PeerId(5) };
-		gdd.retire(cutoff).await.unwrap_or_else(|error| panic!("retire failed: {error:?}"));
+		gdd.retire(cutoff).unwrap_or_else(|error| panic!("retire failed: {error:?}"));
 
 		assert_eq!(gdd.session().hot_log().len(), 1, "late hot op should still be in hot log");
 		assert_eq!(gdd.session().history().count(), 1, "early hot op should be in retired history");
@@ -179,8 +153,7 @@ fn retire_moves_eligible_hot_ops_to_history_and_keeps_rest() {
 		assert_eq!(reopened.session().hot_log().len(), 1);
 
 		// Manifest bumped.
-		let manifest = reopened.read_manifest().await.unwrap();
-		assert!(manifest.last_retired_at.is_some(), "retire should bump last_retired_at");
+		assert!(reopened.manifest().last_retired_at.is_some(), "retire should bump last_retired_at");
 	});
 }
 
@@ -236,7 +209,7 @@ fn export_zip_round_trips_via_deserialize() {
 		let mut restored = document_container::backends::memory::MemoryBackend::new();
 		Zip::deserialize(std::io::Cursor::new(&bytes), &mut restored).unwrap();
 		use document_container::Container;
-		assert!(restored.exists("manifest.bin"));
+		assert!(restored.exists("manifest.json"));
 		assert!(restored.exists("registry.bin"));
 		assert!(!restored.exists("session.json"));
 		assert!(!restored.exists("session.bin"));
@@ -282,7 +255,7 @@ fn resource_round_trip_add_read_remove() {
 		let hash = ResourceHash::from(&payload[..]);
 
 		assert!(!gdd.has_resource(&hash).await);
-		gdd.add_resource(hash, payload).await.unwrap_or_else(|error| panic!("add_resource failed: {error:?}"));
+		gdd.add_resource(hash, payload).unwrap_or_else(|error| panic!("add_resource failed: {error:?}"));
 		assert!(gdd.has_resource(&hash).await);
 
 		let read_back = gdd.read_resource(&hash).await.unwrap();
@@ -291,7 +264,7 @@ fn resource_round_trip_add_read_remove() {
 		let hashes = gdd.resource_hashes().await.unwrap();
 		assert_eq!(hashes, vec![hash]);
 
-		gdd.remove_resource(&hash).await.unwrap();
+		gdd.remove_resource(&hash).unwrap();
 		assert!(!gdd.has_resource(&hash).await);
 	});
 }
@@ -307,7 +280,7 @@ fn resource_survives_reopen() {
 
 		let payload = b"persistent bytes";
 		let hash = ResourceHash::from(&payload[..]);
-		gdd.add_resource(hash, payload).await.unwrap();
+		gdd.add_resource(hash, payload).unwrap();
 
 		let (working, layout) = gdd.into_storage();
 		let reopened = Gdd::<GddV1>::open_in(working, layout).await.unwrap_or_else(|error| panic!("open_in failed: {error:?}"));
@@ -338,9 +311,7 @@ fn resource_from_path_uses_fs_copy_on_folder_backend() {
 		std::fs::write(&src_path, payload).unwrap();
 
 		let hash = ResourceHash::from(&payload[..]);
-		gdd.add_resource_from_path(hash, &src_path)
-			.await
-			.unwrap_or_else(|error| panic!("add_resource_from_path failed: {error:?}"));
+		gdd.add_resource_from_path(hash, &src_path).unwrap_or_else(|error| panic!("add_resource_from_path failed: {error:?}"));
 
 		assert!(gdd.has_resource(&hash).await);
 		assert_eq!(gdd.read_resource(&hash).await.unwrap().as_slice(), payload);
@@ -359,7 +330,7 @@ fn export_carries_resources() {
 
 		let payload = b"exported resource";
 		let hash = ResourceHash::from(&payload[..]);
-		gdd.add_resource(hash, payload).await.unwrap();
+		gdd.add_resource(hash, payload).unwrap();
 
 		let dir = tempfile::tempdir().unwrap();
 		let dest = dir.path().join("export");
@@ -374,17 +345,63 @@ fn export_carries_resources() {
 #[test]
 fn open_in_rejects_future_format_version() {
 	futures::executor::block_on(async {
-		let mut container = empty_container();
+		let container = empty_container();
 		let layout = GddV1;
 
 		let mut future_version = Manifest::new(0xC0DE, PeerId(1), "ed".into(), "std".into());
 		future_version.format_version = manifest::SUPPORTED_FORMAT_VERSION + 1;
-		io::write_single_by_basename(&mut container, layout.manifest_basename(), Codec::Json, &future_version).await.unwrap();
+		io::write_single(&container, layout.manifest_basename(), Codec::Json, &future_version).unwrap();
 
 		match Gdd::<GddV1>::open_in(container, layout).await {
 			Err(OpenError::UnsupportedVersion { .. }) => {}
 			Ok(_) => panic!("expected UnsupportedVersion, got Ok"),
 			Err(other) => panic!("expected UnsupportedVersion, got {other:?}"),
 		}
+	});
+}
+
+#[test]
+fn create_in_records_default_codecs_in_manifest() {
+	futures::executor::block_on(async {
+		let gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(1), 0xAB, "ed".into(), "std".into())
+			.await
+			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
+
+		let codecs = gdd.manifest().codecs;
+		assert_eq!(codecs.registry, Codec::Postcard);
+		assert_eq!(codecs.history, Codec::PostcardFrames);
+		assert_eq!(codecs.hot_log, Codec::PostcardFrames);
+		assert_eq!(codecs.session, Codec::Json);
+	});
+}
+
+#[test]
+fn persist_path_writes_at_manifest_declared_codec_paths() {
+	// The manifest declares the on-disk codec for each payload; the persist path must write at the
+	// extension that codec implies, and reopen (which reads the codec from the manifest) must find them.
+	futures::executor::block_on(async {
+		use document_container::AsyncContainer;
+
+		let mut gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(5), 0xDEAD, "ed".into(), "std".into())
+			.await
+			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
+
+		let hot_op = HotOp {
+			op: RegistryDelta::AddNetwork {
+				network: ROOT_NETWORK,
+				contents: Network::default(),
+			},
+			timestamp: TimeStamp { counter: 1, peer: PeerId(5) },
+			author: PeerId(5),
+		};
+		gdd.apply_hot_op(hot_op).unwrap_or_else(|error| panic!("apply_hot_op failed: {error:?}"));
+
+		let (working, layout) = gdd.into_storage();
+		// Defaults: hot log is PostcardFrames (.frames), manifest is always JSON.
+		assert!(working.exists(&io::path_for(layout.hot_log_basename(), Codec::PostcardFrames)).await);
+		assert!(working.exists(&io::path_for(layout.manifest_basename(), Codec::Json)).await);
+
+		let reopened = Gdd::<GddV1>::open_in(working, layout).await.unwrap_or_else(|error| panic!("open_in failed: {error:?}"));
+		assert!(reopened.registry().networks.contains_key(&ROOT_NETWORK));
 	});
 }

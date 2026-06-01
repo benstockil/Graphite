@@ -1,8 +1,8 @@
 //! Codec for a stream of values. Single-value writes are just streams of length one.
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Codec {
 	/// A single JSON document. `append` to a non-empty buffer errors.
 	Json,

@@ -26,28 +26,38 @@ pub use codec::{Codec, CodecError};
 pub use export::{ExportFormat, ExportOptions};
 pub use io::ReadError;
 pub use layout::{GddV1, Layout};
-pub use manifest::Manifest;
+pub use manifest::{Manifest, PayloadCodecs};
 pub use session_state::SessionState;
+
+/// The manifest is always JSON: it is the bootstrap file, read before any other payload's codec is
+/// known, so its own codec cannot itself be configurable.
+pub const MANIFEST_CODEC: Codec = Codec::Json;
 
 /// Working-copy codecs. The working copy lives in appdata, not under VCS — these defaults
 /// optimize for size and write cost. JSON/JSONL is opt-in via `ExportFormat::Folder` for users
-/// who want a diffable on-disk representation.
-pub const DEFAULT_MANIFEST_CODEC: Codec = Codec::Json;
+/// who want a diffable on-disk representation. Recorded in the manifest at create time and read
+/// back on open (see [`manifest::PayloadCodecs`]), so the persist path never probes the filesystem.
 pub const DEFAULT_SESSION_CODEC: Codec = Codec::Json;
 pub const DEFAULT_REGISTRY_CODEC: Codec = Codec::Postcard;
 pub const DEFAULT_HISTORY_CODEC: Codec = Codec::PostcardFrames;
 pub const DEFAULT_HOT_LOG_CODEC: Codec = Codec::PostcardFrames;
 
 /// Editor-facing handle. Owns the `Session` and the working-copy container; mutations are mirrored
-/// to disk continuously (every retirement appends to `history.jsonl` and re-snapshots `registry.bin`).
+/// to disk continuously (every retirement appends to the history file and re-snapshots the registry).
 ///
-/// The manifest is not cached in memory — it's read through the container when callers ask for it
-/// via [`Gdd::read_manifest`]. Manifest reads are rare (open, create, "last saved" UI lookups),
-/// so caching would just add a sync invariant for no measurable win.
+/// The per-edit persist path (`commit_from_runtime`, `apply_hot_op`, `retire`) is synchronous and
+/// read-free: the manifest is cached in memory (so payload codecs and `last_retired_at` need no
+/// disk read), and writes go through the container's sync write surface. Only `open` / `create` /
+/// `export` are async, since they read.
 pub struct Gdd<L: Layout = GddV1> {
 	session: Session,
 	working: AnyContainer,
 	layout: L,
+	/// In-memory copy of the manifest, kept authoritative since `Gdd` is its sole writer. Holds the
+	/// per-payload codecs (so the persist path never probes the filesystem) and `last_retired_at`
+	/// (so retirement writes the manifest without first reading it). Lets the persist path stay
+	/// fully read-free and synchronous.
+	manifest: Manifest,
 }
 
 impl<L: Layout + Default> Gdd<L> {
@@ -72,46 +82,49 @@ impl<L: Layout + Default> Gdd<L> {
 impl<L: Layout> Gdd<L> {
 	/// Backend-agnostic open. Splits out so tests can supply a [`document_container::backends::memory::MemoryBackend`].
 	pub async fn open_in(working: AnyContainer, layout: L) -> Result<Self, OpenError> {
-		let (manifest, _): (Manifest, _) = io::read_single_by_basename(&working, layout.manifest_basename()).await?;
+		let manifest: Manifest = io::read_single(&working, layout.manifest_basename(), MANIFEST_CODEC).await?;
 		validate_manifest(&manifest)?;
+		let codecs = manifest.codecs;
 
-		let session_state: SessionState = match io::basename_exists(&working, layout.session_basename()).await {
-			true => io::read_single_by_basename(&working, layout.session_basename()).await?.0,
+		let session_state: SessionState = match io::exists(&working, layout.session_basename(), codecs.session).await {
+			true => io::read_single(&working, layout.session_basename(), codecs.session).await?,
 			false => SessionState::default(),
 		};
 
-		let has_registry = io::basename_exists(&working, layout.registry_basename()).await;
-		let has_history = io::basename_exists(&working, layout.history_basename()).await;
+		let has_registry = io::exists(&working, layout.registry_basename(), codecs.registry).await;
+		let has_history = io::exists(&working, layout.history_basename(), codecs.history).await;
 
 		let mut session = match (has_registry, has_history) {
 			(true, true) => {
-				let (registry, _): (Registry, _) = io::read_single_by_basename(&working, layout.registry_basename()).await?;
-				let history_map: HashMap<Rev, Delta> = load_history(&working, &layout).await?.into_iter().map(|delta| (delta.id, delta)).collect();
+				let registry: Registry = io::read_single(&working, layout.registry_basename(), codecs.registry).await?;
+				let history_map: HashMap<Rev, Delta> = load_history(&working, &layout, codecs.history).await?.into_iter().map(|delta| (delta.id, delta)).collect();
 				Session::load(manifest.peer_id, registry, history_map, session_state.head_rev, session_state.next_node_counter)
 			}
 			(true, false) => {
 				// Registry-only export: synthesize a history that reproduces this state.
-				let (registry, _): (Registry, _) = io::read_single_by_basename(&working, layout.registry_basename()).await?;
+				let registry: Registry = io::read_single(&working, layout.registry_basename(), codecs.registry).await?;
 				Session::bootstrap_from_registry(manifest.peer_id, registry)?
 			}
-			(false, _) => Session::replay_from_history(manifest.peer_id, load_history(&working, &layout).await?, session_state.next_node_counter)?,
+			(false, _) => Session::replay_from_history(manifest.peer_id, load_history(&working, &layout, codecs.history).await?, session_state.next_node_counter)?,
 		};
 
-		replay_hot_log(&working, &layout, &mut session).await?;
+		replay_hot_log(&working, &layout, codecs.hot_log, &mut session).await?;
 
-		Ok(Self { session, working, layout })
+		Ok(Self { session, working, layout, manifest })
 	}
 
-	/// Backend-agnostic create. Writes with the working-copy default codecs (see `DEFAULT_*_CODEC`).
-	pub async fn create_in(mut working: AnyContainer, layout: L, peer: PeerId, document_uuid: u64, editor_version: String, stdlib_version: String) -> Result<Self, OpenError> {
+	/// Backend-agnostic create. Records the working-copy default codecs (see `DEFAULT_*_CODEC`) in
+	/// the manifest and writes each payload with its recorded codec.
+	pub async fn create_in(working: AnyContainer, layout: L, peer: PeerId, document_uuid: u64, editor_version: String, stdlib_version: String) -> Result<Self, OpenError> {
 		let manifest = Manifest::new(document_uuid, peer, editor_version, stdlib_version);
-		io::write_single_by_basename(&mut working, layout.manifest_basename(), DEFAULT_MANIFEST_CODEC, &manifest).await?;
-		io::write_single_by_basename(&mut working, layout.session_basename(), DEFAULT_SESSION_CODEC, &SessionState::default()).await?;
+		let codecs = manifest.codecs;
+		io::write_single(&working, layout.manifest_basename(), MANIFEST_CODEC, &manifest)?;
+		io::write_single(&working, layout.session_basename(), codecs.session, &SessionState::default())?;
 
 		let session = Session::with_peer(peer);
-		io::write_single_by_basename(&mut working, layout.registry_basename(), DEFAULT_REGISTRY_CODEC, session.registry()).await?;
+		io::write_single(&working, layout.registry_basename(), codecs.registry, session.registry())?;
 
-		Ok(Self { session, working, layout })
+		Ok(Self { session, working, layout, manifest })
 	}
 }
 
@@ -131,31 +144,18 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), OpenError> {
 	Ok(())
 }
 
-/// Returns the codec whose extension matches the file currently on disk at `basename`.
-/// `None` if no file exists for any known codec.
-async fn current_codec_for(container: &AnyContainer, basename: &str) -> Option<Codec> {
-	for &codec in io::KNOWN_CODECS {
-		if container.exists(&io::path_for(basename, codec)).await {
-			return Some(codec);
-		}
-	}
-	None
-}
-
-async fn load_history<L: Layout>(working: &AnyContainer, layout: &L) -> Result<Vec<Delta>, OpenError> {
-	if !io::basename_exists(working, layout.history_basename()).await {
+async fn load_history<L: Layout>(working: &AnyContainer, layout: &L, codec: Codec) -> Result<Vec<Delta>, OpenError> {
+	if !io::exists(working, layout.history_basename(), codec).await {
 		return Ok(Vec::new());
 	}
-	let (deltas, _): (Vec<Delta>, _) = io::iter_by_basename(working, layout.history_basename()).await?;
-	Ok(deltas)
+	Ok(io::iter::<Delta>(working, layout.history_basename(), codec).await?)
 }
 
-async fn replay_hot_log<L: Layout>(working: &AnyContainer, layout: &L, session: &mut Session) -> Result<(), OpenError> {
-	if !io::basename_exists(working, layout.hot_log_basename()).await {
+async fn replay_hot_log<L: Layout>(working: &AnyContainer, layout: &L, codec: Codec, session: &mut Session) -> Result<(), OpenError> {
+	if !io::exists(working, layout.hot_log_basename(), codec).await {
 		return Ok(());
 	}
-	let (hot_ops, _): (Vec<HotOp>, _) = io::iter_by_basename(working, layout.hot_log_basename()).await?;
-	for hot_op in hot_ops {
+	for hot_op in io::iter::<HotOp>(working, layout.hot_log_basename(), codec).await? {
 		session.replay_hot_op(hot_op)?;
 	}
 	Ok(())
@@ -180,119 +180,105 @@ impl<L: Layout> Gdd<L> {
 		(self.working, self.layout)
 	}
 
-	/// Read and deserialize the on-disk manifest.
-	pub async fn read_manifest(&self) -> Result<Manifest, OpenError> {
-		let (manifest, _) = io::read_single_by_basename::<Manifest>(&self.working, self.layout.manifest_basename()).await?;
-		Ok(manifest)
+	/// The in-memory manifest. `Gdd` is its sole writer, so this is authoritative without re-reading
+	/// disk.
+	pub fn manifest(&self) -> &Manifest {
+		&self.manifest
 	}
 
-	/// Write `manifest` to disk, preserving whatever codec is already there.
-	pub async fn write_manifest(&mut self, manifest: &Manifest) -> Result<(), OpenError> {
-		let codec = current_codec_for(&self.working, self.layout.manifest_basename()).await.unwrap_or(DEFAULT_MANIFEST_CODEC);
-		io::write_single_by_basename(&mut self.working, self.layout.manifest_basename(), codec, manifest).await?;
+	/// Edit the cached manifest and persist it. Always JSON, synchronous.
+	pub fn update_manifest(&mut self, edit: impl FnOnce(&mut Manifest)) -> Result<(), OpenError> {
+		edit(&mut self.manifest);
+		io::write_single(&self.working, self.layout.manifest_basename(), MANIFEST_CODEC, &self.manifest)?;
 		Ok(())
 	}
 
-	/// Read → mutate → write. Sugar for the common case where the caller wants to change a few
-	/// manifest fields without juggling the round-trip themselves.
-	pub async fn update_manifest(&mut self, edit: impl FnOnce(&mut Manifest)) -> Result<(), OpenError> {
-		let mut manifest = self.read_manifest().await?;
-		edit(&mut manifest);
-		self.write_manifest(&manifest).await
-	}
-
 	/// Commit a runtime snapshot through `Session`, appending each emitted delta to the retired
-	/// history file and persisting updated session-state.
+	/// history file and persisting updated session-state. Synchronous: the session mutation is
+	/// in-memory and the disk writes go through the container's sync write surface.
 	///
 	/// Interim API: forwards to `Session::commit_from_runtime`, which itself is a shim that diffs
 	/// the runtime against a freshly-converted `Registry`. The long-term replacement will take
 	/// runtime deltas directly. This wrapper goes away when that lands.
-	pub async fn commit_from_runtime<M: NodeMetadataSource>(&mut self, network: &graph_craft::document::NodeNetwork, metadata: &M) -> Result<Vec<Rev>, CommitError> {
+	pub fn commit_from_runtime<M: NodeMetadataSource>(&mut self, network: &graph_craft::document::NodeNetwork, metadata: &M) -> Result<Vec<Rev>, CommitError> {
 		let revs = self.session.commit_from_runtime(network, metadata)?;
-		if let Err(error) = self.persist_committed_deltas(&revs).await {
+		if let Err(error) = self.persist_committed_deltas(&revs) {
 			log::error!("Failed to persist committed deltas to working copy: {error}");
 		}
 		Ok(revs)
 	}
 
 	/// Apply a hot op from the broadcast stream, appending one frame to the hot log.
-	pub async fn apply_hot_op(&mut self, op: HotOp) -> Result<(), CrdtError> {
+	pub fn apply_hot_op(&mut self, op: HotOp) -> Result<(), CrdtError> {
 		self.session.apply_hot_op(op.clone())?;
-		if let Err(error) = self.append_hot_frame(&op).await {
+		if let Err(error) = self.append_hot_frame(&op) {
 			log::error!("Failed to append hot op frame: {error}");
 		}
 		Ok(())
 	}
 
-	async fn persist_committed_deltas(&mut self, revs: &[Rev]) -> Result<(), OpenError> {
+	fn persist_committed_deltas(&mut self, revs: &[Rev]) -> Result<(), OpenError> {
 		if revs.is_empty() {
 			return Ok(());
 		}
 
-		let history_codec = current_codec_for(&self.working, self.layout.history_basename()).await.unwrap_or(DEFAULT_HISTORY_CODEC);
-		let mut buffer = Vec::new();
-		for rev in revs {
-			let delta = self.session.history().find(|delta| delta.id == *rev).ok_or(CodecError::Empty)?;
-			history_codec.append(&mut buffer, delta)?;
-		}
-		self.working.append(&io::path_for(self.layout.history_basename(), history_codec), &buffer).await?;
+		self.append_history_deltas(revs)?;
+		self.persist_session_state()
+	}
 
-		let session_codec = current_codec_for(&self.working, self.layout.session_basename()).await.unwrap_or(DEFAULT_SESSION_CODEC);
+	/// Encode the history deltas identified by `revs` and append them to the history file.
+	/// Single pass over the history (O(history length)), filtering by `revs` membership.
+	fn append_history_deltas(&mut self, revs: &[Rev]) -> Result<(), OpenError> {
+		let wanted: std::collections::HashSet<Rev> = revs.iter().copied().collect();
+		let mut buffer = Vec::new();
+		for delta in self.session.history().filter(|delta| wanted.contains(&delta.id)) {
+			self.manifest.codecs.history.append(&mut buffer, delta)?;
+		}
+		self.working.append_non_blocking(&io::path_for(self.layout.history_basename(), self.manifest.codecs.history), &buffer)?;
+		Ok(())
+	}
+
+	fn persist_session_state(&mut self) -> Result<(), OpenError> {
 		let state = SessionState {
 			head_rev: self.session.head_rev(),
 			next_node_counter: self.session.next_node_counter(),
 		};
-		io::write_single_by_basename(&mut self.working, self.layout.session_basename(), session_codec, &state).await?;
-
+		io::write_single(&self.working, self.layout.session_basename(), self.manifest.codecs.session, &state)?;
 		Ok(())
 	}
 
-	async fn append_hot_frame(&mut self, op: &HotOp) -> Result<(), OpenError> {
-		let codec = current_codec_for(&self.working, self.layout.hot_log_basename()).await.unwrap_or(DEFAULT_HOT_LOG_CODEC);
+	fn append_hot_frame(&mut self, op: &HotOp) -> Result<(), OpenError> {
 		let mut buffer = Vec::new();
-		codec.append(&mut buffer, op)?;
-		self.working.append(&io::path_for(self.layout.hot_log_basename(), codec), &buffer).await?;
+		self.manifest.codecs.hot_log.append(&mut buffer, op)?;
+		self.working.append_non_blocking(&io::path_for(self.layout.hot_log_basename(), self.manifest.codecs.hot_log), &buffer)?;
 		Ok(())
 	}
 
 	/// Working-copy checkpoint: promote hot ops with timestamp `≤ up_to` into retired deltas,
 	/// append them to the history file, rewrite the hot log with remaining (unretired) ops,
-	/// re-snapshot the registry, and bump `last_retired_at` on the manifest.
-	pub async fn retire(&mut self, up_to: TimeStamp) -> Result<(), RetireError> {
+	/// re-snapshot the registry, and bump `last_retired_at` on the manifest. Synchronous.
+	pub fn retire(&mut self, up_to: TimeStamp) -> Result<(), RetireError> {
 		let new_revs = self.session.retire(up_to)?;
 
 		if !new_revs.is_empty() {
-			let history_codec = current_codec_for(&self.working, self.layout.history_basename()).await.unwrap_or(DEFAULT_HISTORY_CODEC);
-			let mut buffer = Vec::new();
-			for rev in &new_revs {
-				let delta = self.session.history().find(|delta| delta.id == *rev).ok_or(CodecError::Empty)?;
-				history_codec.append(&mut buffer, delta)?;
-			}
-			self.working.append(&io::path_for(self.layout.history_basename(), history_codec), &buffer).await?;
+			self.append_history_deltas(&new_revs)?;
 		}
 
 		// Rewrite hot log with whatever survived retirement.
-		let hot_codec = current_codec_for(&self.working, self.layout.hot_log_basename()).await.unwrap_or(DEFAULT_HOT_LOG_CODEC);
 		let mut hot_buffer = Vec::new();
 		for hot_op in self.session.hot_log() {
-			hot_codec.append(&mut hot_buffer, hot_op)?;
+			self.manifest.codecs.hot_log.append(&mut hot_buffer, hot_op)?;
 		}
-		self.working.write(&io::path_for(self.layout.hot_log_basename(), hot_codec), &hot_buffer).await?;
+		self.working
+			.store_non_blocking(&io::path_for(self.layout.hot_log_basename(), self.manifest.codecs.hot_log), &hot_buffer)?;
 
 		// Re-snapshot registry.
-		let registry_codec = current_codec_for(&self.working, self.layout.registry_basename()).await.unwrap_or(DEFAULT_REGISTRY_CODEC);
-		io::write_single_by_basename(&mut self.working, self.layout.registry_basename(), registry_codec, self.session.registry()).await?;
+		io::write_single(&self.working, self.layout.registry_basename(), self.manifest.codecs.registry, self.session.registry())?;
 
-		// Persist session cursor.
-		let session_codec = current_codec_for(&self.working, self.layout.session_basename()).await.unwrap_or(DEFAULT_SESSION_CODEC);
-		let state = SessionState {
-			head_rev: self.session.head_rev(),
-			next_node_counter: self.session.next_node_counter(),
-		};
-		io::write_single_by_basename(&mut self.working, self.layout.session_basename(), session_codec, &state).await?;
+		self.persist_session_state()?;
 
-		// Bump manifest timestamp.
-		self.update_manifest(|m| m.last_retired_at = Some(chrono::Utc::now().to_rfc3339())).await?;
+		// Bump cached manifest timestamp and persist it.
+		self.update_manifest(|m| m.last_retired_at = Some(chrono::Utc::now().to_rfc3339()))?;
 
 		Ok(())
 	}
@@ -301,13 +287,13 @@ impl<L: Layout> Gdd<L> {
 		self.working.read(&self.layout.resource_path(hash)).await
 	}
 
-	pub async fn add_resource(&self, hash: ResourceHash, bytes: &[u8]) -> Result<(), ContainerError> {
-		self.working.write(&self.layout.resource_path(&hash), bytes).await
+	pub fn add_resource(&self, hash: ResourceHash, bytes: &[u8]) -> Result<(), ContainerError> {
+		self.working.store_non_blocking(&self.layout.resource_path(&hash), bytes)
 	}
 
 	/// Add a resource by copying from `src` rather than buffering its bytes. Folder backends use
 	/// `fs::copy` (CoW on supported filesystems); other backends fall back to read-then-write.
-	pub async fn add_resource_from_path(&self, hash: ResourceHash, src: &Path) -> Result<(), ContainerError> {
+	pub fn add_resource_from_path(&self, hash: ResourceHash, src: &Path) -> Result<(), ContainerError> {
 		let dest_path = self.layout.resource_path(&hash);
 		if let AnyContainer::Folder(folder) = &self.working {
 			let full = folder.root().join(&dest_path);
@@ -318,15 +304,15 @@ impl<L: Layout> Gdd<L> {
 			return Ok(());
 		}
 		let bytes = std::fs::read(src).map_err(ContainerError::Io)?;
-		self.working.write(&dest_path, &bytes).await
+		self.working.store_non_blocking(&dest_path, &bytes)
 	}
 
 	pub async fn has_resource(&self, hash: &ResourceHash) -> bool {
 		self.working.exists(&self.layout.resource_path(hash)).await
 	}
 
-	pub async fn remove_resource(&self, hash: &ResourceHash) -> Result<(), ContainerError> {
-		self.working.remove(&self.layout.resource_path(hash)).await
+	pub fn remove_resource(&self, hash: &ResourceHash) -> Result<(), ContainerError> {
+		self.working.remove_non_blocking(&self.layout.resource_path(hash))
 	}
 
 	/// Enumerate every resource currently in the working copy. Paths that don't parse as a
@@ -388,20 +374,28 @@ impl<L: Layout> Gdd<L> {
 
 	/// Drive a sink through manifest → registry → history → resources, re-encoding typed payloads
 	/// with `codec` and passing resources verbatim. Each entry is written one at a time so the
-	/// sink only ever sees one payload's bytes at a time.
+	/// sink only ever sees one payload's bytes at a time. The exported manifest's codec map is
+	/// rewritten to `codec` so it stays authoritative for the re-encoded payloads; the manifest
+	/// itself is always JSON.
 	async fn stream_entries(&self, codec: Codec, options: ExportOptions, sink: &mut dyn ExportSink) -> Result<(), ExportError> {
 		use document_container::AsyncContainer;
 
-		let manifest = self.read_manifest().await?;
-		sink.write_entry(&io::path_for(self.layout.manifest_basename(), codec), &codec.write_single(&manifest)?)?;
+		let mut manifest = self.manifest.clone();
+		manifest.codecs = PayloadCodecs {
+			registry: codec,
+			history: codec,
+			hot_log: codec,
+			session: codec,
+		};
+		sink.write_entry(&io::path_for(self.layout.manifest_basename(), MANIFEST_CODEC), &MANIFEST_CODEC.write_single(&manifest)?)?;
 
 		if options.include_registry {
-			let (registry, _): (Registry, _) = io::read_single_by_basename(&self.working, self.layout.registry_basename()).await?;
+			let registry: Registry = io::read_single(&self.working, self.layout.registry_basename(), self.manifest.codecs.registry).await?;
 			sink.write_entry(&io::path_for(self.layout.registry_basename(), codec), &codec.write_single(&registry)?)?;
 		}
 
-		if options.include_history && io::basename_exists(&self.working, self.layout.history_basename()).await {
-			let (deltas, _): (Vec<Delta>, _) = io::iter_by_basename(&self.working, self.layout.history_basename()).await?;
+		if options.include_history && io::exists(&self.working, self.layout.history_basename(), self.manifest.codecs.history).await {
+			let deltas: Vec<Delta> = io::iter(&self.working, self.layout.history_basename(), self.manifest.codecs.history).await?;
 			let mut buffer = Vec::new();
 			for delta in &deltas {
 				codec.append(&mut buffer, delta)?;
@@ -436,7 +430,9 @@ impl<L: Layout + Send + Sync> LoadResource for Gdd<L> {
 impl<L: Layout + Send + Sync> ResourceStorage for Gdd<L> {
 	fn store(&self, data: &[u8]) -> ResourceHash {
 		let hash = ResourceHash::from(data);
-		self.working.store_non_blocking(&self.layout.resource_path(&hash), data);
+		if let Err(error) = self.working.store_non_blocking(&self.layout.resource_path(&hash), data) {
+			log::error!("ResourceStorage::store failed for {hash}: {error}");
+		}
 		hash
 	}
 
@@ -457,7 +453,9 @@ impl<L: Layout + Send + Sync> ResourceStorage for Gdd<L> {
 			if kept.contains(&hash) {
 				continue;
 			}
-			self.working.remove_non_blocking(&self.layout.resource_path(&hash));
+			if let Err(error) = self.working.remove_non_blocking(&self.layout.resource_path(&hash)) {
+				log::error!("ResourceStorage::garbage_collect failed to remove {hash}: {error}");
+			}
 		}
 	}
 }
