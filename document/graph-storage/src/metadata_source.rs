@@ -132,6 +132,13 @@ pub trait NodeMetadataSource {
 	fn reference(&self, _network_path: &[RuntimeNodeId]) -> Option<&str> {
 		None
 	}
+
+	/// Document-scoped editor chrome (viewport PTZ, render mode, overlays, snapping, ...), keyed by
+	/// `attr::UI_DOC_*`. Written into `Registry.attributes`, each key its own LWW slot. Returned owned
+	/// to keep the trait object-safe.
+	fn document_attributes(&self) -> HashMap<String, serde_json::Value> {
+		HashMap::new()
+	}
 }
 
 /// No-op metadata source. Use when there's nothing to attach (synthetic networks, CLI tools).

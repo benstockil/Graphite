@@ -1810,10 +1810,25 @@ impl DocumentMessageHandler {
 	pub fn commit_storage_snapshot(&mut self, byte_store: &dyn graph_craft::application_io::resource::ResourceStorage) {
 		use crate::messages::portfolio::document::utility_types::network_interface::storage_metadata::StorageMetadataView;
 
-		let Some(storage) = &mut self.storage else { return };
+		use crate::messages::portfolio::document::utility_types::network_interface::storage_metadata::DocumentSettings;
+
+		if self.storage.is_none() {
+			return;
+		}
 
 		let network = self.network_interface.document_network().clone();
-		let view = StorageMetadataView::new(&self.network_interface);
+		let document_settings = DocumentSettings {
+			document_ptz: &self.document_ptz,
+			render_mode: &self.render_mode,
+			overlays_visibility: &self.overlays_visibility_settings,
+			rulers_visible: self.rulers_visible,
+			snapping_state: &self.snapping_state,
+			collapsed: &self.collapsed,
+		};
+		let view = StorageMetadataView::with_document_settings(&self.network_interface, document_settings);
+
+		// `view` borrows disjoint `self` fields, so the mutable `storage` borrow is independent.
+		let storage = self.storage.as_mut().expect("checked present above");
 		if let Err(error) = storage.commit_from_runtime(&network, &view, &self.resources.registry, byte_store) {
 			log::error!("Storage snapshot commit failed: {error}");
 			return;
@@ -1821,6 +1836,35 @@ impl DocumentMessageHandler {
 
 		#[cfg(debug_assertions)]
 		self.verify_storage_round_trip(&network, &view);
+	}
+
+	/// Restore the document-level settings persisted under `ui::doc::*` from a storage `Registry`
+	/// into the runtime handler fields. Each setting is applied only if present and decodable;
+	/// missing or undecodable keys leave the current field untouched. Inverse of the document-level
+	/// half of `commit_storage_snapshot`; used when the `.gdd` is the load source (not the legacy
+	/// `.graphite` blob), so it is not auto-invoked during dual-write.
+	pub fn apply_stored_document_settings(&mut self, registry: &graph_storage::Registry) {
+		use graph_storage::{AttributesRead, attr};
+
+		let attributes = &registry.attributes;
+		if let Some(value) = attributes.get_typed(attr::UI_DOC_PTZ) {
+			self.document_ptz = value;
+		}
+		if let Some(value) = attributes.get_typed(attr::UI_DOC_RENDER_MODE) {
+			self.render_mode = value;
+		}
+		if let Some(value) = attributes.get_typed(attr::UI_DOC_OVERLAYS) {
+			self.overlays_visibility_settings = value;
+		}
+		if let Some(value) = attributes.get_typed(attr::UI_DOC_RULERS_VISIBLE) {
+			self.rulers_visible = value;
+		}
+		if let Some(value) = attributes.get_typed(attr::UI_DOC_SNAPPING) {
+			self.snapping_state = value;
+		}
+		if let Some(value) = attributes.get_typed(attr::UI_DOC_COLLAPSED) {
+			self.collapsed = value;
+		}
 	}
 
 	/// Debug-only: stored registry should equal a fresh `from_runtime`, and a `to_runtime` of the

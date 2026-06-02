@@ -328,6 +328,8 @@ The CRDT does not mask graph-shape conflicts. Concurrent same-slot `SetExport`s 
 
 `DocumentNodePersistentMetadata` and `NodeNetworkPersistentMetadata` from the runtime — display names, locked/pinned, navigation/PTZ state, selection undo/redo stacks, layer/node type metadata — flow through the storage `Attributes` bucket under `ui::*` keys. Transient runtime caches (`DocumentNodeTransientMetadata`, click targets, resolved types, `OriginalLocation`) stay runtime-only and are not stored.
 
+Document-scoped editor settings (viewport view, render mode, overlay/ruler visibility, snapping, collapsed layers) ride the document-level `Registry.attributes` under `ui::doc::*` keys, supplied through `NodeMetadataSource::document_attributes`. This is what makes the `.gdd` a lossless replacement for the legacy format's document-handler fields.
+
 # Drawbacks
 
 - **Diffing two full `Registry`s on every autosave is O(N) in document size.** The interim cost of treating storage as a serialization layer derived from the runtime; currently triggered at autosave boundaries (`commit_storage_snapshot`) rather than per gesture, and addressed long-term by computing deltas directly on runtime mutations.

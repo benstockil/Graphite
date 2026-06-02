@@ -9,13 +9,17 @@ use std::collections::HashMap;
 
 use glam::IVec2;
 use graph_craft::document::{DocumentNodeImplementation, NodeId, NodeNetwork};
-use graph_storage::{InputMetadataEntry, NetworkMetadataEntry, NodeMetadataEntry, NodeMetadataSource, Position};
+use graph_storage::{InputMetadataEntry, NetworkMetadataEntry, NodeMetadataEntry, NodeMetadataSource, Position, attr};
+use graphene_std::vector::style::RenderMode;
 
 use super::memo_network::MemoNetwork;
 use super::{
 	DocumentNodePersistentMetadata, DocumentNodeTransientMetadata, InputMetadata, InputPersistentMetadata, LayerPosition, NodeNetworkInterface, NodeNetworkMetadata, NodePersistentMetadata,
 	NodePosition, NodeTypePersistentMetadata, PTZ, Previewing,
 };
+use crate::messages::portfolio::document::overlays::utility_types::OverlaysVisibilitySettings;
+use crate::messages::portfolio::document::utility_types::misc::SnappingState;
+use crate::messages::portfolio::document::utility_types::nodes::CollapsedLayers;
 
 /// Fired when the storage entry list disagrees with the converted `NodeNetwork`.
 #[derive(Debug, thiserror::Error)]
@@ -24,14 +28,36 @@ pub enum InterfaceRebuildError {
 	InputMetadataLengthMismatch { node: NodeId, network_path: Vec<NodeId>, expected: usize, got: usize },
 }
 
-/// Adapts a `&NodeNetworkInterface` to `graph-storage`'s `NodeMetadataSource`.
+/// Document-scoped editor settings the storage layer persists under `ui::doc::*` (viewport view,
+/// render mode, overlay/ruler visibility, snapping, collapsed layers). Borrowed for the lifetime of
+/// a single conversion; see [`StorageMetadataView::with_document_settings`].
+pub struct DocumentSettings<'a> {
+	pub document_ptz: &'a PTZ,
+	pub render_mode: &'a RenderMode,
+	pub overlays_visibility: &'a OverlaysVisibilitySettings,
+	pub rulers_visible: bool,
+	pub snapping_state: &'a SnappingState,
+	pub collapsed: &'a CollapsedLayers,
+}
+
+/// Adapts a `&NodeNetworkInterface` to `graph-storage`'s `NodeMetadataSource`. Optionally carries the
+/// document-level settings; when absent (`new`), `document_attributes` is empty (tests / graph-only
+/// conversions that don't round-trip those settings).
 pub struct StorageMetadataView<'a> {
 	interface: &'a NodeNetworkInterface,
+	document_settings: Option<DocumentSettings<'a>>,
 }
 
 impl<'a> StorageMetadataView<'a> {
 	pub fn new(interface: &'a NodeNetworkInterface) -> Self {
-		Self { interface }
+		Self { interface, document_settings: None }
+	}
+
+	pub fn with_document_settings(interface: &'a NodeNetworkInterface, document_settings: DocumentSettings<'a>) -> Self {
+		Self {
+			interface,
+			document_settings: Some(document_settings),
+		}
 	}
 }
 
@@ -125,6 +151,32 @@ impl NodeMetadataSource for StorageMetadataView<'_> {
 	fn reference(&self, network_path: &[NodeId]) -> Option<&str> {
 		let network_metadata = self.interface.network_metadata.nested_metadata(network_path)?;
 		network_metadata.persistent_metadata.reference.as_deref()
+	}
+
+	fn document_attributes(&self) -> HashMap<String, serde_json::Value> {
+		let Some(settings) = &self.document_settings else { return HashMap::new() };
+
+		// Serialize each setting under its own `ui::doc::*` key. A field that fails to serialize is
+		// skipped rather than aborting the whole snapshot; it just won't round-trip.
+		let entries = [
+			(attr::UI_DOC_PTZ, serde_json::to_value(settings.document_ptz)),
+			(attr::UI_DOC_RENDER_MODE, serde_json::to_value(settings.render_mode)),
+			(attr::UI_DOC_OVERLAYS, serde_json::to_value(settings.overlays_visibility)),
+			(attr::UI_DOC_RULERS_VISIBLE, serde_json::to_value(settings.rulers_visible)),
+			(attr::UI_DOC_SNAPPING, serde_json::to_value(settings.snapping_state)),
+			(attr::UI_DOC_COLLAPSED, serde_json::to_value(settings.collapsed)),
+		];
+
+		entries
+			.into_iter()
+			.filter_map(|(key, value)| match value {
+				Ok(value) => Some((key.to_string(), value)),
+				Err(error) => {
+					log::error!("Failed to serialize document setting {key}: {error}");
+					None
+				}
+			})
+			.collect()
 	}
 }
 
@@ -607,5 +659,61 @@ mod tests {
 		// iterating empty data and proving nothing.
 		assert!(checked_any_navigation, "demo artwork produced no navigation metadata — fixture is wrong or extraction is broken");
 		assert!(checked_any_reference, "demo artwork produced no reference metadata — fixture is wrong or extraction is broken");
+	}
+
+	/// Document-level settings (`ui::doc::*`) survive runtime → `Registry` → runtime: convert with
+	/// non-default values attached, then apply the stored attributes onto a fresh handler and confirm
+	/// each field matches.
+	#[test]
+	fn document_settings_round_trip() {
+		let mut document = load_demo("changing-seasons.graphite");
+
+		// Set distinctive, non-default values so the round-trip proves real data moved, not defaults.
+		document.render_mode = RenderMode::Outline;
+		document.rulers_visible = false;
+		document.collapsed = CollapsedLayers(vec![vec![NodeId(7)], vec![NodeId(7), NodeId(42)]]);
+
+		let network = document.network_interface.document_network().clone();
+		let settings = DocumentSettings {
+			document_ptz: &document.document_ptz,
+			render_mode: &document.render_mode,
+			overlays_visibility: &document.overlays_visibility_settings,
+			rulers_visible: document.rulers_visible,
+			snapping_state: &document.snapping_state,
+			collapsed: &document.collapsed,
+		};
+		let view = StorageMetadataView::with_document_settings(&document.network_interface, settings);
+		let registry = Registry::convert_from_runtime(&network, &view, &Default::default(), PeerId(0))
+			.expect("convert_from_runtime failed")
+			.registry;
+
+		// Apply the stored attributes onto a fresh handler and compare each field's serialized form
+		// (avoids requiring `PartialEq` on every setting type). Each field is moved into `to_value`
+		// (its last use), so no borrow is needed.
+		let mut restored = DocumentMessageHandler::default();
+		restored.apply_stored_document_settings(&registry);
+
+		assert_eq!(serde_json::to_value(restored.render_mode).unwrap(), serde_json::to_value(document.render_mode).unwrap(), "render_mode");
+		assert_eq!(
+			serde_json::to_value(restored.rulers_visible).unwrap(),
+			serde_json::to_value(document.rulers_visible).unwrap(),
+			"rulers_visible"
+		);
+		assert_eq!(
+			serde_json::to_value(restored.document_ptz).unwrap(),
+			serde_json::to_value(document.document_ptz).unwrap(),
+			"document_ptz"
+		);
+		assert_eq!(
+			serde_json::to_value(restored.overlays_visibility_settings).unwrap(),
+			serde_json::to_value(document.overlays_visibility_settings).unwrap(),
+			"overlays"
+		);
+		assert_eq!(
+			serde_json::to_value(restored.snapping_state).unwrap(),
+			serde_json::to_value(document.snapping_state).unwrap(),
+			"snapping_state"
+		);
+		assert_eq!(serde_json::to_value(restored.collapsed).unwrap(), serde_json::to_value(document.collapsed).unwrap(), "collapsed");
 	}
 }

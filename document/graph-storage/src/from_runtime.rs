@@ -129,6 +129,11 @@ impl Registry {
 		convert_network(node_network, ROOT_NETWORK, None, &[], &mut registry, &mut ctx)?;
 		convert_resources(resources, peer, &mut registry)?;
 
+		// Document-level editor chrome (`ui::doc::*`) into the document attribute bucket.
+		for (key, value) in metadata.document_attributes() {
+			registry.attributes.set(&key, value, TimeStamp::ORIGIN);
+		}
+
 		Ok(RuntimeConversion {
 			registry,
 			declaration_bytes: ctx.declaration_bytes,

@@ -52,6 +52,15 @@ pub mod attr {
 	pub const UI_NAV_TRANSFORM: &str = "ui::nav::transform";
 	pub const UI_NAV_WIDTH: &str = "ui::nav::width";
 	pub const UI_PREVIEWING: &str = "ui::previewing";
+
+	// Document-level editor chrome, stored in `Registry.attributes` (document scope). Each setting is
+	// its own key so concurrent edits to one don't clobber another.
+	pub const UI_DOC_PTZ: &str = "ui::doc::ptz";
+	pub const UI_DOC_RENDER_MODE: &str = "ui::doc::render_mode";
+	pub const UI_DOC_OVERLAYS: &str = "ui::doc::overlays";
+	pub const UI_DOC_RULERS_VISIBLE: &str = "ui::doc::rulers_visible";
+	pub const UI_DOC_SNAPPING: &str = "ui::doc::snapping";
+	pub const UI_DOC_COLLAPSED: &str = "ui::doc::collapsed";
 }
 
 /// Unified storage-side position. The valid variants depend on `attr::UI_IS_LAYER`:
