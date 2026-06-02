@@ -18,7 +18,10 @@ use document_container::archive::Archive;
 use document_container::backends::folder::FolderBackend;
 use document_container::{AnyContainer, AsyncContainer, ByteHolder, ContainerError};
 use graph_storage::{CommitError, CrdtError, Delta, HotOp, NodeMetadataSource, PeerId, Registry, Rev, Session, TimeStamp};
-use graphene_resource::{LoadResource, Resource, ResourceFuture, ResourceHash, ResourceStorage};
+use graphene_resource::{LoadResource, ResourceHash, ResourceStorage};
+// `Resource` and `ResourceFuture` are only used by the native-only `LoadResource for Gdd` impl.
+#[cfg(not(target_family = "wasm"))]
+use graphene_resource::{Resource, ResourceFuture};
 
 pub mod codec;
 pub mod export;
@@ -39,13 +42,15 @@ pub use session_state::SessionState;
 pub const MANIFEST_CODEC: Codec = Codec::Json;
 
 /// Working-copy codecs. The working copy lives in appdata, not under VCS — these defaults
-/// optimize for size and write cost. JSON/JSONL is opt-in via `ExportFormat::Folder` for users
-/// who want a diffable on-disk representation. Recorded in the manifest at create time and read
-/// back on open (see [`manifest::PayloadCodecs`]), so the persist path never probes the filesystem.
+/// optimize for size and write cost. MessagePack is self-describing, so it round-trips the
+/// type-erased `serde_json::Value` bodies that resource and attribute deltas carry (a non-self-
+/// describing format like postcard cannot). JSON/JSONL is opt-in via `ExportFormat::Folder` for
+/// users who want a diffable on-disk representation. Recorded in the manifest at create time and
+/// read back on open (see [`manifest::PayloadCodecs`]), so the persist path never probes the filesystem.
 pub const DEFAULT_SESSION_CODEC: Codec = Codec::Json;
-pub const DEFAULT_REGISTRY_CODEC: Codec = Codec::Postcard;
-pub const DEFAULT_HISTORY_CODEC: Codec = Codec::PostcardFrames;
-pub const DEFAULT_HOT_LOG_CODEC: Codec = Codec::PostcardFrames;
+pub const DEFAULT_REGISTRY_CODEC: Codec = Codec::MessagePack;
+pub const DEFAULT_HISTORY_CODEC: Codec = Codec::MessagePackFrames;
+pub const DEFAULT_HOT_LOG_CODEC: Codec = Codec::MessagePackFrames;
 
 /// Editor-facing handle. Owns the `Session` and the working-copy container; mutations are mirrored
 /// to disk continuously (every retirement appends to the history file and re-snapshots the registry).
@@ -201,24 +206,25 @@ impl<L: Layout> Gdd<L> {
 		Ok(())
 	}
 
-	/// Commit a runtime snapshot through `Session`, appending each emitted delta to the retired
-	/// history file and persisting updated session-state. Synchronous: the session mutation is
-	/// in-memory and the disk writes go through the container's sync write surface.
+	/// Commit a runtime snapshot through the hot-op pipeline: stage the diff as hot ops, persist the
+	/// hot frames, then immediately retire them into durable history and re-snapshot the registry.
+	/// Synchronous: the session mutation is in-memory and the disk writes go through the container's
+	/// sync write surface.
 	///
-	/// Interim API: forwards to `Session::commit_from_runtime`, which itself is a shim that diffs
-	/// the runtime against a freshly-converted `Registry`. The long-term replacement will take
-	/// runtime deltas directly. This wrapper goes away when that lands.
+	/// Retiring right after staging keeps each autosave durable while still flowing through the same
+	/// hot-op-then-retire path collaboration will use, so the pipeline is exercised before transport
+	/// lands. Interim: `stage_from_runtime` diffs the runtime against a freshly-converted `Registry`;
+	/// the long-term replacement takes runtime deltas directly.
 	pub fn commit_from_runtime<M: NodeMetadataSource>(
 		&mut self,
 		network: &graph_craft::document::NodeNetwork,
 		metadata: &M,
 		resources: &graphene_resource::ResourceRegistry,
 		byte_store: &dyn ResourceStorage,
-	) -> Result<Vec<Rev>, CommitError> {
-		let (revs, declaration_bytes) = self.session.commit_from_runtime(network, metadata, resources)?;
-		if let Err(error) = self.persist_committed_deltas(&revs) {
-			log::error!("Failed to persist committed deltas to working copy: {error}");
-		}
+	) -> Result<Vec<Rev>, CommitFromRuntimeError> {
+		let (hot_ops, declaration_bytes) = self.session.stage_from_runtime(network, metadata, resources)?;
+		let revs = self.append_and_retire(&hot_ops)?;
+
 		// Persist proto-node declaration content to the byte store (the global cache in the editor,
 		// the working-copy container for standalone export). Content-addressed, so re-storing
 		// identical bytes on every commit is an idempotent no-op.
@@ -272,13 +278,18 @@ impl<L: Layout> Gdd<L> {
 		Ok(())
 	}
 
-	fn persist_committed_deltas(&mut self, revs: &[Rev]) -> Result<(), OpenError> {
-		if revs.is_empty() {
-			return Ok(());
+	/// Persist freshly-staged hot ops and immediately retire them into durable history. Appends each
+	/// hot frame (so a crash before retirement still recovers the work), then retires up to the last
+	/// staged timestamp, which drains exactly these ops and re-snapshots the registry. Returns the
+	/// retired `Rev`s. A no-op when nothing was staged.
+	fn append_and_retire(&mut self, hot_ops: &[HotOp]) -> Result<Vec<Rev>, RetireError> {
+		let Some(last) = hot_ops.last() else { return Ok(Vec::new()) };
+
+		for hot_op in hot_ops {
+			self.append_hot_frame(hot_op)?;
 		}
 
-		self.append_history_deltas(revs)?;
-		self.persist_session_state()
+		self.retire(last.timestamp)
 	}
 
 	/// Encode the history deltas identified by `revs` and append them to the history file.
@@ -312,7 +323,7 @@ impl<L: Layout> Gdd<L> {
 	/// Working-copy checkpoint: promote hot ops with timestamp `≤ up_to` into retired deltas,
 	/// append them to the history file, rewrite the hot log with remaining (unretired) ops,
 	/// re-snapshot the registry, and bump `last_retired_at` on the manifest. Synchronous.
-	pub fn retire(&mut self, up_to: TimeStamp) -> Result<(), RetireError> {
+	pub fn retire(&mut self, up_to: TimeStamp) -> Result<Vec<Rev>, RetireError> {
 		let new_revs = self.session.retire(up_to)?;
 
 		if !new_revs.is_empty() {
@@ -335,22 +346,35 @@ impl<L: Layout> Gdd<L> {
 		// Bump cached manifest timestamp and persist it.
 		self.update_manifest(|m| m.last_retired_at = Some(chrono::Utc::now().to_rfc3339()))?;
 
-		Ok(())
+		Ok(new_revs)
 	}
 
 	pub async fn read_resource(&self, hash: &ResourceHash) -> Result<ByteHolder, ContainerError> {
 		self.working.read(&self.layout.resource_path(hash)).await
 	}
 
-	pub fn add_resource(&self, hash: ResourceHash, bytes: &[u8]) -> Result<(), ContainerError> {
-		self.working.store_non_blocking(&self.layout.resource_path(&hash), bytes)
+	/// Register a resource under `id` and store its bytes. Commits an `AddResource` delta (a single
+	/// `DataSource::Embedded` source resolved to the content hash) through the session so the registry
+	/// records the resource and the entry replicates, then writes the bytes into the working copy's
+	/// content-addressed store. The caller owns `id` allocation.
+	pub fn add_resource(&mut self, id: graph_storage::ResourceId, bytes: &[u8]) -> Result<(), AddResourceError> {
+		let hash = ResourceHash::from(bytes);
+
+		let hot_ops = self.session.stage_embedded_resource(id, hash)?;
+		self.append_and_retire(&hot_ops)?;
+
+		self.working.store_non_blocking(&self.layout.resource_path(&hash), bytes)?;
+		Ok(())
 	}
 
-	/// Add a resource by copying from a filesystem `src` rather than buffering its bytes. Folder
-	/// backends use `fs::copy` (CoW on supported filesystems); other backends fall back to
-	/// read-then-write. Native-only: there is no filesystem source path on wasm.
+	/// Like [`add_resource`](Self::add_resource) but copies the bytes from a filesystem `src` rather
+	/// than buffering them. Folder backends use `fs::copy` (CoW on supported filesystems); other
+	/// backends fall back to read-then-write. Native-only: there is no filesystem source path on wasm.
 	#[cfg(not(target_family = "wasm"))]
-	pub fn add_resource_from_path(&self, hash: ResourceHash, src: &Path) -> Result<(), ContainerError> {
+	pub fn add_resource_from_path(&mut self, id: graph_storage::ResourceId, hash: ResourceHash, src: &Path) -> Result<(), AddResourceError> {
+		let hot_ops = self.session.stage_embedded_resource(id, hash)?;
+		self.append_and_retire(&hot_ops)?;
+
 		let dest_path = self.layout.resource_path(&hash);
 		if let AnyContainer::Folder(folder) = &self.working {
 			let full = folder.root().join(&dest_path);
@@ -360,8 +384,10 @@ impl<L: Layout> Gdd<L> {
 			std::fs::copy(src, &full).map_err(ContainerError::Io)?;
 			return Ok(());
 		}
+
 		let bytes = std::fs::read(src).map_err(ContainerError::Io)?;
-		self.working.store_non_blocking(&dest_path, &bytes)
+		self.working.store_non_blocking(&dest_path, &bytes)?;
+		Ok(())
 	}
 
 	pub async fn has_resource(&self, hash: &ResourceHash) -> bool {
@@ -611,6 +637,27 @@ pub enum RetireError {
 	Crdt(#[from] CrdtError),
 	#[error("manifest update failed: {0}")]
 	Manifest(#[from] OpenError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AddResourceError {
+	#[error("container error: {0}")]
+	Container(#[from] ContainerError),
+	#[error("CRDT error: {0}")]
+	Crdt(#[from] CrdtError),
+	#[error("failed to retire registration: {0}")]
+	Retire(#[from] RetireError),
+}
+
+/// A commit staged into the in-memory session but its on-disk persistence failed. The session has
+/// advanced past what the working copy reflects; callers should treat the document as needing
+/// re-persist (or surface the failure) rather than assuming the snapshot is durable.
+#[derive(Debug, thiserror::Error)]
+pub enum CommitFromRuntimeError {
+	#[error("failed to stage runtime snapshot: {0}")]
+	Stage(#[from] CommitError),
+	#[error("failed to retire staged hot ops: {0}")]
+	Retire(#[from] RetireError),
 }
 
 #[derive(Debug, thiserror::Error)]

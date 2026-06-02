@@ -201,7 +201,7 @@ fn export_zip_round_trips_via_deserialize() {
 		let dir = tempfile::tempdir().unwrap();
 		let dest = dir.path().join("doc.gdd.zip");
 
-		gdd.export(&dest, ExportFormat::Zip { codec: Codec::Postcard }, ExportOptions::default())
+		gdd.export(&dest, ExportFormat::Zip { codec: Codec::MessagePack }, ExportOptions::default())
 			.await
 			.unwrap_or_else(|error| panic!("export failed: {error:?}"));
 
@@ -244,22 +244,27 @@ fn export_rejects_invalid_options() {
 
 #[test]
 fn resource_round_trip_add_read_remove() {
-	use graphene_resource::ResourceHash;
+	use graphene_resource::{ResourceHash, ResourceId};
 
 	futures::executor::block_on(async {
-		let gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(99), 0xCAFE, "ed".into(), "std".into())
+		let mut gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(99), 0xCAFE, "ed".into(), "std".into())
 			.await
 			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
 
 		let payload = b"deadbeef cafe babe";
 		let hash = ResourceHash::from(&payload[..]);
+		let id = ResourceId::new();
 
 		assert!(!gdd.has_resource(&hash).await);
-		gdd.add_resource(hash, payload).unwrap_or_else(|error| panic!("add_resource failed: {error:?}"));
+		gdd.add_resource(id, payload).unwrap_or_else(|error| panic!("add_resource failed: {error:?}"));
 		assert!(gdd.has_resource(&hash).await);
 
 		let read_back = gdd.read_resource(&hash).await.unwrap();
 		assert_eq!(read_back.as_slice(), payload);
+
+		// The registry records the resource (entry keyed by id, resolved to the content hash).
+		let entry = gdd.registry().resources.get(&id).expect("registry records the added resource");
+		assert_eq!(entry.hash, Some(hash));
 
 		let hashes = gdd.resource_hashes().await.unwrap();
 		assert_eq!(hashes, vec![hash]);
@@ -271,22 +276,27 @@ fn resource_round_trip_add_read_remove() {
 
 #[test]
 fn resource_survives_reopen() {
-	use graphene_resource::ResourceHash;
+	use graphene_resource::{ResourceHash, ResourceId};
 
 	futures::executor::block_on(async {
-		let gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(7), 0xC0DE, "ed".into(), "std".into())
+		let mut gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(7), 0xC0DE, "ed".into(), "std".into())
 			.await
 			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
 
 		let payload = b"persistent bytes";
 		let hash = ResourceHash::from(&payload[..]);
-		gdd.add_resource(hash, payload).unwrap();
+		let id = ResourceId::new();
+		gdd.add_resource(id, payload).unwrap();
 
 		let (working, layout) = gdd.into_storage();
 		let reopened = Gdd::<GddV1>::open_in(working, layout).await.unwrap_or_else(|error| panic!("open_in failed: {error:?}"));
 
 		assert!(reopened.has_resource(&hash).await);
 		assert_eq!(reopened.read_resource(&hash).await.unwrap().as_slice(), payload);
+
+		// The registry entry replicated through the history file and survives reopen.
+		let entry = reopened.registry().resources.get(&id).expect("reopened registry records the resource");
+		assert_eq!(entry.hash, Some(hash));
 	});
 }
 
@@ -294,13 +304,13 @@ fn resource_survives_reopen() {
 fn resource_from_path_uses_fs_copy_on_folder_backend() {
 	use document_container::AnyContainer;
 	use document_container::backends::folder::FolderBackend;
-	use graphene_resource::ResourceHash;
+	use graphene_resource::{ResourceHash, ResourceId};
 
 	futures::executor::block_on(async {
 		// Need a folder-backed working copy to exercise the fs::copy path.
 		let working_dir = tempfile::tempdir().unwrap();
 		let working = AnyContainer::Folder(FolderBackend::create(working_dir.path()).unwrap());
-		let gdd = Gdd::<GddV1>::create_in(working, GddV1, PeerId(1), 0xAB, "ed".into(), "std".into())
+		let mut gdd = Gdd::<GddV1>::create_in(working, GddV1, PeerId(1), 0xAB, "ed".into(), "std".into())
 			.await
 			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
 
@@ -311,7 +321,9 @@ fn resource_from_path_uses_fs_copy_on_folder_backend() {
 		std::fs::write(&src_path, payload).unwrap();
 
 		let hash = ResourceHash::from(&payload[..]);
-		gdd.add_resource_from_path(hash, &src_path).unwrap_or_else(|error| panic!("add_resource_from_path failed: {error:?}"));
+		let id = ResourceId::new();
+		gdd.add_resource_from_path(id, hash, &src_path)
+			.unwrap_or_else(|error| panic!("add_resource_from_path failed: {error:?}"));
 
 		assert!(gdd.has_resource(&hash).await);
 		assert_eq!(gdd.read_resource(&hash).await.unwrap().as_slice(), payload);
@@ -321,16 +333,17 @@ fn resource_from_path_uses_fs_copy_on_folder_backend() {
 #[test]
 fn export_carries_resources() {
 	use document_format::{ExportFormat, ExportOptions};
-	use graphene_resource::ResourceHash;
+	use graphene_resource::{ResourceHash, ResourceId};
 
 	futures::executor::block_on(async {
-		let gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(2), 0xBC, "ed".into(), "std".into())
+		let mut gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(2), 0xBC, "ed".into(), "std".into())
 			.await
 			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
 
 		let payload = b"exported resource";
 		let hash = ResourceHash::from(&payload[..]);
-		gdd.add_resource(hash, payload).unwrap();
+		let id = ResourceId::new();
+		gdd.add_resource(id, payload).unwrap();
 
 		let dir = tempfile::tempdir().unwrap();
 		let dest = dir.path().join("export");
@@ -368,9 +381,9 @@ fn create_in_records_default_codecs_in_manifest() {
 			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
 
 		let codecs = gdd.manifest().codecs;
-		assert_eq!(codecs.registry, Codec::Postcard);
-		assert_eq!(codecs.history, Codec::PostcardFrames);
-		assert_eq!(codecs.hot_log, Codec::PostcardFrames);
+		assert_eq!(codecs.registry, Codec::MessagePack);
+		assert_eq!(codecs.history, Codec::MessagePackFrames);
+		assert_eq!(codecs.hot_log, Codec::MessagePackFrames);
 		assert_eq!(codecs.session, Codec::Json);
 	});
 }
@@ -397,8 +410,8 @@ fn persist_path_writes_at_manifest_declared_codec_paths() {
 		gdd.apply_hot_op(hot_op).unwrap_or_else(|error| panic!("apply_hot_op failed: {error:?}"));
 
 		let (working, layout) = gdd.into_storage();
-		// Defaults: hot log is PostcardFrames (.frames), manifest is always JSON.
-		assert!(working.exists(&io::path_for(layout.hot_log_basename(), Codec::PostcardFrames)).await);
+		// Defaults: hot log is MessagePackFrames (.frames), manifest is always JSON.
+		assert!(working.exists(&io::path_for(layout.hot_log_basename(), Codec::MessagePackFrames)).await);
 		assert!(working.exists(&io::path_for(layout.manifest_basename(), Codec::Json)).await);
 
 		let reopened = Gdd::<GddV1>::open_in(working, layout).await.unwrap_or_else(|error| panic!("open_in failed: {error:?}"));

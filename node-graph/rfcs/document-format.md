@@ -19,20 +19,20 @@ A document is a `Registry` plus a tree of operations applied to it.
 
 ## Registry
 
-The `Registry` is a **flat** node graph. All nodes from all nested networks live in a single map; each node carries a back-pointer to its network. Networks themselves only store their list of exports. Proto-node identifiers are interned into a separate declaration table.
+The `Registry` is a **flat** node graph. All nodes from all nested networks live in a single map; each node carries a back-pointer to its network. Networks themselves only store their list of exports. Proto-node declarations are not a separate table — they are content-addressed resources like any other (see [Resources](#resources)), referenced by `ResourceId`.
 
 ```rs
 pub struct Registry {
     pub node_instances: HashMap<NodeId, Node>,                 // all nodes, flat
     pub networks: HashMap<NetworkId, Network>,                  // exports + per-network attrs
-    pub node_declarations: HashMap<DeclarationId, ProtoNode>,   // interned identifiers
     pub exported_nodes: Vec<NodeId>,                            // library API surface
     pub peer_users: HashMap<PeerId, UserId>,                    // per-device → per-human identity
+    pub resources: ResourceStore,                               // content-addressable resources (images, fonts, declarations)
     pub attributes: Attributes,                                 // document-level metadata
 }
 
 pub struct Node {
-    pub implementation: Implementation,     // ProtoNode(decl) or Network(net)
+    pub implementation: Implementation,     // ProtoNode(ResourceId) or Network(net)
     pub inputs: Vec<InputSlot>,
     pub inputs_attributes: Vec<Attributes>,
     pub attributes: Attributes,
@@ -102,6 +102,12 @@ pub enum RegistryDelta {
     SetExportedNodes        { nodes: Vec<NodeId> },
     ChangeDocumentAttribute { delta: AttributeDelta },
     RegisterPeer            { peer: PeerId, user: UserId },
+    // Resources (incl. proto-node declarations):
+    SetResourceHash { id: ResourceId, hash: Option<ResourceHash> },     // LWW on the resolved hash
+    AddSource       { id: ResourceId, key: SourceKey, source: Value },  // add-wins entry in the source chain
+    RemoveSource    { id: ResourceId, key: SourceKey },
+    AddResource     { id: ResourceId, entry: ResourceEntry },           // whole-entry; reverse of RemoveResource
+    RemoveResource  { id: ResourceId, snapshot: ResourceEntry },        // snapshot for O(1) reverse
 }
 
 /// `value: None` is the removal case. Timestamp lives on the wrapping `Delta`.
@@ -196,7 +202,7 @@ The editor operates on its existing runtime types. Storage is a serialization la
                 └─────────────────────────────────────────┘
 ```
 
-The runtime is the source of truth during editing. Conversion runs on save, on load, and across the sync boundary when broadcasting or receiving ops. The editor-facing handle is `Session` (`graph_storage::Session`); `Document` is internal. `Session::commit_from_runtime(&NodeNetwork, &dyn NodeMetadataSource)` is the single entry point: it diffs the stored registry against a fresh conversion, ticks the clock once per emitted op, wraps each in a `Delta`, and applies + records to history.
+The runtime is the source of truth during editing. Conversion runs on save, on load, and across the sync boundary when broadcasting or receiving ops. The editor-facing handle is `Session` (`graph_storage::Session`); `Document` is internal. `Session::stage_from_runtime(&NodeNetwork, &dyn NodeMetadataSource)` is the entry point: it diffs the stored registry against a fresh conversion, ticks the clock once per emitted op, and applies each as a hot op on the hot log. The `Gdd` handle then persists the hot frames and retires them into durable history. Autosave stages and retires in one step, so solo editing flows through the same hot-op-then-retire path collaboration uses, exercising it before any transport lands.
 
 ## On-disk container
 
@@ -230,8 +236,8 @@ Arrows are "depends on": the editor uses `Session` from `graph-storage` at runti
 A document contains:
 
 - `manifest.json` — always JSON, the bootstrap file. Carries the magic identifier `"gdd"`, a single `u32` `format_version`, a stable `document_uuid`, the saving session's `PeerId`, editor and stdlib versions, an optional save timestamp, and a record of which payloads this save included (registry / history / embedded resources).
-- `document.{json,bin}` — the serialized `Registry`. Codec chosen per-save (JSON for inspectable, binary for compact).
-- `history.{jsonl,bin}` — the serialized delta DAG. JSON history is line-oriented (one delta per line) so appending is a one-line diff.
+- `document.{json,bin}` — the serialized `Registry`. Codec chosen per-save: JSON for inspectable, MessagePack for compact (binary must be self-describing; see the codec rationale).
+- `history.{jsonl,frames}` — the serialized delta DAG, appended a record at a time. JSON history is line-oriented (one delta per line); binary history is length-prefixed MessagePack frames, the prefix guarding against a torn final frame from a crash.
 - `resources/<hash>` — embedded resource bytes, keyed by `ResourceHash`.
 
 The folder backend stores these as plain files on disk; an archive codec packs the same named entries into a single file.
@@ -252,11 +258,28 @@ A `SaveOptions` struct controls scope per-save: `include_registry` (skip = rebui
 
 ## Resources
 
-Resource bytes are content-addressed by `ResourceHash` and resolved through the `ResourceRegistry` (`node-graph/libraries/resources`). Each resource carries a chain of `DataSource` variants tried in order: `Embedded` (bytes live in `resources/<hash>` inside the container), `FilePath(PathBuf)` (bytes mmap'd from an external file at the recorded path), `Url`, `Font` (runtime-resolved, not container-resolved). Multiple sources can coexist on one resource — e.g., `FilePath` for the local working copy and `Embedded` as a portability fallback.
+Everything content-addressable — raster images, fonts, embedded WASM, **and proto-node declarations** — is a resource. The storage `Registry` holds `resources: ResourceStore` (references only); the bytes live in a content-addressed byte store keyed by `ResourceHash`, owned by the caller (the app-global cache in the editor, the `Gdd` container for standalone/export), not by `graph-storage`.
 
-On disk, each `DataSource` is encoded as `serde_json::Value` rather than a typed enum, with the same motivation as the `Attributes` bucket: type-erasure lets migrations rename or restructure variants without keeping old enum shapes alive in Rust. `DataSource` stays a typed enum at the runtime layer; the conversion happens at the serialization boundary. Unknown variants are not preserved across versions — an older binary loading a document with a variant it doesn't recognize is a hard error.
+```rs
+pub type ResourceStore = HashMap<ResourceId, ResourceEntry>;
 
-Legacy documents with inline image `TaggedValue`s have those values extracted into the resource registry at load time; new saves never embed inline blobs in `NodeInput::Value`. Embed-vs-link policy on save is dictated by the registry's `DataSource` chain, not by the container.
+pub struct ResourceEntry {
+    pub sources: Vec<(SourceKey, SourceValue)>,     // fallback chain, sorted by key, add-wins OR-set
+    pub hash: Option<ResourceHash>,                  // resolved content hash (LWW)
+    pub hash_timestamp: TimeStamp,
+}
+
+pub struct SourceKey   { pub priority: Priority, pub peer: PeerId }  // fractional priority + peer tiebreak
+pub struct SourceValue { pub source: serde_json::Value, pub timestamp: TimeStamp }
+```
+
+A node references a resource by `ResourceId`; the entry maps it to a chain of `DataSource`s tried in order (`Embedded` bytes by hash, `FilePath`, `Url`, `Font`) plus the resolved `ResourceHash`. The chain is an **add-wins ordered OR-set**: each entry's `SourceKey` carries a fractional `Priority` so a peer can insert between two sources without renumbering, and concurrent insertions at the same priority converge via the `PeerId` tiebreak. The `hash` is **LWW** (content-derived, so concurrent resolves agree by construction).
+
+Each `DataSource` is stored as `serde_json::Value` rather than a typed enum, with the same motivation as the `Attributes` bucket: type-erasure lets migrations restructure variants without keeping old enum shapes alive. `DataSource` stays typed at the runtime layer; conversion happens at the serialization boundary. Unknown variants are a hard error on load.
+
+**Declarations as resources.** `Implementation::ProtoNode(ResourceId)` references a declaration resource. `from_runtime` serializes each `ProtoNode` (postcard), hashes it, derives the `ResourceId` from that hash (deterministic bootstrap; a future stable well-known-ID table would let the ID denote the function), and registers a `DataSource::Embedded` entry; the bytes go to the caller's byte store. `to_runtime` resolves declarations back via a `Declarations` (`ResourceId → ProtoNode`) map the caller builds from its byte store.
+
+Legacy documents with inline image `TaggedValue`s have those values extracted into resources at load time; new saves never embed inline blobs in `NodeInput::Value`.
 
 ## Migrations
 
@@ -274,7 +297,7 @@ Migrations live in a dedicated crate so they are usable both from the editor and
 - Each nested `NodeNetwork` is assigned a fresh `NetworkId`. Aliasing (multiple nodes referencing the same network) is structurally supported by the storage model — `Implementation::Network(NetworkId)` is a reference — but the converter does not exploit it yet. Aliasing is fixed at the runtime layer first; the converter then preserves sharing without an explicit dedup pass.
 - Non-structural `DocumentNode` fields (`call_argument`, `context_features`, `visible`, `skip_deduplication`, ...) become entries in the node's `attributes`. UI metadata from `DocumentNodeMetadata` (positions, display names, locked, pinned, ...) flows through the same bucket under `ui::*` keys.
 
-`to_runtime` is the inverse: rebuild local IDs from the stashed attribute, restore typed fields from attribute values, follow `Implementation::Network` references to recursively materialize nested networks.
+`to_runtime` is the inverse: rebuild local IDs from the stashed attribute, restore typed fields from attribute values, follow `Implementation::Network` references to recursively materialize nested networks, and resolve `Implementation::ProtoNode(ResourceId)` against a `Declarations` map (`ResourceId → ProtoNode`) the caller supplies from its byte store. Since `graph-storage` is byte-unaware, `to_runtime` takes the resolved declarations as a parameter rather than reaching for bytes itself.
 
 ## Slots — inputs and exports
 
@@ -293,6 +316,7 @@ For the full design and per-op derivation, see the [CmRDT design doc](../../note
 - **Causal delivery.** `apply_delta` requires every entry in `delta.parents` is already in local history. The storage layer does not buffer; out-of-order delivery is a transport concern. New peers initialize via snapshot transfer (`Registry` + history) before streaming deltas.
 - **Removal.** Physical, no tombstones. If a later op targets an absent node or network, the receiver replays the most recent `AddNode` / network creation from history before applying. `RemoveNetwork` carries `snapshot: Network` so its reverse and resurrection don't require re-walking history. Removal is therefore non-durable under concurrent edits: any concurrent reference to a removed node revives it.
 - **LWW primitives.** Per-input (`InputSlot.timestamp`), per-export-slot (`ExportSlot.timestamp`), per-attribute-value (the `TimeStamp` in `Attributes`), and whole-list for `SetExportedNodes` via a sidecar timestamp in `Registry.attributes` under `library::exported_nodes_ts`. The timestamp driving every LWW arm comes from the wrapping `Delta`; `AttributeDelta` carries `value: Option<_>` so a single shape covers both `Set` (`Some`) and `Remove` (`None`) and `Set` vs. `Remove` has a defined winner.
+- **Resources.** A resource's `hash` is LWW (content-derived, so concurrent resolves agree). Its source chain is an add-wins ordered OR-set keyed by `SourceKey` (fractional priority + peer tiebreak): concurrent `AddSource`s at distinct keys all survive; a re-add at the same key is LWW. Whole-resource `AddResource`/`RemoveResource` mirror the node/network add-remove pairs (`RemoveResource` snapshots the entry for O(1) reverse).
 
 The CRDT does not mask graph-shape conflicts. Concurrent same-slot `SetExport`s with different targets resolve by LWW, but the resulting wiring may be wrong; downstream consumers see it as a compile or wiring error.
 
@@ -307,7 +331,7 @@ The CRDT does not mask graph-shape conflicts. Concurrent same-slot `SetExport`s 
 # Drawbacks
 
 - **Diffing two full `Registry`s on every autosave is O(N) in document size.** The interim cost of treating storage as a serialization layer derived from the runtime; currently triggered at autosave boundaries (`commit_storage_snapshot`) rather than per gesture, and addressed long-term by computing deltas directly on runtime mutations.
-- **Attributes as `serde_json::Value` carry per-value overhead.** Mitigable with postcard encoding or a typed fast path for hot keys without changing the design.
+- **Attributes as `serde_json::Value` carry per-value overhead.** Mitigable with a typed fast path for hot keys without changing the design. They also force a self-describing codec, ruling out the most compact binary formats.
 - **Single global format version is a sharp edge** when libraries diverge: a breaking change in one library bumps the version for documents that don't use it.
 - **`RemoveNode` is non-durable under concurrency.** Any concurrent reference to a removed node revives it from history.
 
@@ -324,6 +348,10 @@ The CRDT does not mask graph-shape conflicts. Concurrent same-slot `SetExport`s 
 **Flat node storage vs. nested networks.** All CRDT ops target nodes via a single uniform `NodeId` address space regardless of nesting depth. A nested representation would require ops to carry a path, complicating commutativity.
 
 **`.gdd` vs. reusing `.graphite`.** A distinct extension makes migration unambiguous and prevents older Graphite versions from trying to open a new-format file.
+
+**MessagePack vs. postcard for the binary codec.** Deltas and the registry carry type-erased `serde_json::Value` bodies; a non-self-describing format (postcard) can't deserialize them. MessagePack is self-describing at a few percent size cost. Postcard is retained (not folded into MessagePack despite the extra dependency) for hash preimages (`NodeId`, `Rev`, node-path hashes) and content-addressed blobs (`ProtoNode` declarations, value payloads), which feed `blake3` and so need a canonical encoding: one deterministic byte form per value, forever. MessagePack is self-describing and has multiple valid encodings per value, so the same content would not hash stably — the opposite of what these sites need.
+
+**Source chain as a sorted `Vec` vs. `BTreeMap`.** `SourceKey` is a struct, so a `BTreeMap`-keyed chain can't serialize to JSON (string keys only). A sorted `Vec` of pairs keeps the same ordering and add-wins semantics losslessly across every codec.
 
 # Future possibilities
 

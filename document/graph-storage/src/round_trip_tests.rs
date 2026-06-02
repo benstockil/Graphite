@@ -191,7 +191,7 @@ fn test_registry_structure() {
 	let (registry, _declarations) = to_registry(&network);
 
 	assert!(registry.resources.len() >= 2, "Should have proto-node declaration resources");
-	assert!(registry.networks.len() >= 1, "Should have at least one network");
+	assert!(!registry.networks.is_empty(), "Should have at least one network");
 
 	let root_network = registry.networks.get(&crate::ROOT_NETWORK).expect("Root network should exist");
 	assert_eq!(root_network.exports.len(), network.exports.len(), "Export count should match");
@@ -226,8 +226,10 @@ fn test_nested_network_flattening() {
 #[test]
 fn test_metadata_preservation() {
 	// Create a network with nodes that have non-default metadata
-	let mut context_features = ContextDependencies::default();
-	context_features.extract = core_types::context::ContextFeatures::FOOTPRINT | core_types::context::ContextFeatures::REAL_TIME;
+	let context_features = ContextDependencies {
+		extract: core_types::context::ContextFeatures::FOOTPRINT | core_types::context::ContextFeatures::REAL_TIME,
+		..Default::default()
+	};
 
 	let network = NodeNetwork {
 		exports: vec![NodeInput::node(NodeId(1), 0)],
@@ -238,7 +240,7 @@ fn test_metadata_preservation() {
 					inputs: vec![NodeInput::import(concrete!(f64), 0), NodeInput::import(Type::Generic(Cow::Borrowed("T")), 1)],
 					implementation: DocumentNodeImplementation::ProtoNode(ProtoNodeIdentifier::new("test::NodeWithMetadata")),
 					call_argument: concrete!(String),
-					context_features: context_features.clone(),
+					context_features,
 					visible: false,           // Non-default value
 					skip_deduplication: true, // Non-default value
 					..Default::default()
@@ -510,12 +512,12 @@ fn resources_round_trip_through_from_runtime() {
 	assert_eq!(entry.hash, Some(hash), "resolved hash carried through");
 	assert_eq!(entry.sources.len(), 2, "both sources carried through");
 
-	// BTreeMap iterates in priority (chain) order; decode bodies back to DataSource to compare.
-	let decoded: Vec<DataSource> = entry.sources.values().map(|v| serde_json::from_value(v.source.clone()).expect("source body decodes")).collect();
+	// The chain iterates in priority order; decode bodies back to DataSource to compare.
+	let decoded: Vec<DataSource> = entry.sources.iter().map(|(_, v)| serde_json::from_value(v.source.clone()).expect("source body decodes")).collect();
 	assert_eq!(decoded, vec![DataSource::Embedded, DataSource::Url("https://example.com/img.png".parse().unwrap())]);
 
 	// All source keys carry the document peer.
-	assert!(entry.sources.keys().all(|key| key.peer == PeerId(7)), "source keys scoped to the document peer");
+	assert!(entry.sources.iter().all(|(key, _)| key.peer == PeerId(7)), "source keys scoped to the document peer");
 }
 
 /// Full resource round-trip: a runtime `ResourceRegistry` converted into storage and back is equal

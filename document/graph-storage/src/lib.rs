@@ -1,5 +1,4 @@
 #![expect(unused, reason = "WIP: the Document API surface is still being wired in")]
-use std::collections::BTreeMap;
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 pub use graphene_resource::{ResourceHash, ResourceId};
@@ -172,10 +171,7 @@ fn resources_value_equal(a: &ResourceStore, b: &ResourceStore) -> bool {
 		b.get(id).is_some_and(|other| {
 			entry.hash == other.hash
 				&& entry.sources.len() == other.sources.len()
-				&& entry
-					.sources
-					.iter()
-					.all(|(key, value)| other.sources.get(key).is_some_and(|other_value| value.source == other_value.source))
+				&& entry.sources.iter().all(|(key, value)| other.source(key).is_some_and(|other_value| value.source == other_value.source))
 		})
 	})
 }
@@ -298,16 +294,46 @@ impl Session {
 	/// a commit). Returns the new `Rev`s in commit order (empty if nothing changed) plus the
 	/// proto-node declaration bytes the conversion extracted, keyed by content hash, for the caller
 	/// to persist into its byte store (`graph-storage` itself is byte-unaware).
-	pub fn commit_from_runtime<M: NodeMetadataSource>(
+	///
+	/// Stages the diff as hot ops rather than retired deltas: each op is applied to the registry and
+	/// pushed onto the hot log. The caller persists the returned hot frames and then calls `retire`
+	/// to promote them into durable history. This routes autosave through the same hot-op pipeline
+	/// collaboration will use, so the whole path is exercised before any transport lands.
+	pub fn stage_from_runtime<M: NodeMetadataSource>(
 		&mut self,
 		network: &graph_craft::document::NodeNetwork,
 		metadata: &M,
 		resources: &graphene_resource::ResourceRegistry,
-	) -> Result<(Vec<Rev>, HashMap<ResourceHash, Vec<u8>>), CommitError> {
+	) -> Result<(Vec<HotOp>, from_runtime::DeclarationBytes), CommitError> {
 		let conversion = Registry::convert_from_runtime(network, metadata, resources, self.document.peer)?;
 		let ops = crate::delta::compute_deltas(&self.document.registry, &conversion.registry);
-		let revs = self.commit_ops(ops, false)?;
-		Ok((revs, conversion.declaration_bytes))
+		let hot_ops = self.stage_ops(ops)?;
+		Ok((hot_ops, conversion.declaration_bytes))
+	}
+
+	/// Register a content-addressed resource as a single `DataSource::Embedded` source resolved to
+	/// `hash`, staged as one `AddResource` hot op. The caller owns `id` allocation, persists the
+	/// returned hot frame, retires, and persists the bytes into its byte store separately.
+	pub fn stage_embedded_resource(&mut self, id: ResourceId, hash: ResourceHash) -> Result<Vec<HotOp>, CrdtError> {
+		let entry = ResourceEntry::embedded(hash, self.document.peer, self.document.clock.tick());
+		self.stage_ops([RegistryDelta::AddResource { id, entry }])
+	}
+
+	/// Apply each op as a hot op with a freshly-ticked timestamp, returning the staged frames in
+	/// order. Each tick is strictly later than the last, so the final frame carries the latest
+	/// timestamp, which is what the caller passes to `retire`.
+	fn stage_ops(&mut self, ops: impl IntoIterator<Item = RegistryDelta>) -> Result<Vec<HotOp>, CrdtError> {
+		let mut staged = Vec::new();
+		for op in ops {
+			let hot_op = HotOp {
+				op,
+				timestamp: self.document.clock.tick(),
+				author: self.document.peer,
+			};
+			self.document.apply_hot_op(hot_op.clone())?;
+			staged.push(hot_op);
+		}
+		Ok(staged)
 	}
 
 	/// Wrap each op as a `Delta`, apply it, and chain it onto the local history. One tick per op.
@@ -632,9 +658,56 @@ pub struct SourceValue {
 /// resource agree by construction, since the hash is content-derived).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceEntry {
-	pub sources: BTreeMap<SourceKey, SourceValue>,
+	/// Fallback chain kept sorted by `SourceKey`, so iteration yields highest-priority first.
+	pub sources: Vec<(SourceKey, SourceValue)>,
 	pub hash: Option<ResourceHash>,
 	pub hash_timestamp: TimeStamp,
+}
+
+impl ResourceEntry {
+	/// A resource backed by a single `DataSource::Embedded` fallback resolved to `hash`. Both the
+	/// source entry and the resolved hash carry `timestamp` so later LWW writes order against it.
+	/// The bytes themselves are persisted separately by the caller's byte store.
+	pub fn embedded(hash: ResourceHash, peer: PeerId, timestamp: TimeStamp) -> Self {
+		let embedded = serde_json::to_value(graphene_resource::DataSource::Embedded).expect("DataSource::Embedded serializes");
+		let sources = vec![(SourceKey { priority: Priority(0.), peer }, SourceValue { source: embedded, timestamp })];
+
+		Self {
+			sources,
+			hash: Some(hash),
+			hash_timestamp: timestamp,
+		}
+	}
+
+	/// The source body and timestamp stored under `key`, if any.
+	pub fn source(&self, key: &SourceKey) -> Option<&SourceValue> {
+		self.sources.binary_search_by(|(candidate, _)| candidate.cmp(key)).ok().map(|index| &self.sources[index].1)
+	}
+
+	/// Insert or LWW-overwrite the entry at `key`. A re-set at an existing key wins only if `value`'s
+	/// timestamp is strictly newer; a fresh key is inserted in sorted position.
+	pub fn set_source(&mut self, key: SourceKey, value: SourceValue) {
+		match self.sources.binary_search_by(|(candidate, _)| candidate.cmp(&key)) {
+			Ok(index) => {
+				if value.timestamp > self.sources[index].1.timestamp {
+					self.sources[index].1 = value;
+				}
+			}
+			Err(index) => self.sources.insert(index, (key, value)),
+		}
+	}
+
+	/// Remove the entry at `key` if its timestamp is strictly older than `timestamp` (LWW). Returns
+	/// whether anything was removed.
+	pub fn remove_source(&mut self, key: &SourceKey, timestamp: TimeStamp) -> bool {
+		match self.sources.binary_search_by(|(candidate, _)| candidate.cmp(key)) {
+			Ok(index) if timestamp > self.sources[index].1.timestamp => {
+				self.sources.remove(index);
+				true
+			}
+			_ => false,
+		}
+	}
 }
 
 /// All resources referenced by the document, keyed by stable per-document [`ResourceId`]. Replicates
@@ -1098,23 +1171,11 @@ impl Document {
 			}
 			RegistryDelta::AddSource { id, key, source } => {
 				let entry = self.registry.resources.entry(id).or_default();
-				match entry.sources.entry(key) {
-					std::collections::btree_map::Entry::Occupied(mut occupied) => {
-						if timestamp > occupied.get().timestamp {
-							occupied.insert(SourceValue { source, timestamp });
-						}
-					}
-					std::collections::btree_map::Entry::Vacant(vacant) => {
-						vacant.insert(SourceValue { source, timestamp });
-					}
-				}
+				entry.set_source(key, SourceValue { source, timestamp });
 			}
 			RegistryDelta::RemoveSource { id, key } => {
 				if let Some(entry) = self.registry.resources.get_mut(&id) {
-					let should_remove = entry.sources.get(&key).is_some_and(|existing| timestamp > existing.timestamp);
-					if should_remove {
-						entry.sources.remove(&key);
-					}
+					entry.remove_source(&key, timestamp);
 				}
 			}
 			RegistryDelta::AddResource { id, entry } => {
@@ -1197,7 +1258,7 @@ impl Document {
 				id,
 				hash: self.registry.resources.get(&id).and_then(|entry| entry.hash),
 			},
-			&RegistryDelta::AddSource { id, key, .. } => match self.registry.resources.get(&id).and_then(|entry| entry.sources.get(&key)) {
+			&RegistryDelta::AddSource { id, key, .. } => match self.registry.resources.get(&id).and_then(|entry| entry.source(&key)) {
 				// The slot already held a source: undo restores it.
 				Some(existing) => RegistryDelta::AddSource {
 					id,
@@ -1207,7 +1268,7 @@ impl Document {
 				// The slot was empty: undo removes what this op added.
 				None => RegistryDelta::RemoveSource { id, key },
 			},
-			&RegistryDelta::RemoveSource { id, key } => match self.registry.resources.get(&id).and_then(|entry| entry.sources.get(&key)) {
+			&RegistryDelta::RemoveSource { id, key } => match self.registry.resources.get(&id).and_then(|entry| entry.source(&key)) {
 				Some(existing) => RegistryDelta::AddSource {
 					id,
 					key,

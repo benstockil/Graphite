@@ -14,6 +14,7 @@ graphene-resource = { workspace = true }
 core-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rmp-serde = { workspace = true }
 postcard = { version = "1.0", features = ["use-std"] }
 futures = { workspace = true }
 chrono = { workspace = true }

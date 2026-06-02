@@ -12,8 +12,7 @@ use serde::Serialize;
 use crate::attr::*;
 use crate::metadata_source::{NoMetadata, NodeMetadataSource};
 use crate::{
-	AttributesExt, ExportSlot, Implementation, InputSlot, Network, NetworkId, Node, NodeId, NodeInput, PeerId, Position, ProtoNode, ROOT_NETWORK, Registry, ResourceHash, ResourceId, SourceKey,
-	SourceValue, TimeStamp,
+	AttributesExt, ExportSlot, Implementation, InputSlot, Network, NetworkId, Node, NodeId, NodeInput, PeerId, Position, ProtoNode, ROOT_NETWORK, Registry, ResourceHash, ResourceId, TimeStamp,
 };
 
 fn map_serialization_error(key: &str) -> impl FnOnce(serde_json::Error) -> ConversionError + '_ {
@@ -74,13 +73,17 @@ impl TryFrom<&NodeNetwork> for Registry {
 	}
 }
 
+/// Proto-node declaration bytes extracted during conversion, keyed by content hash, for the caller
+/// to persist into its byte store.
+pub type DeclarationBytes = HashMap<ResourceHash, Vec<u8>>;
+
 /// A `from_runtime` conversion result: the reference-only [`Registry`] plus the proto-node
 /// declaration *bytes* it extracted, keyed by content hash. `graph-storage` doesn't own a byte
 /// store, so the caller (the `Gdd`) persists these into its content store; the registry only holds
 /// the `ResourceId`/`ResourceHash` references.
 pub struct RuntimeConversion {
 	pub registry: Registry,
-	pub declaration_bytes: HashMap<ResourceHash, Vec<u8>>,
+	pub declaration_bytes: DeclarationBytes,
 }
 
 impl RuntimeConversion {
@@ -153,7 +156,7 @@ fn convert_resources(resources: &graphene_resource::ResourceRegistry, peer: Peer
 				peer,
 			};
 			let body = serde_json::to_value(source).map_err(|error| ConversionError::SerializationError(error.to_string()))?;
-			entry.sources.insert(
+			entry.set_source(
 				key,
 				crate::SourceValue {
 					source: body,
@@ -170,20 +173,7 @@ fn convert_resources(resources: &graphene_resource::ResourceRegistry, peer: Peer
 /// Register a proto-node declaration as a content-addressed resource: a single `DataSource::Embedded`
 /// source resolved to `hash`. The bytes themselves are persisted by the caller's byte store.
 fn register_declaration_resource(registry: &mut Registry, id: ResourceId, hash: ResourceHash, peer: PeerId) {
-	let mut entry = crate::ResourceEntry {
-		hash: Some(hash),
-		hash_timestamp: TimeStamp::ORIGIN,
-		..Default::default()
-	};
-	let embedded = serde_json::to_value(graphene_resource::DataSource::Embedded).expect("DataSource::Embedded serializes");
-	entry.sources.insert(
-		SourceKey { priority: crate::Priority(0.), peer },
-		SourceValue {
-			source: embedded,
-			timestamp: TimeStamp::ORIGIN,
-		},
-	);
-	registry.resources.insert(id, entry);
+	registry.resources.insert(id, crate::ResourceEntry::embedded(hash, peer, TimeStamp::ORIGIN));
 }
 
 struct ConversionContext<'m, M: NodeMetadataSource + ?Sized> {
@@ -193,7 +183,7 @@ struct ConversionContext<'m, M: NodeMetadataSource + ?Sized> {
 	/// skips the work.)
 	declaration_ids: HashMap<String, ResourceId>,
 	/// Extracted declaration content keyed by hash, handed back for the caller's byte store.
-	declaration_bytes: HashMap<ResourceHash, Vec<u8>>,
+	declaration_bytes: DeclarationBytes,
 	metadata: &'m M,
 	peer: PeerId,
 }
@@ -211,7 +201,14 @@ fn convert_network<M: NodeMetadataSource + ?Sized>(
 		let node_path = child_path(parent_path, network_id, local_id);
 		let global_id = node_path.to_global_id(ctx.peer);
 
-		let mut node = convert_node(doc_node, local_id, network_id, parent_path, metadata_path, *runtime_node_id, registry, ctx)?;
+		let location = NodeLocation {
+			local_id,
+			network_id,
+			parent_path,
+			metadata_path,
+			runtime_node_id: *runtime_node_id,
+		};
+		let mut node = convert_node(doc_node, location, registry, ctx)?;
 		node.attributes.set(ORIGINAL_NODE_ID, serde_json::json!(local_id), TimeStamp::ORIGIN);
 		registry.node_instances.insert(global_id, node);
 	}
@@ -242,17 +239,26 @@ fn child_path(parent_path: Option<&NodePath>, network_id: NetworkId, local_id: N
 	}
 }
 
-/// `metadata_path` is the chain of runtime IDs from the root down to (but not including) this node.
-fn convert_node<M: NodeMetadataSource + ?Sized>(
-	doc_node: &DocumentNode,
+/// Where a node sits in both the storage tree (`local_id`, `network_id`, `parent_path`) and the
+/// runtime tree (`metadata_path`, `runtime_node_id`). `metadata_path` is the chain of runtime IDs
+/// from the root down to (but not including) this node.
+struct NodeLocation<'a> {
 	local_id: NodeId,
 	network_id: NetworkId,
-	parent_path: Option<&NodePath>,
-	metadata_path: &[RuntimeNodeId],
+	parent_path: Option<&'a NodePath>,
+	metadata_path: &'a [RuntimeNodeId],
 	runtime_node_id: RuntimeNodeId,
-	registry: &mut Registry,
-	ctx: &mut ConversionContext<'_, M>,
-) -> Result<Node, ConversionError> {
+}
+
+fn convert_node<M: NodeMetadataSource + ?Sized>(doc_node: &DocumentNode, location: NodeLocation<'_>, registry: &mut Registry, ctx: &mut ConversionContext<'_, M>) -> Result<Node, ConversionError> {
+	let NodeLocation {
+		local_id,
+		network_id,
+		parent_path,
+		metadata_path,
+		runtime_node_id,
+	} = location;
+
 	let node_path = child_path(parent_path, network_id, local_id);
 	let timestamp = TimeStamp::ORIGIN;
 

@@ -106,16 +106,16 @@ fn tiny_network() -> NodeNetwork {
 /// ChangeNodeInput / ChangeNodeAttribute ops because self.registry has real timestamps while the
 /// freshly-built `to` registry has TimeStamp::ORIGIN.
 #[test]
-fn commit_from_runtime_is_idempotent_for_unchanged_network() {
+fn stage_from_runtime_is_idempotent_for_unchanged_network() {
 	let mut session = Session::with_peer(PeerId(1));
 	let network = tiny_network();
 
 	let resources = graphene_resource::ResourceRegistry::new();
-	let (first, _) = session.commit_from_runtime(&network, &NoMetadata, &resources).expect("first commit failed");
-	assert!(!first.is_empty(), "first commit should produce at least one delta for the initial network");
+	let (first, _) = session.stage_from_runtime(&network, &NoMetadata, &resources).expect("first stage failed");
+	assert!(!first.is_empty(), "first stage should produce at least one hot op for the initial network");
 
-	let (second, _) = session.commit_from_runtime(&network, &NoMetadata, &resources).expect("second commit failed");
-	assert_eq!(second.len(), 0, "second commit of unchanged network produced {} spurious deltas: {:?}", second.len(), second);
+	let (second, _) = session.stage_from_runtime(&network, &NoMetadata, &resources).expect("second stage failed");
+	assert_eq!(second.len(), 0, "second stage of unchanged network produced {} spurious hot ops: {:?}", second.len(), second);
 }
 
 /// A SetExport against a removed network must restore the network from history rather than error.
@@ -293,8 +293,8 @@ fn concurrent_source_adds_at_distinct_priorities_both_survive() {
 
 	let entry = document.registry.resources.get(&id).expect("resource entry exists");
 	assert_eq!(entry.sources.len(), 2, "both concurrent additions survive");
-	// BTreeMap iteration is in priority order.
-	let bodies: Vec<_> = entry.sources.values().map(|v| v.source.clone()).collect();
+	// The chain iterates in priority order.
+	let bodies: Vec<_> = entry.sources.iter().map(|(_, v)| v.source.clone()).collect();
 	assert_eq!(bodies, vec![serde_json::json!("embedded"), serde_json::json!("url")]);
 }
 
@@ -342,7 +342,7 @@ fn same_source_key_is_last_writer_wins() {
 		.unwrap();
 
 	let entry = document.registry.resources.get(&id).unwrap();
-	assert_eq!(entry.sources.get(&key).unwrap().source, serde_json::json!("new"));
+	assert_eq!(entry.source(&key).unwrap().source, serde_json::json!("new"));
 }
 
 /// SetResourceHash is LWW on the hash; a later resolve wins, an earlier one is ignored.
@@ -390,7 +390,7 @@ fn remove_source_reverse_restores_prior() {
 
 	// Applying the reverse restores the chain.
 	document.apply_op(reverse, ts(6, 1), false).unwrap();
-	assert_eq!(document.registry.resources.get(&id).unwrap().sources.get(&key).unwrap().source, serde_json::json!("kept"));
+	assert_eq!(document.registry.resources.get(&id).unwrap().source(&key).unwrap().source, serde_json::json!("kept"));
 }
 
 /// AddSource on a fresh slot reverses to a RemoveSource; on an occupied slot it restores the prior body.
@@ -440,10 +440,8 @@ fn add_source_reverse_depends_on_prior_state() {
 use crate::{ResourceEntry, ResourceStore, SourceValue};
 
 fn entry_with_source(priority: f64, peer: u64, body: serde_json::Value, hash: Option<ResourceHash>) -> ResourceEntry {
-	let mut sources = std::collections::BTreeMap::new();
-	sources.insert(source_key(priority, peer), SourceValue { source: body, timestamp: ts(1, peer) });
 	ResourceEntry {
-		sources,
+		sources: vec![(source_key(priority, peer), SourceValue { source: body, timestamp: ts(1, peer) })],
 		hash,
 		hash_timestamp: ts(1, peer),
 	}
@@ -465,7 +463,7 @@ fn compute_deltas_ignores_unchanged_resources() {
 	let mut to = ResourceStore::new();
 	let mut to_entry = entry_with_source(0.0, 1, serde_json::json!("embedded"), Some(hash));
 	to_entry.hash_timestamp = ts(99, 2);
-	to_entry.sources.values_mut().for_each(|v| v.timestamp = ts(99, 2));
+	to_entry.sources.iter_mut().for_each(|(_, v)| v.timestamp = ts(99, 2));
 	to.insert(id, to_entry);
 
 	let deltas = crate::delta::compute_deltas(&registry_with_resources(from), &registry_with_resources(to));
@@ -489,7 +487,7 @@ fn compute_deltas_diffs_resources_and_round_trips() {
 	let mut to = ResourceStore::new();
 	// `kept`: hash changes and a second source is added.
 	let mut kept_entry = entry_with_source(0.0, 1, serde_json::json!("embedded"), Some(hash_new));
-	kept_entry.sources.insert(
+	kept_entry.set_source(
 		source_key(1.0, 1),
 		SourceValue {
 			source: serde_json::json!("url"),
