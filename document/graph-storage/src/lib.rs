@@ -342,9 +342,23 @@ impl Session {
 	/// Apply each op as a hot op with a freshly-ticked timestamp, returning the staged frames in
 	/// order. Each tick is strictly later than the last, so the final frame carries the latest
 	/// timestamp, which is what the caller passes to `retire`.
+	///
+	/// The peer's first contribution is preceded by a `RegisterPeer` op, so the device's
+	/// `PeerId → UserId` mapping is established (and, under causal delivery, observed by other peers)
+	/// before any of its edits. A no-op batch doesn't register — registration rides a real edit.
 	fn stage_ops(&mut self, ops: impl IntoIterator<Item = RegistryDelta>) -> Result<Vec<HotOp>, CrdtError> {
-		let mut staged = Vec::new();
-		for op in ops {
+		let mut pending: Vec<RegistryDelta> = ops.into_iter().collect();
+		if pending.is_empty() {
+			return Ok(Vec::new());
+		}
+
+		if !self.document.registry.peer_users.contains_key(&self.document.peer) {
+			let user = UserId(self.document.peer.0);
+			pending.insert(0, RegistryDelta::RegisterPeer { peer: self.document.peer, user });
+		}
+
+		let mut staged = Vec::with_capacity(pending.len());
+		for op in pending {
 			let hot_op = HotOp {
 				op,
 				timestamp: self.document.clock.tick(),

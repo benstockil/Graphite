@@ -505,6 +505,46 @@ fn create_in_records_default_codecs_in_manifest() {
 	});
 }
 
+/// The `RegisterPeer` op auto-emitted on the first commit rides the hot-op pipeline through
+/// persistence and retirement, so the `peer_users` mapping survives a reopen.
+#[test]
+fn first_commit_registers_peer_and_survives_reopen() {
+	use graph_craft::application_io::resource::HashMapResourceStorage;
+	use graph_craft::document::{DocumentNode, DocumentNodeImplementation, NodeInput, NodeNetwork};
+	use graph_craft::{ProtoNodeIdentifier, concrete};
+	use graph_storage::{NoMetadata, UserId};
+	use graphene_resource::ResourceRegistry;
+
+	futures::executor::block_on(async {
+		let mut gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(21), 0xAB, "ed".into(), "std".into())
+			.await
+			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
+
+		let network = NodeNetwork {
+			exports: vec![NodeInput::node(core_types::uuid::NodeId(0), 0)],
+			nodes: [(
+				core_types::uuid::NodeId(0),
+				DocumentNode {
+					inputs: vec![NodeInput::import(concrete!(u32), 0)],
+					implementation: DocumentNodeImplementation::ProtoNode(ProtoNodeIdentifier::new("graphene_core::ops::identity::IdentityNode")),
+					..Default::default()
+				},
+			)]
+			.into_iter()
+			.collect(),
+			..Default::default()
+		};
+
+		gdd.commit_from_runtime(&network, &NoMetadata, &ResourceRegistry::new(), &HashMapResourceStorage::new())
+			.unwrap_or_else(|error| panic!("commit_from_runtime failed: {error:?}"));
+		assert_eq!(gdd.registry().peer_users.get(&PeerId(21)), Some(&UserId(21)), "first commit registers the peer");
+
+		let (working, layout) = gdd.into_storage();
+		let reopened = Gdd::<GddV1>::open_in(working, layout).await.unwrap_or_else(|error| panic!("open_in failed: {error:?}"));
+		assert_eq!(reopened.registry().peer_users.get(&PeerId(21)), Some(&UserId(21)), "registration survives reopen");
+	});
+}
+
 #[test]
 fn persist_path_writes_at_manifest_declared_codec_paths() {
 	// The manifest declares the on-disk codec for each payload; the persist path must write at the

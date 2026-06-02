@@ -152,6 +152,40 @@ fn stage_from_runtime_is_idempotent_for_unchanged_network() {
 	assert_eq!(second.len(), 0, "second stage of unchanged network produced {} spurious hot ops: {:?}", second.len(), second);
 }
 
+/// The peer's first contribution prepends a `RegisterPeer` op (establishing its `UserId` mapping);
+/// later contributions don't re-register, and a no-op batch registers nothing.
+#[test]
+fn first_contribution_registers_the_peer() {
+	let mut session = Session::with_peer(PeerId(7));
+	let resources = graphene_resource::ResourceRegistry::new();
+
+	assert!(session.registry().peer_users.is_empty(), "no registration before any contribution");
+
+	let (first, _) = session.stage_from_runtime(&tiny_network(), &NoMetadata, &resources).expect("first stage failed");
+	let registrations = first.iter().filter(|hot_op| matches!(hot_op.op, RegistryDelta::RegisterPeer { .. })).count();
+	assert_eq!(registrations, 1, "exactly one RegisterPeer on first contribution");
+	assert!(matches!(first[0].op, RegistryDelta::RegisterPeer { .. }), "RegisterPeer must precede the edit ops");
+	assert_eq!(session.registry().peer_users.get(&PeerId(7)), Some(&crate::UserId(7)), "peer mapped to its UserId");
+
+	// A second, distinct contribution must not re-register.
+	let mut other_network = tiny_network();
+	other_network.exports.clear();
+	let (second, _) = session.stage_from_runtime(&other_network, &NoMetadata, &resources).expect("second stage failed");
+	assert!(
+		!second.iter().any(|hot_op| matches!(hot_op.op, RegistryDelta::RegisterPeer { .. })),
+		"already-registered peer must not re-register"
+	);
+
+	// A no-op batch (re-staging an already-converged network) registers nothing on a fresh peer:
+	// registration rides a real edit, never a lone op.
+	let mut fresh = Session::with_peer(PeerId(8));
+	fresh.stage_from_runtime(&tiny_network(), &NoMetadata, &resources).expect("seed stage failed");
+	let peers_before = fresh.registry().peer_users.clone();
+	let (empty, _) = fresh.stage_from_runtime(&tiny_network(), &NoMetadata, &resources).expect("no-op stage failed");
+	assert!(empty.is_empty(), "an unchanged re-stage must produce no hot ops");
+	assert_eq!(fresh.registry().peer_users, peers_before, "a no-op batch must not add a registration");
+}
+
 /// A SetExport against a removed network must restore the network from history rather than error.
 #[test]
 fn set_export_resurrects_absent_network() {
