@@ -422,81 +422,127 @@ impl<L: Layout> Gdd<L> {
 	/// through, then materializes as a folder, zip, or xz archive at `dest`. Does not mutate
 	/// `self` and does not buffer the full export — resources stream end-to-end. Native-only:
 	/// export writes to a filesystem path.
+	///
+	/// `byte_store` is the source for `embed_all_resources`: in the editor the working copy holds no
+	/// resource bytes (they live in the app-global cache), so embedding resolves each registry hash
+	/// through the store. It is unused when `embed_all_resources` is false.
 	#[cfg(not(target_family = "wasm"))]
-	pub async fn export(&self, dest: &Path, format: ExportFormat, options: ExportOptions) -> Result<(), ExportError> {
+	pub async fn export(&self, dest: &Path, format: ExportFormat, options: ExportOptions, byte_store: &dyn LoadResource) -> Result<(), ExportError> {
 		options.validate().map_err(ExportError::InvalidOptions)?;
 
-		let codec = match format {
-			ExportFormat::Folder { codec } | ExportFormat::Zip { codec } | ExportFormat::Xz { codec } => codec,
-		};
-
 		match format {
-			ExportFormat::Folder { .. } => {
+			ExportFormat::Folder => {
 				let mut folder = document_container::backends::folder::FolderBackend::create(dest)?;
 				let mut sink = FolderSink { folder: &mut folder };
-				self.stream_entries(codec, options, &mut sink).await?;
+				self.stream_entries(options, byte_store, &mut sink).await?;
 			}
-			ExportFormat::Zip { .. } => {
+			ExportFormat::Zip => {
 				let file = std::fs::File::create(dest).map_err(document_container::ContainerError::Io)?;
 				let mut writer = document_container::archive::Zip::writer(file)?;
-				self.stream_entries(codec, options, &mut writer).await?;
+				self.stream_entries(options, byte_store, &mut writer).await?;
 				use document_container::archive::ArchiveWriter;
 				writer.finish()?;
 			}
-			ExportFormat::Xz { .. } => {
+			ExportFormat::Xz => {
 				let file = std::fs::File::create(dest).map_err(document_container::ContainerError::Io)?;
 				let mut writer = document_container::archive::Xz::writer(file)?;
-				self.stream_entries(codec, options, &mut writer).await?;
+				self.stream_entries(options, byte_store, &mut writer).await?;
 				use document_container::archive::ArchiveWriter;
 				writer.finish()?;
 			}
 		}
-
-		let _ = options.embed_all_resources; // TODO once resource API lands
 
 		Ok(())
 	}
 
-	/// Drive a sink through manifest → registry → history → resources, re-encoding typed payloads
-	/// with `codec` and passing resources verbatim. Each entry is written one at a time so the
-	/// sink only ever sees one payload's bytes at a time. The exported manifest's codec map is
-	/// rewritten to `codec` so it stays authoritative for the re-encoded payloads; the manifest
-	/// itself is always JSON.
+	/// Drive a sink through manifest → registry → history → resources. Payloads keep the working
+	/// copy's recorded per-payload codecs (no re-encode), so registry stays single-value and history
+	/// stays multi-value without the caller having to keep them coherent. Each entry is written one
+	/// at a time so the sink only ever sees one payload's bytes; the manifest itself is always JSON.
 	#[cfg(not(target_family = "wasm"))]
-	async fn stream_entries(&self, codec: Codec, options: ExportOptions, sink: &mut dyn ExportSink) -> Result<(), ExportError> {
+	async fn stream_entries(&self, options: ExportOptions, byte_store: &dyn LoadResource, sink: &mut dyn ExportSink) -> Result<(), ExportError> {
 		use document_container::AsyncContainer;
 
-		let mut manifest = self.manifest.clone();
-		manifest.codecs = PayloadCodecs {
-			registry: codec,
-			history: codec,
-			hot_log: codec,
-			session: codec,
-		};
-		sink.write_entry(&io::path_for(self.layout.manifest_basename(), MANIFEST_CODEC), &MANIFEST_CODEC.write_single(&manifest)?)?;
+		let codecs = self.manifest.codecs;
+		sink.write_entry(&io::path_for(self.layout.manifest_basename(), MANIFEST_CODEC), &MANIFEST_CODEC.write_single(&self.manifest)?)?;
+
+		// Hashes the working copy already holds on disk; their bytes are copied through verbatim below
+		// and don't need the byte store.
+		let working_copy_hashes: std::collections::HashSet<ResourceHash> = self.resource_hashes().await?.into_iter().collect();
+
+		// Decide which resources travel as bytes. A resource already marked `Embedded` always has its
+		// bytes materialized (in the editor they live in the byte store, not the working copy, so a
+		// plain export must still pull them). `embed_all_resources` additionally promotes link-only
+		// resources (`Url`/`FilePath`/`Font`) by prepending an `Embedded` source for a self-contained
+		// export. Bytes already in the working copy are skipped here; the copy-through pass writes them.
+		let mut export_session = self.session.clone();
+		let mut hashes_from_store: Vec<ResourceHash> = Vec::new();
+		let mut links_to_promote: Vec<graph_storage::ResourceId> = Vec::new();
+		for (id, entry) in &export_session.registry().resources {
+			let Some(hash) = entry.hash else { continue };
+			let embed = entry.has_embedded_source() || options.embed_all_resources;
+			if !embed {
+				continue;
+			}
+			if !entry.has_embedded_source() {
+				links_to_promote.push(*id);
+			}
+			if !working_copy_hashes.contains(&hash) {
+				hashes_from_store.push(hash);
+			}
+		}
+
+		// Load the gap from the byte store (fail fast if an embedded resource is missing), then commit
+		// the link promotions as real `AddSource` deltas on the clone so the exported registry and
+		// history stay consistent. The live `Gdd` is untouched.
+		let mut embedded_bytes: Vec<(ResourceHash, Resource)> = Vec::new();
+		for hash in hashes_from_store {
+			let Some(resource) = byte_store.load(hash).await else {
+				return Err(ExportError::MissingResource(hash));
+			};
+			embedded_bytes.push((hash, resource));
+		}
+		export_session.embed_resource_sources(links_to_promote)?;
 
 		if options.include_registry {
-			let registry: Registry = io::read_single(&self.working, self.layout.registry_basename(), self.manifest.codecs.registry).await?;
-			sink.write_entry(&io::path_for(self.layout.registry_basename(), codec), &codec.write_single(&registry)?)?;
+			sink.write_entry(
+				&io::path_for(self.layout.registry_basename(), codecs.registry),
+				&codecs.registry.write_single(export_session.registry())?,
+			)?;
 		}
 
-		if options.include_history && io::exists(&self.working, self.layout.history_basename(), self.manifest.codecs.history).await {
-			let deltas: Vec<Delta> = io::iter(&self.working, self.layout.history_basename(), self.manifest.codecs.history).await?;
+		if options.include_history {
 			let mut buffer = Vec::new();
-			for delta in &deltas {
-				codec.append(&mut buffer, delta)?;
+			for delta in export_session.history_topological() {
+				codecs.history.append(&mut buffer, delta)?;
 			}
-			sink.write_entry(&io::path_for(self.layout.history_basename(), codec), &buffer)?;
+			if !buffer.is_empty() {
+				sink.write_entry(&io::path_for(self.layout.history_basename(), codecs.history), &buffer)?;
+			}
 		}
 
+		// Copy whatever resource bytes the working copy already holds, tracking which hashes are
+		// covered so the embed pass doesn't re-emit them.
+		let mut emitted = std::collections::HashSet::new();
 		let resources_dir = self.layout.resources_dir();
 		if self.working.list_dirs("").await?.iter().any(|d| d == resources_dir) {
+			let prefix = format!("{resources_dir}/");
 			for path in self.working.list(resources_dir).await? {
+				if let Some(hash) = path.strip_prefix(&prefix).and_then(|name| name.parse::<ResourceHash>().ok()) {
+					emitted.insert(hash);
+				}
 				let holder = self.working.read(&path).await?;
 				match holder.source_path() {
 					Some(src_path) => sink.write_entry_from_path(&path, src_path)?,
 					None => sink.write_entry(&path, holder.as_slice())?,
 				}
+			}
+		}
+
+		// Write the embedded bytes the working copy didn't already hold.
+		for (hash, resource) in &embedded_bytes {
+			if emitted.insert(*hash) {
+				sink.write_entry(&self.layout.resource_path(hash), resource.as_ref())?;
 			}
 		}
 
@@ -672,4 +718,8 @@ pub enum ExportError {
 	Codec(#[from] CodecError),
 	#[error("invalid export options: {0}")]
 	InvalidOptions(&'static str),
+	#[error("embedded resource {0} missing from the byte store")]
+	MissingResource(ResourceHash),
+	#[error("CRDT error: {0}")]
+	Crdt(#[from] CrdtError),
 }

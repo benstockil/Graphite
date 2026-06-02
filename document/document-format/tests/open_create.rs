@@ -7,6 +7,12 @@ fn empty_container() -> AnyContainer {
 	AnyContainer::Memory(MemoryBackend::new())
 }
 
+/// A resource byte store for export calls. Empty unless a test pre-populates it; only consulted when
+/// `embed_all_resources` is set.
+fn empty_byte_store() -> graph_craft::application_io::resource::HashMapResourceStorage {
+	graph_craft::application_io::resource::HashMapResourceStorage::new()
+}
+
 #[test]
 fn create_in_round_trips_empty_document() {
 	futures::executor::block_on(async {
@@ -169,12 +175,12 @@ fn export_folder_round_trips_through_open() {
 		let dir = tempfile::tempdir().unwrap();
 		let dest = dir.path().join("export");
 
-		gdd.export(&dest, ExportFormat::Folder { codec: Codec::Json }, ExportOptions::default())
+		gdd.export(&dest, ExportFormat::Folder, ExportOptions::default(), &empty_byte_store())
 			.await
 			.unwrap_or_else(|error| panic!("export failed: {error:?}"));
 
-		// Manifest re-encoded with the export codec: registry as JSON instead of postcard.
-		assert!(dest.join("registry.json").exists());
+		// Payloads keep the working-copy codecs: registry is MessagePack (`.bin`), manifest is JSON.
+		assert!(dest.join("registry.bin").exists());
 		assert!(dest.join("manifest.json").exists());
 		// session.json + hot-log are peer-local / ephemeral and should not appear in exports.
 		assert!(!dest.join("session.json").exists());
@@ -201,7 +207,7 @@ fn export_zip_round_trips_via_deserialize() {
 		let dir = tempfile::tempdir().unwrap();
 		let dest = dir.path().join("doc.gdd.zip");
 
-		gdd.export(&dest, ExportFormat::Zip { codec: Codec::MessagePack }, ExportOptions::default())
+		gdd.export(&dest, ExportFormat::Zip, ExportOptions::default(), &empty_byte_store())
 			.await
 			.unwrap_or_else(|error| panic!("export failed: {error:?}"));
 
@@ -234,7 +240,7 @@ fn export_rejects_invalid_options() {
 			embed_all_resources: false,
 		};
 
-		match gdd.export(&dest, ExportFormat::Folder { codec: Codec::Json }, options).await {
+		match gdd.export(&dest, ExportFormat::Folder, options, &empty_byte_store()).await {
 			Err(ExportError::InvalidOptions(_)) => {}
 			Ok(_) => panic!("expected InvalidOptions, got Ok"),
 			Err(other) => panic!("expected InvalidOptions, got {other:?}"),
@@ -347,10 +353,121 @@ fn export_carries_resources() {
 
 		let dir = tempfile::tempdir().unwrap();
 		let dest = dir.path().join("export");
-		gdd.export(&dest, ExportFormat::Folder { codec: Codec::Json }, ExportOptions::default()).await.unwrap();
+		gdd.export(&dest, ExportFormat::Folder, ExportOptions::default(), &empty_byte_store()).await.unwrap();
 
 		let resource_file = dest.join("resources").join(format!("{hash}"));
 		assert!(resource_file.exists(), "exported resource file should exist at {resource_file:?}");
+		assert_eq!(std::fs::read(&resource_file).unwrap(), payload);
+	});
+}
+
+/// `embed_all_resources` makes a link-only resource self-contained: the bytes (which live only in
+/// the byte store, not the working copy) are written into the export, the exported registry's chain
+/// gains a leading `Embedded` source ahead of the original `Url`, and the export reopens with both.
+#[test]
+fn embed_all_resources_materializes_link_only_resource() {
+	use document_format::{ExportFormat, ExportOptions};
+	use graph_craft::application_io::resource::ResourceStorage;
+	use graph_craft::document::NodeNetwork;
+	use graph_storage::NoMetadata;
+	use graphene_resource::{DataSource, ResourceHash, ResourceId, ResourceRegistry};
+
+	futures::executor::block_on(async {
+		let mut gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(8), 0xF00D, "ed".into(), "std".into())
+			.await
+			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
+
+		// A resource whose only source is a URL, resolved to a hash. The bytes live solely in the
+		// byte store; the working copy never holds them.
+		let payload = b"bytes behind a url";
+		let hash = ResourceHash::from(&payload[..]);
+		let byte_store = empty_byte_store();
+		byte_store.store(payload);
+
+		let mut resources = ResourceRegistry::new();
+		let id = ResourceId::new();
+		resources.push_source_back(&id, DataSource::Url("https://example.com/r.bin".parse().unwrap()));
+		resources.resolve(&id, hash);
+
+		gdd.commit_from_runtime(&NodeNetwork::default(), &NoMetadata, &resources, &byte_store)
+			.unwrap_or_else(|error| panic!("commit_from_runtime failed: {error:?}"));
+
+		// The working copy holds no resource bytes (URL source, nothing embedded yet).
+		assert!(!gdd.has_resource(&hash).await);
+
+		let dir = tempfile::tempdir().unwrap();
+		let dest = dir.path().join("embedded");
+		gdd.export(
+			&dest,
+			ExportFormat::Folder,
+			ExportOptions {
+				embed_all_resources: true,
+				..Default::default()
+			},
+			&byte_store,
+		)
+		.await
+		.unwrap_or_else(|error| panic!("export failed: {error:?}"));
+
+		// Bytes materialized into the export.
+		let resource_file = dest.join("resources").join(format!("{hash}"));
+		assert!(resource_file.exists(), "embedded resource bytes should be written to {resource_file:?}");
+		assert_eq!(std::fs::read(&resource_file).unwrap(), payload);
+
+		// Reopen the export: the registry chain now leads with Embedded, keeping the URL as fallback,
+		// and the bytes are resolvable from the export itself with no byte store.
+		let reopened = Gdd::<GddV1>::open(&dest).await.unwrap_or_else(|error| panic!("open export failed: {error:?}"));
+		assert!(reopened.has_resource(&hash).await, "embedded bytes should be resolvable from the export");
+
+		let entry = reopened.registry().resources.get(&id).expect("resource entry survived export");
+		assert_eq!(entry.hash, Some(hash));
+		let embedded = serde_json::to_value(DataSource::Embedded).unwrap();
+		let url = serde_json::to_value(DataSource::Url("https://example.com/r.bin".parse().unwrap())).unwrap();
+		let chain: Vec<_> = entry.sources.iter().map(|(_, value)| value.source.clone()).collect();
+		assert_eq!(chain, vec![embedded, url], "Embedded leads the chain, URL kept as fallback");
+	});
+}
+
+/// A plain export (no `embed_all_resources`) still materializes the bytes of an already-`Embedded`
+/// resource, pulling from the byte store when the working copy doesn't hold them (the editor case
+/// where bytes live in the app-global cache, not the per-document working copy).
+#[test]
+fn export_materializes_embedded_resource_from_byte_store() {
+	use document_format::{ExportFormat, ExportOptions};
+	use graph_craft::application_io::resource::ResourceStorage;
+	use graph_craft::document::NodeNetwork;
+	use graph_storage::NoMetadata;
+	use graphene_resource::{DataSource, ResourceHash, ResourceId, ResourceRegistry};
+
+	futures::executor::block_on(async {
+		let mut gdd = Gdd::<GddV1>::create_in(empty_container(), GddV1, PeerId(9), 0xBEEF, "ed".into(), "std".into())
+			.await
+			.unwrap_or_else(|error| panic!("create_in failed: {error:?}"));
+
+		// An Embedded resource whose bytes live only in the byte store, not the working copy.
+		let payload = b"embedded bytes in the cache";
+		let hash = ResourceHash::from(&payload[..]);
+		let byte_store = empty_byte_store();
+		byte_store.store(payload);
+
+		let mut resources = ResourceRegistry::new();
+		let id = ResourceId::new();
+		resources.push_source_back(&id, DataSource::Embedded);
+		resources.resolve(&id, hash);
+		gdd.commit_from_runtime(&NodeNetwork::default(), &NoMetadata, &resources, &byte_store)
+			.unwrap_or_else(|error| panic!("commit_from_runtime failed: {error:?}"));
+
+		assert!(!gdd.has_resource(&hash).await, "bytes should not be in the working copy");
+
+		let dir = tempfile::tempdir().unwrap();
+		let dest = dir.path().join("plain");
+		// Default options: embed_all_resources is false.
+		gdd.export(&dest, ExportFormat::Folder, ExportOptions::default(), &byte_store)
+			.await
+			.unwrap_or_else(|error| panic!("export failed: {error:?}"));
+
+		let resource_file = dest.join("resources").join(format!("{hash}"));
+		assert!(resource_file.exists(), "embedded resource bytes should be pulled from the store into {resource_file:?}");
 		assert_eq!(std::fs::read(&resource_file).unwrap(), payload);
 	});
 }

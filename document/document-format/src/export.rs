@@ -1,16 +1,16 @@
 //! Export options. Walking the working copy through an archive codec / re-encoding payloads.
 //! Implementation lives on [`crate::Gdd::export`].
 
-use crate::codec::Codec;
-
+/// Export wrapping. Payloads keep the working copy's recorded per-payload codecs (see
+/// [`crate::manifest::PayloadCodecs`]); export does not re-encode.
 #[derive(Copy, Clone, Debug)]
 pub enum ExportFormat {
-	/// Copy the working copy to a destination folder, optionally re-encoding payloads.
-	Folder { codec: Codec },
+	/// Copy the working copy to a destination folder.
+	Folder,
 	/// Wrap as a `.gdd.zip` archive (deflate, pure-Rust `zip` crate).
-	Zip { codec: Codec },
+	Zip,
 	/// Wrap as a `.gdd.xz` archive (whole-archive xz via `lzma-rust2`).
-	Xz { codec: Codec },
+	Xz,
 }
 
 #[derive(Copy, Clone, Debug)]

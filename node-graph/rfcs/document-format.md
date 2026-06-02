@@ -219,7 +219,7 @@ The two concerns live in downstream crates: `gdd-container` defines the `Contain
             ┌───────────────┐  ┌──────────────────────────────┐
             │ graph-storage │  │ gdd-format                   │
             │ (disk-unaware)│◀─│  Gdd handle, Layout, codec,  │
-            └───────────────┘  │  SaveOptions                 │
+            └───────────────┘  │  ExportOptions               │
                                └──────────────────────────────┘
                                               │
                                               ▼
@@ -236,7 +236,7 @@ Arrows are "depends on": the editor uses `Session` from `graph-storage` at runti
 A document contains:
 
 - `manifest.json` — always JSON, the bootstrap file. Carries the magic identifier `"gdd"`, a single `u32` `format_version`, a stable `document_uuid`, the saving session's `PeerId`, editor and stdlib versions, an optional save timestamp, and a record of which payloads this save included (registry / history / embedded resources).
-- `document.{json,bin}` — the serialized `Registry`. Codec chosen per-save: JSON for inspectable, MessagePack for compact (binary must be self-describing; see the codec rationale).
+- `document.{json,bin}` — the serialized `Registry`. The codec is fixed per payload and recorded in the manifest (JSON for inspectable, MessagePack for compact; binary must be self-describing — see the codec rationale). Export reuses the working copy's recorded codecs rather than re-encoding.
 - `history.{jsonl,frames}` — the serialized delta DAG, appended a record at a time. JSON history is line-oriented (one delta per line); binary history is length-prefixed MessagePack frames, the prefix guarding against a torn final frame from a crash.
 - `resources/<hash>` — embedded resource bytes, keyed by `ResourceHash`.
 
@@ -252,9 +252,9 @@ The folder backend stores these as plain files on disk; an archive codec packs t
                 └── 2c91...
 ```
 
-The `Gdd` handle owns the loaded bytes and exposes them as zero-copy slices. On the folder backend, reads are direct mmap references; loading from an archive decompresses once on open into an in-memory backend. Writes mutate the handle in place; `save()` / `save_as()` persists to a chosen backend, optionally through an archive codec.
+The `Gdd` handle owns the loaded bytes and exposes them as zero-copy slices. On the folder backend, reads are direct mmap references; loading from an archive decompresses once on open into an in-memory backend. The working copy is mutated continuously (autosave); `export(dest, format, options, byte_store)` produces a separate artifact through an `ExportFormat` (`Folder`/`Zip`/`Xz`) without mutating the handle.
 
-A `SaveOptions` struct controls scope per-save: `include_registry` (skip = rebuild from history on load), `include_history` (skip = state-only snapshot), `embed_all_resources` (materialize every linked-file resource into the container for a portable file, without mutating the in-memory state), and `codec`. These compose freely except that `include_registry: false && include_history: false` is rejected.
+`ExportOptions` controls scope: `include_registry` (skip = rebuild from history on load), `include_history` (skip = state-only snapshot), and `embed_all_resources`. These compose freely except that `include_registry: false && include_history: false` is rejected. The `byte_store` resolves resource bytes the working copy doesn't physically hold (in the editor they live in the app-global cache). `Embedded`-sourced resources are always materialized into the export's `resources/`; `embed_all_resources` additionally promotes link-only resources (`Url`/`FilePath`/`Font`) by prepending an `Embedded` source. That promotion is committed as real `AddSource` deltas on a throwaway session clone so the exported registry and history stay consistent; history is serialized in deterministic topological order, so identical delta sets export byte-identically.
 
 ## Resources
 

@@ -46,8 +46,8 @@ impl Registry {
 	}
 
 	/// Rebuild the runtime [`ResourceRegistry`](graphene_resource::ResourceRegistry) from the stored
-	/// `resources`. Each entry's source chain is restored in priority order (the `BTreeMap` already
-	/// iterates sorted) with bodies decoded from their type-erased `serde_json::Value` form back to
+	/// `resources`. Each entry's source chain is restored in priority order (the chain is kept
+	/// sorted by key) with bodies decoded from their type-erased `serde_json::Value` form back to
 	/// `DataSource`; the resolved hash, if any, is restored last. Inverse of `convert_resources` in
 	/// `from_runtime`.
 	pub fn to_resource_registry(&self) -> Result<graphene_resource::ResourceRegistry, ConversionError> {

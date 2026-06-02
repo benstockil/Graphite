@@ -319,6 +319,26 @@ impl Session {
 		self.stage_ops([RegistryDelta::AddResource { id, entry }])
 	}
 
+	/// Commit an `AddSource(Embedded)` retired delta for each given resource, making it the highest-
+	/// precedence fallback. Skips resources that already have an `Embedded` source or no longer exist.
+	/// Used on a throwaway session clone at export time so the exported registry and history agree;
+	/// callers must guarantee the bytes are available in the export's resource store.
+	pub fn embed_resource_sources(&mut self, ids: impl IntoIterator<Item = ResourceId>) -> Result<Vec<Rev>, CrdtError> {
+		let embedded = serde_json::to_value(graphene_resource::DataSource::Embedded).expect("DataSource::Embedded serializes");
+
+		let mut ops = Vec::new();
+		for id in ids {
+			let Some(entry) = self.document.registry.resources.get(&id) else { continue };
+			if entry.has_embedded_source() {
+				continue;
+			}
+			let key = entry.highest_precedence_key(self.document.peer);
+			ops.push(RegistryDelta::AddSource { id, key, source: embedded.clone() });
+		}
+
+		self.commit_ops(ops, false)
+	}
+
 	/// Apply each op as a hot op with a freshly-ticked timestamp, returning the staged frames in
 	/// order. Each tick is strictly later than the last, so the final frame carries the latest
 	/// timestamp, which is what the caller passes to `retire`.
@@ -444,6 +464,45 @@ impl Session {
 
 	pub fn history(&self) -> impl Iterator<Item = &Delta> + '_ {
 		self.document.history.values()
+	}
+
+	/// History in deterministic causal order: a topological sort (Kahn's algorithm) with ties among
+	/// ready deltas broken by `Rev`. Every parent precedes its children, so the result is a valid
+	/// replay order; the order is a pure function of the delta set, so two peers holding the same
+	/// history serialize byte-identical output. Parents outside this history (already-known ancestors)
+	/// don't gate emission. O(V + E) in deltas and parent edges.
+	pub fn history_topological(&self) -> Vec<&Delta> {
+		let history = &self.document.history;
+
+		// Unsatisfied in-history parent count per delta, plus reverse edges to decrement as parents emit.
+		let mut pending_parents: HashMap<Rev, usize> = HashMap::with_capacity(history.len());
+		let mut children: HashMap<Rev, Vec<Rev>> = HashMap::new();
+		for (rev, delta) in history {
+			let in_history_parents = delta.parents.iter().filter(|parent| history.contains_key(parent)).count();
+			pending_parents.insert(*rev, in_history_parents);
+			for parent in &delta.parents {
+				if history.contains_key(parent) {
+					children.entry(*parent).or_default().push(*rev);
+				}
+			}
+		}
+
+		// Ready set as a min-heap on `Rev` (via `Reverse`) so ties resolve deterministically.
+		let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<Rev>> = pending_parents.iter().filter(|(_, count)| **count == 0).map(|(rev, _)| std::cmp::Reverse(*rev)).collect();
+
+		let mut ordered = Vec::with_capacity(history.len());
+		while let Some(std::cmp::Reverse(rev)) = ready.pop() {
+			ordered.push(&history[&rev]);
+			for child in children.get(&rev).into_iter().flatten() {
+				let count = pending_parents.get_mut(child).expect("child is in history");
+				*count -= 1;
+				if *count == 0 {
+					ready.push(std::cmp::Reverse(*child));
+				}
+			}
+		}
+
+		ordered
 	}
 
 	pub fn hot_log(&self) -> &[HotOp] {
@@ -706,6 +765,22 @@ impl ResourceEntry {
 				true
 			}
 			_ => false,
+		}
+	}
+
+	/// True if the chain already carries a `DataSource::Embedded` source.
+	pub fn has_embedded_source(&self) -> bool {
+		let embedded = serde_json::to_value(graphene_resource::DataSource::Embedded).expect("DataSource::Embedded serializes");
+		self.sources.iter().any(|(_, value)| value.source == embedded)
+	}
+
+	/// A `SourceKey` ordered strictly ahead of every current source, so an inserted entry becomes the
+	/// highest-precedence fallback.
+	pub fn highest_precedence_key(&self, peer: PeerId) -> SourceKey {
+		let min_priority = self.sources.first().map(|(key, _)| key.priority.0).unwrap_or(0.);
+		SourceKey {
+			priority: Priority(min_priority - 1.),
+			peer,
 		}
 	}
 }

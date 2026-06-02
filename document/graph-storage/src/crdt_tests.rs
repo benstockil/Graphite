@@ -101,6 +101,40 @@ fn tiny_network() -> NodeNetwork {
 	}
 }
 
+/// `history_topological` emits parents before children and is a pure function of the delta set:
+/// two sessions independently built from the same network produce byte-identical history order.
+#[test]
+fn history_topological_is_causal_and_deterministic() {
+	let resources = graphene_resource::ResourceRegistry::new();
+
+	let mut build = || {
+		let mut session = Session::with_peer(PeerId(1));
+		session.stage_from_runtime(&tiny_network(), &NoMetadata, &resources).expect("stage failed");
+		let last_timestamp = session.hot_log().last().expect("staged at least one hot op").timestamp;
+		session.retire(last_timestamp).expect("retire failed");
+		session
+	};
+
+	let session_a = build();
+	let session_b = build();
+
+	let order_a: Vec<crate::Rev> = session_a.history_topological().iter().map(|delta| delta.id).collect();
+	let order_b: Vec<crate::Rev> = session_b.history_topological().iter().map(|delta| delta.id).collect();
+
+	assert!(order_a.len() > 1, "expected a multi-delta history to make ordering meaningful");
+	assert_eq!(order_a, order_b, "same delta set must serialize in the same topological order");
+
+	// Every parent that's part of this history precedes its child.
+	let position: std::collections::HashMap<crate::Rev, usize> = order_a.iter().enumerate().map(|(i, rev)| (*rev, i)).collect();
+	for delta in session_a.history_topological() {
+		for parent in &delta.parents {
+			if let Some(parent_pos) = position.get(parent) {
+				assert!(*parent_pos < position[&delta.id], "parent {parent} must precede child {} in topological order", delta.id);
+			}
+		}
+	}
+}
+
 /// Committing the same NodeNetwork twice must produce zero history entries on the second commit.
 /// Without value-only diffing in compute_deltas, the second commit would emit spurious
 /// ChangeNodeInput / ChangeNodeAttribute ops because self.registry has real timestamps while the
